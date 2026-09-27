@@ -1,0 +1,58 @@
+# neoagent 配置示例 —— 复制为 config.toml 后填写真实值
+# config.toml 已在 .gitignore 中，不会被提交
+
+[llm]
+# OpenAI 兼容接口：DeepSeek 官方 / 通义 / OpenAI / 自建均可
+base_url = "https://api.deepseek.com"
+api_key = "sk-xxxxxxxx"
+model = "deepseek-chat"
+# DeepSeek thinking 开关（deepseek-flash 默认开；开着多轮需回传 reasoning_content，
+# 我们从消息库重渲染会丢，故默认显式关闭）。换供应商可设 "" 表示不传该参数。
+thinking = "disabled"
+
+[agent]
+# 一次回复内最多连续调用多少轮工具（防失控）
+max_tool_rounds = 12
+# LLM 窗口：渲染时取消息库最新的 N 条
+history_limit = 200
+# 记忆文件（M 自己用 write_file 维护，全文注入【记忆】段）
+memory_file = "data/MEMORY.md"
+
+[files]
+# read_file / write_file 允许访问的根目录（防越界）
+# 可写绝对路径或 ~；demo 想放开就加 "~"
+allowed_roots = ["/Users/apple/Projects/misc/neoagent"]
+
+[exec]
+# 命令执行安全边界（demo 也必须有）
+timeout_seconds = 60          # 单条命令超时
+max_output_bytes = 20000      # stdout+stderr 超出截断
+allowed_roots = ["/Users/apple/Projects/misc/neoagent"]  # cwd 允许范围
+# 命中即拒绝的危险命令（正则，弱防线但必须有；不要拿它当唯一防线）
+deny_patterns = ["\\bsudo\\b", "\\brm\\s+-rf\\b", "\\bmkfs\\b", "\\bdd\\s+of=/dev", "\\bshutdown\\b", "\\breboot\\b", ":\\(\\)\\s*\\{"]
+
+[media]
+max_bytes = 20971520            # 附件大小上限（20MB）
+max_images_per_message = 4
+download_quoted_media = false   # 引用里的媒体默认不下载
+
+[vision]
+provider = "deepseek-files"     # 可拆换：inline-base64
+file_expires_seconds = 2592000  # 上传图片 30 天过期（0 = 永久）
+
+[asr]
+provider = "xiaomi-mimo"        # 语音转写供应商（可拆换）
+api_key = ""                    # 小米 ASR token
+base_url = "https://api.xiaomimimo.com/v1"
+model = "mimo-v2.5-asr"
+language = "auto"
+max_audio_seconds = 300
+
+[channels.weixin]
+enabled = true
+# iLink Bot API 凭据由扫码登录获得，落在 data/weixin/，此处无需配置
+
+[channels.feishu]
+enabled = false               # M2 再开
+app_id = ""
+app_secret = ""

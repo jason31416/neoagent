@@ -1,0 +1,24 @@
+[project]
+name = "neoagent"
+version = "0.1.0"
+description = "neoagent 最简样例：IM（微信/飞书）+ tool calling 闭环，验证技术栈可行性"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.40",        # OpenAI 兼容客户端（DeepSeek 等都走这套）
+    "aiohttp>=3.9",        # 微信 iLink Bot API 长轮询 / HTTP
+    "cryptography>=42.0",  # 微信媒体 AES-128-ECB（iLink 协议要求）
+    "qrcode>=8.0",         # 微信扫码登录时终端渲染二维码
+]
+
+[project.optional-dependencies]
+feishu = ["lark-oapi>=1.3"]  # 飞书官方 SDK（WebSocket 长连接）
+
+[project.scripts]
+neoagent = "neoagent.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["neoagent*"]

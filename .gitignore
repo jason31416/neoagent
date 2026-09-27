@@ -1,0 +1,17 @@
+# 本地配置与密钥
+config.toml
+.env
+
+# 运行时数据（微信登录凭据、会话状态等）
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+build/
+dist/
+
+# IDE
+.idea/
