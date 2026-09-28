@@ -211,3 +211,7 @@ class ReasoningEffortSource:
             except Exception:
                 pass
         return self._value
+
+    def __call__(self) -> str:
+        """effort_provider 契约：可调用、返回当前档位。"""
+        return self.get()

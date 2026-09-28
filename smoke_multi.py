@@ -414,6 +414,7 @@ async def main() -> None:
     cfg_path.write_text('[llm]\nreasoning_effort = "none"\n', encoding="utf-8")
     src = ReasoningEffortSource(cfg_path, initial="medium")
     check(src.get() == "none", "改配置即生效（none）")
+    check(callable(src) and src() == "none", "effort_provider 契约：实例可直接调用")
     _time.sleep(0.02)
     cfg_path.write_text('[llm]\nreasoning_effort = "high"\n', encoding="utf-8")
     check(src.get() == "high", "再改再生效（high）")
