@@ -258,18 +258,18 @@ class AgentLoop:
         - tool_calls → 落 tool_call 行（一轮数组），执行后逐个落 tool_result 行。
         """
         tools = self.registry.schemas()
-        turn_tool_msgs: List[dict] = []   # 本轮的 tool_calls / tool 结果机器件（本地暂存，未入库）
         turn_seen_imgs: set = set()       # 本轮已嵌图（同轮同图去重）
         rounds = 0
         bubbles_sent = 0
 
         gen_at_render = st.input_gen
         while rounds < self.max_tool_rounds:
-            # 事实层现渲染 + 本轮工具机器件（渲染前快照输入代数）。
-            # 裁剪预算扣掉：工具 schema + turn 内机器件 + 锚定残差（真值锚定）。
+            # 事实层现渲染（工具流水当轮已落库，渲染即含，不再另拼机器件——
+            # 曾经的 turn_tool_msgs 暂存链会造成同一轮流水在请求里出现两次）。
+            # 裁剪预算扣掉：工具 schema + 锚定残差（真值锚定）。
             gen_at_render = st.input_gen
-            overhead, extra_est = self._request_overhead(session_key, tools, turn_tool_msgs)
-            messages = self._render(session_key, overhead=overhead) + turn_tool_msgs
+            overhead, extra_est = self._request_overhead(session_key, tools)
+            messages = self._render(session_key, overhead=overhead)
             est_total = self._caches[session_key].last_cost + extra_est
             predicted = self._anchors[session_key].predict(est_total)
 
@@ -310,16 +310,6 @@ class AgentLoop:
             if not result.tool_calls:
                 return gen_at_render
 
-            turn_tool_msgs.append({
-                "role": "assistant",
-                "content": result.content,
-                "tool_calls": [
-                    {"id": tc.id, "type": "function",
-                     "function": {"name": tc.name, "arguments": tc.arguments}}
-                    for tc in result.tool_calls
-                ],
-            })
-
             st.tool_running = True
             try:
                 for i, tc in enumerate(result.tool_calls):
@@ -331,13 +321,6 @@ class AgentLoop:
                                     sender_name="neoagent", text=output,
                                     call_id=calls[i]["call_id"], name=tc.name,
                                     attachments=atts)
-                    # 工具结果信封：带图的 tool 消息用 content 数组（实测 DeepSeek 收）
-                    content: Any = output
-                    if atts and self.vision is not None:
-                        content = [{"type": "text", "text": output}] + [
-                            self.vision.content_part(a.data, a.mime) for a in atts]
-                    turn_tool_msgs.append({"role": "tool", "tool_call_id": tc.id,
-                                           "content": content})
             finally:
                 st.tool_running = False
 
@@ -345,8 +328,8 @@ class AgentLoop:
         logger.warning("工具循环达到上限 %d 轮，强制收尾", self.max_tool_rounds)
         nudge = {"role": "user",
                  "content": "（系统提示：工具调用轮数已达上限，请立即基于已有结果用 <message> 给用户一句总结。）"}
-        overhead, extra_est = self._request_overhead(session_key, tools, turn_tool_msgs)
-        messages = self._render(session_key, overhead=overhead) + turn_tool_msgs + [nudge]
+        overhead, extra_est = self._request_overhead(session_key, tools)
+        messages = self._render(session_key, overhead=overhead) + [nudge]
         est_total = self._caches[session_key].last_cost + extra_est \
             + count_chat_payload(self.token_counter, [nudge])
         predicted = self._anchors[session_key].predict(est_total)
@@ -584,15 +567,16 @@ class AgentLoop:
             overhead=overhead,
         )
 
-    def _request_overhead(self, session_key: str, tools, turn_tool_msgs) -> tuple:
+    def _request_overhead(self, session_key: str, tools) -> tuple:
         """(裁剪用开销, 非时间线估算)。
 
-        开销 = 工具 schema + turn 内工具机器件 + 真值锚定残差——都是"时间线之外
+        开销 = 工具 schema + 真值锚定残差——都是"时间线之外
         但真实占用上下文"的部分，得挤占时间线预算。
+        （工具流水在时间线里，由渲染计价，不在此重复计入。）
         """
         if self._tools_est is None:
             self._tools_est = count_chat_payload(self.token_counter, tools=tools)
-        extra_est = self._tools_est + count_chat_payload(self.token_counter, turn_tool_msgs)
+        extra_est = self._tools_est
         anchor = self._anchors.setdefault(session_key, TokenAnchor())
         return extra_est + anchor.offset, extra_est
 

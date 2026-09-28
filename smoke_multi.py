@@ -143,6 +143,14 @@ async def main() -> None:
     check([e.message_id for e in entries if e.type == TYPE_ASSISTANT] == ["m1", "m2", "m3"],
           "发出消息 id 回填 assistant 行")
 
+    # 工具流水在请求里恰好一份（回归锚：曾有"落库渲染 + turn_tool_msgs 暂存"双份 bug）
+    req2 = llm.seen[-1]
+    tc_msgs = [m for m in req2 if m.get("tool_calls")]
+    tool_ids = [m.get("tool_call_id") for m in req2 if m["role"] == "tool"]
+    check(len(tc_msgs) == 1 and tool_ids == [calls[0].call_id, calls[1].call_id],
+          f"每轮工具流水恰好一份、id 与落库持久 id 一致（实际 tool_calls 消息 "
+          f"{len(tc_msgs)} 条，tool_ids={tool_ids}）")
+
     # ── 4. 渲染 ──
     print("=== 3. 渲染 ===")
     flat = "\n".join(str(m) for m in render(ledger, "cli:smoke"))
@@ -520,7 +528,7 @@ async def main() -> None:
     check(not any(isinstance(m.get("content"), list) for m in msgs),
           "历史残留坏图自动降级（渲染保险丝，救活中毒历史）")
 
-    # ---- feishu post 富文本解析（别再"忽略消息类型 post"） ----
+    print("=== 19. feishu post 富文本解析 ===")
     from neoagent.channels.feishu.adapter import _parse_post as _pp
     res = []
     lines = _pp({"title": "标题", "content": [
