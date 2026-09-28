@@ -105,8 +105,8 @@ def render_attachments(atts: List[Attachment]) -> str:
             desc += f"，{a.size // 1024}KB"
         if a.local_path:
             desc += f"，路径 {a.local_path}"
-        if a.kind == "image" and not a.provider_ref:
-            desc += "（图内容不可用）"
+        if a.kind == "image" and not a.data:
+            desc += "（图内容未附）"
         lines.append(f"（附件 {i}：{desc}）")
     return ("\n" + "\n".join(lines)) if lines else ""
 
@@ -157,9 +157,11 @@ class _Row:
         self.body = _esc_body(
             f"{entry.text}{render_attachments(entry.attachments)}".strip())
         self.att = entry.attachments[0] if entry.attachments else None
+        # 图片 parts 只给 user 行（协议限制：assistant 消息不能带图；
+        # M 发出的图本就不回灌，tool 行的图走 tool 信封，见 _tool_result_msg）
         images = [a for a in entry.attachments
-                  if a.kind == "image" and a.provider_ref is not None and vision is not None]
-        self.parts = [vision.content_part(a.provider_ref) for a in images] or None
+                  if a.kind == "image" and a.data and self.role == "user" and vision is not None]
+        self.parts = [vision.content_part(a.data, a.mime) for a in images] or None
         self.cost = self.measure(counter)
 
     def measure(self, counter) -> int:
@@ -181,7 +183,7 @@ class _Row:
                    "content": [{"type": "text", "text": text}] + self.parts}
         else:
             msg = {"role": self.role, "content": text}
-        if self.reasoning and include_reasoning:
+        if self.reasoning and include_reasoning and self.role == "assistant":
             msg["reasoning_content"] = self.reasoning
         return msg
 
@@ -226,6 +228,20 @@ class TimelineCache:
 # ----------------------------------------------------------------------
 # 建块 / 裁剪
 # ----------------------------------------------------------------------
+def _tool_result_msg(r, vision, counter):
+    """tool_result 行 → 协议 tool 消息。带图走 content 数组信封
+    （实测 DeepSeek 收 tool 消息带图——工具结果信封是 OpenAI 协议下唯一原生等价物）。"""
+    imgs = [a for a in r.attachments
+            if a.kind == "image" and a.data and vision is not None]
+    if imgs:
+        content = [{"type": "text", "text": r.text}] + [
+            vision.content_part(a.data, a.mime) for a in imgs]
+    else:
+        content = r.text
+    cost = 12 + counter.count(r.text) + sum(counter.count_image() for _ in imgs)
+    return {"role": "tool", "tool_call_id": r.call_id, "content": content}, cost
+
+
 def _build_blocks(rows: list, counter, vision) -> List[Block]:
     """行 → 块。tool_call 行 + 其全部 tool_result（按 call_id 配对，可被插话隔开）
     = 一个原子块；对话行各自成块。孤儿 tool_result（call 行不在本批，冷扫描边界）
@@ -261,8 +277,9 @@ def _build_blocks(rows: list, counter, vision) -> List[Block]:
                             for c in e.calls)
             for c in e.calls:
                 for r in results.get(c.call_id, ()):
-                    msgs.append({"role": "tool", "tool_call_id": r.call_id, "content": r.text})
-                    cost += 12 + counter.count(r.text)
+                    msg, rcost = _tool_result_msg(r, vision, counter)
+                    msgs.append(msg)
+                    cost += rcost
             blk = Block("tool", [], cost, tool_msgs=msgs, reasoning=e.reasoning or "")
             blk.first_seq = e.seq_id
             blk.call_index = {c.call_id: blk for c in e.calls}
@@ -383,8 +400,9 @@ def _absorb(cache: TimelineCache, rows: list, counter, vision) -> None:
     for call_id, lst in late.items():
         blk = cache.call_blocks[call_id]
         for r in lst:
-            blk.tool_msgs.append({"role": "tool", "tool_call_id": r.call_id, "content": r.text})
-            blk.cost += 12 + counter.count(r.text)
+            msg, rcost = _tool_result_msg(r, vision, counter)
+            blk.tool_msgs.append(msg)
+            blk.cost += rcost
 
     for blk in _build_blocks(rest, counter, vision):
         cache.blocks.append(blk)

@@ -10,15 +10,15 @@
 要点：
 - 序号 seq_id 每会话单调递增、**永不回收**（sessions.last_seq 分配器，删行不倒退）；
 - LLM 上下文只是渲染时截取的最新 N **行**（见 render.py）；
-- 附件/引用等 type 相关载荷放 meta(JSON)；图片的 provider_ref 入库时转纯数据、出库还原。
+- 附件/引用等 type 相关载荷放 meta(JSON)；图片字节入 blobs 表（内容寻址 image_sha）。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
-from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, List, Optional
@@ -48,35 +48,19 @@ CREATE TABLE IF NOT EXISTS messages (
   meta         JSON,                   -- type 相关载荷（附件/引用/工具调用数组/配对 id）
   PRIMARY KEY (session_key, seq_id)
 );
+CREATE TABLE IF NOT EXISTS blobs (
+  sha256       TEXT PRIMARY KEY,       -- 内容寻址：同图只存一份
+  mime         TEXT,
+  bytes        BLOB                    -- 图片字节本体（账持有数据，本地删移不影响还原）
+);
 CREATE INDEX IF NOT EXISTS idx_messages_msgid ON messages(session_key, message_id);
 """
-
-
-def _dump_provider_ref(ref: Any) -> Any:
-    """provider_ref 是不透明句柄（VisionRef 等）——入库时转纯数据。"""
-    if ref is None:
-        return None
-    if is_dataclass(ref):
-        return asdict(ref)
-    if isinstance(ref, dict):
-        return ref
-    return str(ref)
-
-
-def _load_provider_ref(data: Any) -> Any:
-    """出库时还原成带属性访问的对象（SimpleNamespace 足够 content_part 用）。"""
-    if data is None:
-        return None
-    if isinstance(data, dict):
-        return SimpleNamespace(**data)
-    return data
 
 
 def _att_to_dict(a: Attachment) -> dict:
     return {
         "kind": a.kind, "filename": a.filename, "mime": a.mime,
-        "size": a.size, "local_path": a.local_path,
-        "provider_ref": _dump_provider_ref(a.provider_ref),
+        "size": a.size, "local_path": a.local_path, "image_sha": a.image_sha,
     }
 
 
@@ -84,8 +68,7 @@ def _att_from_dict(d: dict) -> Attachment:
     return Attachment(
         kind=d.get("kind", "file"), filename=d.get("filename", ""),
         mime=d.get("mime", ""), size=int(d.get("size", 0)),
-        local_path=d.get("local_path", ""),
-        provider_ref=_load_provider_ref(d.get("provider_ref")),
+        local_path=d.get("local_path", ""), image_sha=d.get("image_sha", ""),
     )
 
 
@@ -152,6 +135,12 @@ class MessageLedger:
         """
         meta: dict = {}
         if attachments:
+            for a in attachments:
+                if a.kind == "image" and a.data:
+                    if not a.image_sha:
+                        a.image_sha = hashlib.sha256(a.data).hexdigest()
+                    self._put_blob(a.image_sha, a.mime, a.data)
+                    a.data = b""                   # 瞬态字段不进 meta（字节在 blobs）
             meta["attachments"] = [_att_to_dict(a) for a in attachments]
         if reply_to is not None:
             meta["reply_to"] = _reply_to_dict(reply_to)
@@ -202,16 +191,35 @@ class MessageLedger:
 
     def _row_to_entry(self, r) -> Any:
         meta = json.loads(r[6]) if r[6] else {}
+        atts = [_att_from_dict(d) for d in meta.get("attachments", [])]
+        for a in atts:                              # 图片字节现取（blobs 内容寻址）
+            if a.image_sha:
+                hit = self.blob(a.image_sha)
+                if hit is not None:
+                    a.data = hit[1]
         return SimpleNamespace(
             seq_id=int(r[0]), message_id=r[1] or "", type=r[2],
             sender_name=r[3] or "", timestamp=float(r[4] or 0), text=r[5] or "",
-            attachments=[_att_from_dict(d) for d in meta.get("attachments", [])],
+            attachments=atts,
             reply_to=_reply_to_from_dict(meta["reply_to"]) if meta.get("reply_to") else None,
             calls=[SimpleNamespace(**c) for c in meta.get("calls", [])],
             call_id=meta.get("call_id", ""),
             name=meta.get("name", ""),
             reasoning=meta.get("reasoning", ""),
         )
+
+    def _put_blob(self, sha: str, mime: str, data: bytes) -> None:
+        """图片字节落 blobs（内容寻址，同图只存一份，幂等）。"""
+        self._conn.execute(
+            "INSERT OR IGNORE INTO blobs(sha256, mime, bytes) VALUES(?,?,?)",
+            (sha, mime or "", sqlite3.Binary(data)))
+        self._conn.commit()
+
+    def blob(self, sha: str) -> Optional[tuple]:
+        """按 sha 取图片字节 (mime, bytes)；没有返回 None。"""
+        row = self._conn.execute(
+            "SELECT mime, bytes FROM blobs WHERE sha256 = ?", (sha,)).fetchone()
+        return (row[0] or "", bytes(row[1])) if row else None
 
     def attach_reasoning(self, session_key: str, seq_id: int, reasoning: str) -> None:
         """把一轮的思考草稿挂到轮首行（meta.reasoning）。

@@ -28,7 +28,7 @@ from uuid import uuid4
 
 from ..providers.tokens import HeuristicTokenCounter, TokenAnchor, TokenCounter, count_chat_payload
 from ..tools.file_tools import _resolve_in_roots
-from ..tools.registry import ToolRegistry
+from ..tools.registry import ToolOutput, ToolRegistry
 from .events import Attachment, MessageEvent, ReplyRef
 from .ledger import (MessageLedger, TYPE_ASSISTANT, TYPE_INTERNAL, TYPE_TOOL_CALL,
                      TYPE_TOOL_RESULT, TYPE_USER)
@@ -258,6 +258,7 @@ class AgentLoop:
         """
         tools = self.registry.schemas()
         turn_tool_msgs: List[dict] = []   # 本轮的 tool_calls / tool 结果机器件（本地暂存，未入库）
+        turn_seen_imgs: set = set()       # 本轮已嵌图（同轮同图去重）
         rounds = 0
         bubbles_sent = 0
 
@@ -321,11 +322,21 @@ class AgentLoop:
             st.tool_running = True
             try:
                 for i, tc in enumerate(result.tool_calls):
-                    output = await self._execute_tool(tc.name, tc.arguments)
+                    output, images = await self._execute_tool(tc.name, tc.arguments)
+                    atts, note = self._embed_images(images, turn_seen_imgs)
+                    if note:
+                        output += note
                     self.ledger.add(session_key=session_key, type=TYPE_TOOL_RESULT,
                                     sender_name="neoagent", text=output,
-                                    call_id=calls[i]["call_id"], name=tc.name)
-                    turn_tool_msgs.append({"role": "tool", "tool_call_id": tc.id, "content": output})
+                                    call_id=calls[i]["call_id"], name=tc.name,
+                                    attachments=atts)
+                    # 工具结果信封：带图的 tool 消息用 content 数组（实测 DeepSeek 收）
+                    content: Any = output
+                    if atts and self.vision is not None:
+                        content = [{"type": "text", "text": output}] + [
+                            self.vision.content_part(a.data, a.mime) for a in atts]
+                    turn_tool_msgs.append({"role": "tool", "tool_call_id": tc.id,
+                                           "content": content})
             finally:
                 st.tool_running = False
 
@@ -411,15 +422,9 @@ class AgentLoop:
             logger.warning("媒体消息被拒 %s：%s", it.path, exc)
             return await self._say(session_key, st, f"（{display} 发不出去：{exc}）")
 
-        provider_ref = None
-        if kind == "image" and self.vision is not None:
-            try:
-                provider_ref = await self.vision.attach(str(p))   # 自己发的图也能被回忆
-            except Exception as exc:
-                logger.warning("发出图片上传 vision 失败 %s：%s", p, exc)
-
+        # 发出的图不回灌历史（创作产物无需回看；assistant 消息也不能带图）
         att = Attachment(kind=kind, filename=it.name or p.name, mime=mime,
-                         size=p.stat().st_size, local_path=str(p), provider_ref=provider_ref)
+                         size=p.stat().st_size, local_path=str(p))
         seq = self.ledger.add(session_key=session_key, type=TYPE_ASSISTANT,
                               sender_name="neoagent", text="", attachments=[att],
                               reply_to=reply_ref)
@@ -492,15 +497,15 @@ class AgentLoop:
         elif audio_atts:
             text = text or _VOICE_FALLBACK
 
-        # 图片 → 上传 vision 拿句柄（DeepSeek file_id），历史可复用
+        # 图片 → 读字节入账（blobs 内容寻址；渲染时现编码进上下文，
+        # 本地删/移文件不影响上下文还原）
         images = [a for a in attachments if a.kind == "image"][:self.max_images]
-        if images and self.vision is not None:
-            for a in images:
+        for a in images:
+            if a.local_path and not a.data:
                 try:
-                    a.provider_ref = await self.vision.attach(a.local_path)
-                except Exception as exc:
-                    logger.warning("图片上传失败 %s：%s", a.filename, exc)
-                    a.provider_ref = None  # 渲染层降级为"（图内容不可用）"
+                    a.data = Path(a.local_path).read_bytes()
+                except OSError as exc:
+                    logger.warning("图片读取失败 %s：%s", a.filename, exc)  # 渲染层降级"（图内容未附）"
 
         return text, attachments
 
@@ -591,12 +596,12 @@ class AgentLoop:
         if u.get("prompt_tokens"):
             self._anchors[session_key].update(u["prompt_tokens"], est_total)
 
-    async def _execute_tool(self, name: str, arguments_json: str) -> str:
-        """执行一个工具调用，永远返回字符串（错误也转成字符串回给模型自纠）。"""
+    async def _execute_tool(self, name: str, arguments_json: str) -> tuple:
+        """执行一个工具调用，返回 (文字结果, 图片路径列表)；错误也转成字符串回给模型自纠。"""
         try:
             args = json.loads(arguments_json) if arguments_json else {}
         except json.JSONDecodeError as e:
-            return f"工具参数不是合法 JSON：{e}"
+            return f"工具参数不是合法 JSON：{e}", []
 
         logger.info("调用工具 %s(%s)", name, arguments_json[:200])
         try:
@@ -605,9 +610,36 @@ class AgentLoop:
             logger.exception("工具 %s 执行异常", name)
             output = f"工具执行异常：{e}"
 
+        images: List[str] = []
+        if isinstance(output, ToolOutput):
+            images = list(output.images or [])
+            output = output.text
+
         if len(output) > 20000:
             output = output[:20000] + "\n…（输出过长已截断）"
 
         snippet = output[:500] + ("…" if len(output) > 500 else "")
-        logger.info("工具 %s 结果（%d 字符）：%s", name, len(output), snippet)
-        return output
+        logger.info("工具 %s 结果（%d 字符%s）：%s", name, len(output),
+                    f"，{len(images)} 图" if images else "", snippet)
+        return output, images
+
+    def _embed_images(self, paths: List[str], seen: set) -> tuple:
+        """工具结果里的图片：读字节备落账/入上下文；同轮同图去重（hermes 同款防重复嵌）。
+        返回 (附件列表, 附加说明)。"""
+        atts: List[Attachment] = []
+        notes: List[str] = []
+        for p in paths:
+            key = str(Path(p).resolve())
+            if key in seen:
+                notes.append(f"\n（图 {Path(p).name} 本轮回上文已附，不重复）")
+                continue
+            seen.add(key)
+            try:
+                data = Path(p).read_bytes()
+            except OSError as exc:
+                notes.append(f"\n（图 {Path(p).name} 读取失败：{exc}）")
+                continue
+            atts.append(Attachment(kind="image", filename=Path(p).name,
+                                   mime=mimetypes.guess_type(p)[0] or "image/jpeg",
+                                   size=len(data), local_path=p, data=data))
+        return atts, "".join(notes)

@@ -44,9 +44,7 @@ max_bytes = 20971520            # 附件大小上限（20MB）
 max_images_per_message = 4
 download_quoted_media = false   # 引用里的媒体默认不下载
 
-[vision]
-provider = "deepseek-files"     # 可拆换：inline-base64
-file_expires_seconds = 2592000  # 上传图片 30 天过期（0 = 永久）
+# 图片喂模型走 OpenAI 标准 image_url + data URL（无需配置；字节落 blobs 表）
 
 [asr]
 provider = "xiaomi-mimo"        # 语音转写供应商（可拆换）

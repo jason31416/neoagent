@@ -8,13 +8,22 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Dict, List, Union
 
 logger = logging.getLogger(__name__)
 
-# handler 签名：吃一个 dict 参数，返回字符串（给模型看的执行结果）
-ToolHandler = Callable[[Dict[str, Any]], Awaitable[str]]
+
+@dataclass
+class ToolOutput:
+    """工具结果：文字 + 可选图片（read_file 读图——OpenAI 协议下 tool 消息可带图，
+    实测 DeepSeek 收；图片走"工具结果信封"进当轮上下文并落账）。"""
+    text: str = ""
+    images: List[str] = field(default_factory=list)   # 图片路径（核心读字节/落 blob）
+
+
+# handler 签名：吃一个 dict 参数，返回字符串或 ToolOutput（给模型看的执行结果）
+ToolHandler = Callable[[Dict[str, Any]], Awaitable[Union[str, ToolOutput]]]
 
 
 @dataclass
@@ -51,7 +60,7 @@ class ToolRegistry:
             for t in self._tools.values()
         ]
 
-    async def call(self, name: str, args: Dict[str, Any]) -> str:
+    async def call(self, name: str, args: Dict[str, Any]) -> Union[str, ToolOutput]:
         """按名字执行工具。未知工具返回错误字符串（让模型自己纠正）。"""
         entry = self._tools.get(name)
         if entry is None:

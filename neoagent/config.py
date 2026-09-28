@@ -44,12 +44,6 @@ class MediaConfig:
 
 
 @dataclass
-class VisionConfig:
-    provider: str = "deepseek-files"         # 可拆换：inline-base64
-    file_expires_seconds: int = 2592000      # 30 天过期（0 = 永久）
-
-
-@dataclass
 class AsrConfig:
     provider: str = "xiaomi-mimo"            # 可拆换
     api_key: str = ""
@@ -89,7 +83,6 @@ class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     media: MediaConfig = field(default_factory=MediaConfig)
-    vision: VisionConfig = field(default_factory=VisionConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)
     files: FilesConfig = field(default_factory=FilesConfig)
     exec: ExecConfig = field(default_factory=ExecConfig)
@@ -137,10 +130,6 @@ def load_config(path: Path | None = None) -> Config:
         cfg.media.max_bytes = int(md.get("max_bytes", cfg.media.max_bytes))
         cfg.media.max_images_per_message = int(md.get("max_images_per_message", cfg.media.max_images_per_message))
         cfg.media.download_quoted_media = bool(md.get("download_quoted_media", cfg.media.download_quoted_media))
-
-        vs = raw.get("vision", {})
-        cfg.vision.provider = str(vs.get("provider", cfg.vision.provider))
-        cfg.vision.file_expires_seconds = int(vs.get("file_expires_seconds", cfg.vision.file_expires_seconds))
 
         ar = raw.get("asr", {})
         cfg.asr.provider = str(ar.get("provider", cfg.asr.provider))

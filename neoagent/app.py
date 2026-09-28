@@ -45,9 +45,7 @@ def build_agent(cfg: Config) -> AgentLoop:
     ))
 
     # providers（供应商适配全部藏在 providers/ 后面）
-    vision = make_vision(
-        cfg.vision.provider, cfg.llm.base_url, cfg.llm.api_key,
-        cfg.vision.file_expires_seconds or None)
+    vision = make_vision()
     transcriber = make_transcriber(
         cfg.asr.provider, cfg.asr.base_url, cfg.asr.api_key, cfg.asr.model,
         cfg.asr.language, cfg.asr.max_audio_seconds)

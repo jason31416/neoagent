@@ -6,13 +6,15 @@ description 的措辞参考了 hermes（告诉模型"用这个代替 cat"这类�
 
 from __future__ import annotations
 
+import mimetypes
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .registry import ToolRegistry
+from .registry import ToolOutput, ToolRegistry
 
 DEFAULT_READ_LIMIT = 200  # 单次最多读多少行（IM 场景不需要长输出）
+IMAGE_READ_MAX_BYTES = 20 * 1024 * 1024   # read_file 看图的大小上限
 
 # 工作台：相对路径的解析基准（agent 的工作目录，不是项目根）
 _workspace: Optional[Path] = None
@@ -39,8 +41,8 @@ def _resolve_in_roots(path_str: str, allowed_roots: List[str], base: Optional[Pa
     raise PermissionError(f"路径超出允许范围（allowed_roots={allowed_roots}）：{p}")
 
 
-async def read_file(args: Dict[str, Any]) -> str:
-    """read_file 工具实现：带行号、分页读取。"""
+async def read_file(args: Dict[str, Any]):
+    """read_file 工具实现：文本带行号分页；图片走"工具结果信封"直接看图。"""
     path = _resolve_in_roots(str(args.get("path", "")), _allowed_roots())
     offset = int(args.get("offset", 1))          # 1-based
     limit = min(int(args.get("limit", DEFAULT_READ_LIMIT)), 500)
@@ -49,6 +51,24 @@ async def read_file(args: Dict[str, Any]) -> str:
         return f"文件不存在：{path}"
     if not path.is_file():
         return f"不是普通文件：{path}"
+
+    # 图片 → 工具结果信封（图像内容随工具结果进上下文，主模型亲眼看）
+    mime = mimetypes.guess_type(str(path))[0] or ""
+    if mime.startswith("image/"):
+        size = path.stat().st_size
+        if size > IMAGE_READ_MAX_BYTES:
+            return f"图片太大（{size // 1024}KB，上限 {IMAGE_READ_MAX_BYTES // 1024}KB），看不了"
+        return ToolOutput(text=f"（图片 {path.name} 的图像内容如下）", images=[str(path)])
+
+    # 二进制（非图片）明确拒绝，不吐乱码误导模型
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8192)
+    except OSError as e:
+        return f"读取失败：{e}"
+    if b"\x00" in head:
+        return (f"二进制文件读不出文本内容：{path.name}（{mime or '未知类型'}）。"
+                "要看图片请确认它是 png/jpg 等图片格式；其他二进制内容无法查看。")
 
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -93,8 +113,8 @@ def set_allowed_roots(roots: List[str]) -> None:
 READ_FILE_SCHEMA = {
     "name": "read_file",
     "description": (
-        "读取文本文件，带行号和分页。用这个代替 cat/head/tail。"
-        "输出格式为 '行号|内容'。大文件用 offset/limit 分页读取。"
+        "读取文件：文本文件带行号分页输出（'行号|内容'，大文件用 offset/limit 分页）；"
+        "图片文件（png/jpg 等）会直接把图像内容给你看。用这个代替 cat/head/tail。"
     ),
     "parameters": {
         "type": "object",

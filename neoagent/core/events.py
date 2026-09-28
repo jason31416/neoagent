@@ -32,15 +32,16 @@ class Conversation:
 class Attachment:
     """一个附件。随消息来的带 local_path；引用占位的只有元数据（local_path 空）。
 
-    provider_ref 是 provider 层的不透明句柄（如 DeepSeek file_id），
-    由核心在入库时填，通道不感知。
+    图片的**字节本体落账**（blobs 表，内容寻址 image_sha）——本地文件删/移不影响
+    上下文还原；data 是入库前的瞬态字段（ledger 落 blob 后不再携带）。
     """
     kind: str                     # "image" | "file" | "audio" | "video"
     filename: str
     mime: str = ""
     size: int = 0
-    local_path: str = ""
-    provider_ref: Any = None      # VisionInput.attach() 的产物，其余类型恒 None
+    local_path: str = ""          # 来源记录（可为空/失效，不影响还原）
+    image_sha: str = ""           # blobs 表键（仅图片）
+    data: bytes = b""             # 瞬态：图片字节，入库时存进 blobs
 
 
 @dataclass

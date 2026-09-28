@@ -19,7 +19,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from neoagent.core.agent_loop import AgentLoop, _extract_messages
-from neoagent.core.events import Conversation, MessageEvent, ReplyRef, SendResult, Sender
+from neoagent.core.events import (Attachment, Conversation, MessageEvent, ReplyRef,
+                                  SendResult, Sender)
 from neoagent.core.ledger import (MessageLedger, TYPE_ASSISTANT, TYPE_TOOL_CALL,
                                   TYPE_TOOL_RESULT, TYPE_USER)
 from neoagent.core.render import TimelineCache, render_messages
@@ -418,6 +419,86 @@ async def main() -> None:
     _time.sleep(0.02)
     cfg_path.write_text('[llm]\nreasoning_effort = "high"\n', encoding="utf-8")
     check(src.get() == "high", "再改再生效（high）")
+
+    print("=== 16. 图片落库与协议角色 ===")
+    from neoagent.providers.vision import OpenAIImageVision
+    ov = OpenAIImageVision()
+    png = b"\x89PNG fake bytes for blob"
+    sk7 = "cli:imgrole"
+    ledger.add(session_key=sk7, type=TYPE_USER, sender_name="jason31416", text="用户发的图",
+               attachments=[Attachment(kind="image", filename="u.png", mime="image/png",
+                                       size=len(png), local_path="/tmp/不存在的路径/u.png",
+                                       data=png)])
+    img_seq = ledger.add(session_key=sk7, type=TYPE_ASSISTANT, sender_name="neoagent", text="",
+                         attachments=[Attachment(kind="image", filename="m.png", mime="image/png",
+                                                 size=10, local_path="/tmp/m.png")])
+    ledger.attach_reasoning(sk7, img_seq, "发图前的思考")
+    ledger.add(session_key=sk7, type=TYPE_TOOL_CALL, sender_name="neoagent",
+               calls=[{"call_id": "ig1", "name": "read_file", "arguments": "{}"}])
+    ledger.add(session_key=sk7, type=TYPE_TOOL_RESULT, sender_name="neoagent", call_id="ig1",
+               name="read_file", text="（图片 r.png 的图像内容如下）",
+               attachments=[Attachment(kind="image", filename="r.png", mime="image/png",
+                                       size=len(png), local_path="/tmp/r.png", data=png)])
+    msgs = render_messages(ledger, sk7, identity=IDENTITY, memory_text="",
+                           budget=250_000, counter=COUNTER, vision=ov)
+    parts_msgs = [m for m in msgs if isinstance(m.get("content"), list)]
+    user_imgs = [m for m in parts_msgs if m.get("role") == "user"]
+    tool_imgs = [m for m in parts_msgs if m.get("role") == "tool"]
+    check(len(user_imgs) == 1 and len(tool_imgs) == 1,
+          f"user 行带 parts、tool 信封带图（实际 user={len(user_imgs)} tool={len(tool_imgs)}）")
+    a_texts = [m for m in msgs if m.get("role") == "assistant"]
+    check(all(not isinstance(m.get("content"), list) for m in a_texts),
+          "assistant 消息永不带图片 parts（协议限制，实测 400）")
+    check(any("reasoning_content" in m for m in a_texts)
+          and not any("reasoning_content" in m for m in parts_msgs),
+          "思考草稿只挂 assistant 消息")
+    row = ledger.visible("cli:imgrole", 50)[0]
+    check(row.attachments[0].data == png,
+          "字节从 blobs 还原（local_path 是不存在的路径——不依赖本地文件）")
+    n_blobs = ledger._conn.execute("SELECT COUNT(*) FROM blobs").fetchone()[0]
+    check(n_blobs == 1, f"同图只存一份 blob（内容寻址去重，实际 {n_blobs}）")
+
+    print("=== 17. read_file 读图（工具结果信封）===")
+    from neoagent.tools.file_tools import read_file, set_allowed_roots
+    from neoagent.tools.registry import ToolOutput
+    rf_dir = Path(tmp) / "rf"
+    rf_dir.mkdir()
+    img = rf_dir / "shot.png"
+    img.write_bytes(png)
+    (rf_dir / "blob.bin").write_bytes(b"\x00\x01\x02binary")
+    (rf_dir / "t.txt").write_text("hello 文本", encoding="utf-8")
+    set_allowed_roots([tmp])
+    out = await read_file({"path": str(img)})
+    check(isinstance(out, ToolOutput) and out.images == [str(img.resolve())]
+          and "图像内容如下" in out.text, "read_file 图片 → ToolOutput（图像随工具结果进上下文）")
+    out2 = await read_file({"path": str(rf_dir / "blob.bin")})
+    check(isinstance(out2, str) and "二进制文件读不出文本" in out2, "非图二进制明确拒绝，不吐乱码")
+    out3 = await read_file({"path": str(rf_dir / "t.txt")})
+    check(isinstance(out3, str) and "hello 文本" in out3, "文本文件照常读")
+
+    # 全链路：stub 模型两轮都调"看图"工具 → 信封进请求、同轮去重
+    reg2 = ToolRegistry()
+
+    async def _look(args):
+        return ToolOutput(text="（图片 shot.png 的图像内容如下）", images=[str(img)])
+
+    reg2.register("look", "看图", {"type": "object", "properties": {}}, _look)
+    llm8 = StubLLM([
+        SimpleNamespace(content="草稿", tool_calls=[tc("q1", "look", "{}")]),
+        SimpleNamespace(content="草稿", tool_calls=[tc("q2", "look", "{}")]),
+        SimpleNamespace(content='<message>看完了</message>', tool_calls=None),
+    ])
+    agent8 = AgentLoop(llm=llm8, registry=reg2, ledger=ledger, memory_file=mem, vision=ov)
+    await agent8.submit(mk_event("看看这张图", conv="look"), responder=Collector())
+    await agent8.wait_idle("cli:look")
+    req = str(llm8.seen[-1])
+    check("image_url" in req and "data:image/png;base64," in req,
+          "工具结果信封进请求（tool 消息带 image_url data URL）")
+    look_rows = [e for e in ledger.visible("cli:look", 30) if e.type == TYPE_TOOL_RESULT]
+    check(len(look_rows) == 2 and look_rows[0].attachments and not look_rows[1].attachments
+          and "不重复" in look_rows[1].text,
+          "同轮同图去重（第二条只留说明不重复嵌）")
+    set_allowed_roots([])
 
     ledger.close()
     print("=== 全部通过 ===")
