@@ -13,12 +13,17 @@ thinking = "disabled"
 [agent]
 # 一次回复内最多连续调用多少轮工具（防失控）
 max_tool_rounds = 12
-# LLM 窗口：渲染时取消息库最新的 N 条
-history_limit = 200
+# 时间线 token 预算：从最老端成组抛弃到装进预算（引用召回不计）
+history_token_budget = 250000
+# 每张图估算 token（计数器用；providers/tokens.py 可换精确实现）
+image_token_estimate = 1024
 # 记忆文件（M 自己用 write_file 维护，全文注入【记忆】段）
 memory_file = "data/MEMORY.md"
 # 身份文件（【它是谁】段全文；改它就改了 M 的人设与消息协议说明）
 identity_file = "IDENTITY.md"
+# 工作台：agent 的工作目录（exec 默认 cwd、相对路径基准、产出物落脚点）；
+# 自动并入 files/exec/media 允许范围，无需再配 roots
+workspace = "data/workspace"
 
 [files]
 # read_file / write_file 允许访问的根目录（防越界）

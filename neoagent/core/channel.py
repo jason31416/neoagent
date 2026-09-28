@@ -66,6 +66,12 @@ class ChannelAdapter(abc.ABC):
         不支持引用的通道可忽略它发普通消息。返回的 SendResult.message_id
         是这条发出消息的平台 id（核心回填进账，供以后被引用）。"""
 
+    async def send_media(self, event: MessageEvent, path: str,
+                         quote_to: Optional[str] = None) -> SendResult:
+        """把图片/文件作为**独立消息**发回原会话（协议的 <img>/<file> 标签落到这里）。
+        不支持的通道返回 ok=False，核心降级为文本说明。"""
+        return SendResult(ok=False, error=f"{self.name} 通道不支持发送媒体")
+
     async def fetch_message_text(self, message_id: str) -> Optional[str]:
         """按平台消息 id 取消息文本（引用解析的最后一级兜底）。
         默认不支持（None）；飞书实现它（message.get），微信的 ref_msg 内联自带文本用不到。"""

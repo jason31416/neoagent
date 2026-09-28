@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 try:
     import lark_oapi as lark
     from lark_oapi.api.im.v1 import (
+        CreateFileRequest, CreateFileRequestBody,
+        CreateImageRequest, CreateImageRequestBody,
         GetMessageRequest, GetMessageResourceRequest,
         CreateMessageRequest, CreateMessageRequestBody,
         P2ImMessageReceiveV1, ReplyMessageRequest, ReplyMessageRequestBody,
@@ -338,4 +340,61 @@ class FeishuAdapter(ChannelAdapter):
             return SendResult(ok=True, message_id=sent_id)
         except Exception as exc:
             logger.exception("[feishu] 发送异常")
+            return SendResult(ok=False, error=str(exc))
+
+    async def send_media(self, event: MessageEvent, path: str,
+                         quote_to: Optional[str] = None) -> SendResult:
+        """发图片/文件为**独立消息**：上传拿 image_key/file_key → create/reply。
+        svg 等 image/* 但非栅格的走 file 通道（飞书图片上传只收栅格图）。"""
+        import mimetypes
+        from pathlib import Path
+        try:
+            p = Path(path)
+            mime = mimetypes.guess_type(str(p))[0] or ""
+            if mime in ("image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"):
+                with open(p, "rb") as f:
+                    body = (CreateImageRequestBody.builder()
+                            .image_type("message").image(f).build())
+                    resp = self._client.im.v1.image.create(
+                        CreateImageRequest.builder().request_body(body).build())
+                if not resp.success():
+                    err = f"图片上传失败 code={resp.code} msg={resp.msg}"
+                    logger.error("[feishu] %s", err)
+                    return SendResult(ok=False, error=err)
+                content = json.dumps({"image_key": resp.data.image_key})
+                msg_type = "image"
+            else:
+                with open(p, "rb") as f:
+                    body = (CreateFileRequestBody.builder()
+                            .file_type("stream").file_name(p.name).file(f).build())
+                    resp = self._client.im.v1.file.create(
+                        CreateFileRequest.builder().request_body(body).build())
+                if not resp.success():
+                    err = f"文件上传失败 code={resp.code} msg={resp.msg}"
+                    logger.error("[feishu] %s", err)
+                    return SendResult(ok=False, error=err)
+                content = json.dumps({"file_key": resp.data.file_key})
+                msg_type = "file"
+
+            if quote_to:
+                rbody = (ReplyMessageRequestBody.builder()
+                         .content(content).msg_type(msg_type).build())
+                request = (ReplyMessageRequest.builder()
+                           .message_id(quote_to).request_body(rbody).build())
+                response = self._client.im.v1.message.reply(request)
+            else:
+                sbody = (CreateMessageRequestBody.builder()
+                         .receive_id(event.metadata.get("chat_id") or event.conversation.id)
+                         .msg_type(msg_type).content(content).build())
+                request = (CreateMessageRequest.builder()
+                           .receive_id_type("chat_id").request_body(sbody).build())
+                response = self._client.im.v1.message.create(request)
+            if not response.success():
+                err = f"code={response.code} msg={response.msg}"
+                logger.error("[feishu] 媒体发送失败 %s", err)
+                return SendResult(ok=False, error=err)
+            sent_id = getattr(getattr(response, "data", None), "message_id", None)
+            return SendResult(ok=True, message_id=sent_id)
+        except Exception as exc:
+            logger.exception("[feishu] 媒体发送异常")
             return SendResult(ok=False, error=str(exc))

@@ -42,13 +42,19 @@ async def _run() -> None:
         logger.info("[%s] 收到：%s", event.channel, event.text[:80])
         adapter = event_adapter(event.channel)
 
-        async def responder(text: str, quote_to: str | None = None,
+        async def responder(text: str, quote_to: str | None = None, media: str | None = None,
                             _event=event, _adapter=adapter):
             """回复出口：M 的话经原通道发回（忙时回执也走这里）。
-            quote_to：M 的 replyTo → 通道级引用；返回 SendResult（message_id 回填账用）。"""
-            logger.info("[%s] 回复 >>>%s\n%s", _event.channel,
-                        f"（引用 {quote_to}）" if quote_to else "", text)
-            result = await _adapter.send_reply(_event, text, quote_to=quote_to)
+            quote_to：M 的 replyTo → 通道级引用；media：媒体消息（<img>/<file>，独立消息）。
+            返回 SendResult（message_id 回填账用）。"""
+            if media:
+                logger.info("[%s] 回复 >>>（媒体 %s）%s", _event.channel, media,
+                            f"（引用 {quote_to}）" if quote_to else "")
+                result = await _adapter.send_media(_event, media, quote_to=quote_to)
+            else:
+                logger.info("[%s] 回复 >>>%s\n%s", _event.channel,
+                            f"（引用 {quote_to}）" if quote_to else "", text)
+                result = await _adapter.send_reply(_event, text, quote_to=quote_to)
             if not result.ok:
                 logger.error("[%s] 回复失败：%s", _event.channel, result.error)
             return result

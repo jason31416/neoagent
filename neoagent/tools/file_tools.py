@@ -8,20 +8,32 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .registry import ToolRegistry
 
 DEFAULT_READ_LIMIT = 200  # 单次最多读多少行（IM 场景不需要长输出）
 
+# 工作台：相对路径的解析基准（agent 的工作目录，不是项目根）
+_workspace: Optional[Path] = None
 
-def _resolve_in_roots(path_str: str, allowed_roots: List[str]) -> Path:
+
+def set_workspace(path) -> None:
+    """设置工作台目录（相对路径以它为基准；绝对路径不受影响）。"""
+    global _workspace
+    _workspace = Path(path) if path else None
+
+
+def _resolve_in_roots(path_str: str, allowed_roots: List[str], base: Optional[Path] = None) -> Path:
     """解析路径并校验在允许的根目录内。
-    统一展开 ~ 并解析符号链接后再比较，防止 ../ 和软链越界。
-    不在允许范围内直接抛 PermissionError（转成字符串回给模型）。"""
-    p = Path(path_str).expanduser().resolve()
+    相对路径以工作台（base/_workspace）为基准；统一展开 ~ 并解析符号链接后再比较，
+    防止 ../ 和软链越界。不在允许范围内直接抛 PermissionError（转成字符串回给模型）。"""
+    p = Path(path_str).expanduser()
+    if not p.is_absolute():
+        p = (base or _workspace or Path.cwd()) / p
+    p = p.resolve()
     for root in allowed_roots:
-        r = Path(root).resolve()
+        r = Path(root).expanduser().resolve()
         if p == r or r in p.parents:
             return p
     raise PermissionError(f"路径超出允许范围（allowed_roots={allowed_roots}）：{p}")

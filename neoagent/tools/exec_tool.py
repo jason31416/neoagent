@@ -24,10 +24,12 @@ class ExecPolicy:
 
     def __init__(self, timeout_seconds: int = 60, max_output_bytes: int = 20000,
                  allowed_roots: List[str] | None = None,
-                 deny_patterns: List[str] | None = None) -> None:
+                 deny_patterns: List[str] | None = None,
+                 workspace: str = "") -> None:
         self.timeout_seconds = timeout_seconds
         self.max_output_bytes = max_output_bytes
         self.allowed_roots = allowed_roots or []
+        self.workspace = workspace                  # 默认 cwd（工作台）
         # 预编译正则，命中任一即拒绝
         self.deny_res = [re.compile(p) for p in (deny_patterns or [])]
 
@@ -53,8 +55,9 @@ async def exec_command(args: Dict[str, Any]) -> str:
         if dre.search(command):
             return f"命令被安全策略拒绝（命中禁止模式 {dre.pattern}）：{command}"
 
-    # 2. cwd 校验（默认落在项目根目录）
-    cwd = str(args.get("cwd", "")) or (policy.allowed_roots[0] if policy.allowed_roots else ".")
+    # 2. cwd 校验（默认落在工作台；显式 cwd 必须在允许范围内）
+    cwd = str(args.get("cwd", "")) or policy.workspace \
+        or (policy.allowed_roots[0] if policy.allowed_roots else ".")
     from pathlib import Path
     cwd_p = Path(cwd).expanduser().resolve()
     ok = any(cwd_p == Path(r).resolve() or Path(r).resolve() in cwd_p.parents
@@ -106,7 +109,7 @@ EXEC_SCHEMA = {
         "type": "object",
         "properties": {
             "command": {"type": "string", "description": "要执行的 bash 命令"},
-            "cwd": {"type": "string", "description": "工作目录（可选，默认项目目录；必须在允许范围内）"},
+            "cwd": {"type": "string", "description": "工作目录（可选，默认工作台；必须在允许范围内）"},
         },
         "required": ["command"],
     },

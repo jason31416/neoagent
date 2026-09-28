@@ -9,11 +9,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
+import mimetypes
+import secrets
 import time
+from pathlib import Path
 from typing import Dict, Optional, Tuple
+from urllib.parse import quote
 
 import aiohttp
 
@@ -388,6 +393,65 @@ class WeixinAdapter(ChannelAdapter):
         except Exception as exc:
             logger.exception("[weixin] 发送失败")
             return SendResult(ok=False, error=str(exc))
+
+    async def send_media(self, event: MessageEvent, path: str,
+                         quote_to: Optional[str] = None) -> SendResult:
+        """发图片/文件为独立消息（hermes 同款链路）：
+        getuploadurl → AES-128-ECB 加密 → CDN POST → 带媒体 item 的 sendmessage。"""
+        assert self._session is not None
+        to = str(event.metadata.get("to_user_id") or event.conversation.id)
+        context_token = event.metadata.get("context_token") \
+            or self._tokens.get(self._account_id, to)
+        try:
+            plaintext = Path(path).read_bytes()
+            media_type, item_type = _outbound_media_type(path)
+            filekey, aes_key = secrets.token_hex(16), secrets.token_bytes(16)
+            rawsize, rawfilemd5 = len(plaintext), hashlib.md5(plaintext).hexdigest()
+
+            resp = await ilink.get_upload_url(
+                self._session, base_url=self._base_url, token=self._token, to_user_id=to,
+                media_type=media_type, filekey=filekey, rawsize=rawsize,
+                rawfilemd5=rawfilemd5, filesize=((rawsize + 16) // 16) * 16,
+                aeskey_hex=aes_key.hex())
+            ciphertext = ilink._aes128_ecb_encrypt(plaintext, aes_key)
+            upload_param = str(resp.get("upload_param") or "")
+            # 优先 upload_full_url（CDN 直传），否则拼 upload_param；hermes 实测 POST，PUT 404
+            upload_url = str(resp.get("upload_full_url") or "") or (upload_param and (
+                f"{ilink.WEIXIN_CDN_BASE_URL.rstrip('/')}/upload"
+                f"?encrypted_query_param={quote(upload_param, safe='')}&filekey={quote(filekey, safe='')}"))
+            if not upload_url:
+                return SendResult(ok=False, error="getuploadurl 既没回 upload_param 也没回 upload_full_url")
+            enc_param = await ilink.upload_ciphertext(self._session, ciphertext=ciphertext,
+                                                      upload_url=upload_url)
+            item = ilink.media_item(
+                item_type,
+                encrypt_query_param=enc_param,
+                # iLink 期望 aes_key = base64(hex 字符串)；给原始字节会渲染成灰图（hermes 实测）
+                aes_key_for_api=base64.b64encode(aes_key.hex().encode("ascii")).decode("ascii"),
+                ciphertext_size=len(ciphertext), plaintext_size=rawsize,
+                filename=Path(path).name, rawfilemd5=rawfilemd5)
+            resp = await ilink.send_items(self._session, base_url=self._base_url,
+                                          token=self._token, to=to, item_list=[item],
+                                          context_token=context_token, ref_msg_id=quote_to)
+            ret = resp.get("ret", 0)
+            if ret not in (0, None):
+                err = f"sendmessage ret={ret} errcode={resp.get('errcode')} errmsg={resp.get('errmsg')}"
+                logger.error("[weixin] 媒体发送 %s", err)
+                return SendResult(ok=False, error=err)
+            return SendResult(ok=True, message_id=ilink.sent_msg_id(resp))
+        except Exception as exc:
+            logger.exception("[weixin] 媒体发送失败")
+            return SendResult(ok=False, error=str(exc))
+
+
+def _outbound_media_type(path: str) -> Tuple[int, int]:
+    """出向媒体归类：图→IMAGE、视频→VIDEO，其余（含音频）都当 FILE 发。"""
+    mime = mimetypes.guess_type(path)[0] or ""
+    if mime.startswith("image/"):
+        return ilink.MEDIA_IMAGE, ilink.ITEM_IMAGE
+    if mime.startswith("video/"):
+        return ilink.MEDIA_VIDEO, ilink.ITEM_VIDEO
+    return ilink.MEDIA_FILE, ilink.ITEM_FILE
 
 
 def _split_text(text: str, max_len: int) -> list[str]:

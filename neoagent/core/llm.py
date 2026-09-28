@@ -36,9 +36,11 @@ class ToolCall:
 
 @dataclass
 class ChatResult:
-    """一次模型调用的结果。content 和 tool_calls 可以同时出现。"""
+    """一次模型调用的结果。content 和 tool_calls 可以同时出现。
+    usage 是接口回的真实用量（prompt/completion_tokens，拿不到为 None）。"""
     content: Optional[str] = None
     tool_calls: List[ToolCall] = field(default_factory=list)
+    usage: Optional[Dict[str, int]] = None
 
 
 class LLMClient:
@@ -74,4 +76,9 @@ class LLMClient:
                 name=tc.function.name,
                 arguments=tc.function.arguments or "{}",
             ))
+        if getattr(resp, "usage", None) is not None:
+            result.usage = {
+                "prompt_tokens": getattr(resp.usage, "prompt_tokens", 0) or 0,
+                "completion_tokens": getattr(resp.usage, "completion_tokens", 0) or 0,
+            }
         return result

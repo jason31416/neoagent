@@ -210,26 +210,37 @@ def sent_msg_id(resp: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+async def send_items(session: aiohttp.ClientSession, *, base_url: str, token: str,
+                     to: str, item_list: List[Dict[str, Any]], context_token: Optional[str],
+                     ref_msg_id: Optional[str] = None) -> Dict[str, Any]:
+    """发一条消息（item_list 可含文本/媒体项）。ref_msg_id：引用同会话某条消息。"""
+    items = list(item_list)
+    if ref_msg_id and items:
+        items[0] = {**items[0],
+                    "ref_msg": {"message_item": {"type": ITEM_TEXT, "msg_id": str(ref_msg_id)}}}
+    message: Dict[str, Any] = {
+        "from_user_id": "", "to_user_id": to,
+        "client_id": secrets.token_hex(8),       # 幂等去重用，随机即可
+        "message_type": MSG_TYPE_BOT,
+        "message_state": MSG_STATE_FINISH,
+        "item_list": items,
+    }
+    if context_token:
+        message["context_token"] = context_token
+    return await _api_post(session, base_url=base_url, endpoint=EP_SEND_MESSAGE,
+                           payload={"msg": message}, token=token, timeout_ms=API_TIMEOUT_MS)
+
+
 async def send_text(session: aiohttp.ClientSession, *, base_url: str, token: str,
                     to: str, text: str, context_token: Optional[str],
                     ref_msg_id: Optional[str] = None) -> Dict[str, Any]:
     """回一条文本消息。context_token 必带（拿不到就多半发不出去）。
     ref_msg_id：引用（回复）同会话里的某条消息——协议对称（收包 ref_msg 同构），
     服务端不认就当普通消息发出去，不炸。"""
-    item: Dict[str, Any] = {"type": ITEM_TEXT, "text_item": {"text": text}}
-    if ref_msg_id:
-        item["ref_msg"] = {"message_item": {"type": ITEM_TEXT, "msg_id": str(ref_msg_id)}}
-    message: Dict[str, Any] = {
-        "from_user_id": "", "to_user_id": to,
-        "client_id": secrets.token_hex(8),       # 幂等去重用，随机即可
-        "message_type": MSG_TYPE_BOT,
-        "message_state": MSG_STATE_FINISH,
-        "item_list": [item],
-    }
-    if context_token:
-        message["context_token"] = context_token
-    return await _api_post(session, base_url=base_url, endpoint=EP_SEND_MESSAGE,
-                           payload={"msg": message}, token=token, timeout_ms=API_TIMEOUT_MS)
+    return await send_items(
+        session, base_url=base_url, token=token, to=to,
+        item_list=[{"type": ITEM_TEXT, "text_item": {"text": text}}],
+        context_token=context_token, ref_msg_id=ref_msg_id)
 
 
 def extract_text(item_list: List[Dict[str, Any]], fold_ref: bool = True) -> str:
@@ -417,3 +428,74 @@ async def download_media(session: "aiohttp.ClientSession", *, encrypted_query_pa
 
     raw = await asyncio.wait_for(_do(), timeout=timeout_seconds)
     return _aes128_ecb_decrypt(raw, _parse_aes_key(aes_key_b64)) if aes_key_b64 else raw
+
+
+# ----------------------------------------------------------------------
+# 媒体上传/发送（移植自 hermes weixin.py 的 _send_file 链路）
+# getuploadurl → AES-128-ECB 加密 → CDN POST → x-encrypted-param → 带媒体 item 的 sendmessage
+# ----------------------------------------------------------------------
+MEDIA_IMAGE, MEDIA_VIDEO, MEDIA_FILE, MEDIA_VOICE = 1, 2, 3, 4   # getuploadurl media_type
+EP_GET_UPLOAD_URL = "ilink/bot/getuploadurl"
+
+
+def _pkcs7_pad(data: bytes, block_size: int = 16) -> bytes:
+    pad_len = block_size - (len(data) % block_size)
+    return data + bytes([pad_len] * pad_len)
+
+
+def _aes128_ecb_encrypt(plaintext: bytes, key: bytes) -> bytes:
+    """AES-128-ECB 加密 + PKCS7 填充（与下载解密对称）。"""
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    encryptor = Cipher(algorithms.AES(key), modes.ECB(), backend=default_backend()).encryptor()
+    return encryptor.update(_pkcs7_pad(plaintext)) + encryptor.finalize()
+
+
+# 出向媒体 item 构造：item type → (item key, 附加字段)
+_ITEM_SHAPES: Dict[int, Any] = {
+    ITEM_FILE: ("file_item", lambda kw: {"file_name": kw["filename"], "len": str(kw["plaintext_size"])}),
+    ITEM_IMAGE: ("image_item", lambda kw: {"mid_size": kw["ciphertext_size"]}),
+    ITEM_VIDEO: ("video_item", lambda kw: {
+        "video_size": kw["ciphertext_size"], "play_length": kw.get("play_length", 0),
+        "video_md5": kw.get("rawfilemd5", "")}),
+    ITEM_VOICE: ("voice_item", lambda kw: {
+        "encode_type": kw.get("encode_type"), "bits_per_sample": kw.get("bits_per_sample"),
+        "sample_rate": kw.get("sample_rate"), "playtime": kw.get("playtime", 0)}),
+}
+
+
+def media_item(item_type: int, **kw: Any) -> Dict[str, Any]:
+    """出向媒体 item（收包同构的 media 块 + 各类型附加字段）。"""
+    key, fields = _ITEM_SHAPES[item_type]
+    media = {"encrypt_query_param": kw["encrypt_query_param"],
+             "aes_key": kw["aes_key_for_api"], "encrypt_type": 1}
+    return {"type": item_type, key: {"media": media, **fields(kw)}}
+
+
+async def get_upload_url(session: aiohttp.ClientSession, *, base_url: str, token: str,
+                         to_user_id: str, media_type: int, filekey: str,
+                         rawsize: int, rawfilemd5: str, filesize: int,
+                         aeskey_hex: str) -> Dict[str, Any]:
+    """向 iLink 要上传地址。filesize 是 PKCS7 补齐后的密文尺寸（16 的倍数）。"""
+    payload = {"filekey": filekey, "media_type": media_type, "to_user_id": to_user_id,
+               "rawsize": rawsize, "rawfilemd5": rawfilemd5, "filesize": filesize,
+               "no_need_thumb": True, "aeskey": aeskey_hex}
+    return await _api_post(session, base_url=base_url, endpoint=EP_GET_UPLOAD_URL,
+                           payload=payload, token=token, timeout_ms=API_TIMEOUT_MS)
+
+
+async def upload_ciphertext(session: aiohttp.ClientSession, *, ciphertext: bytes,
+                            upload_url: str) -> str:
+    """密文 POST 到 CDN，返回响应头 x-encrypted-param（放进媒体 item 用）。"""
+
+    async def _do() -> str:
+        async with session.post(upload_url, data=ciphertext,
+                                headers={"Content-Type": "application/octet-stream"}) as resp:
+            param = resp.headers.get("x-encrypted-param") if resp.status == 200 else None
+            if param:
+                await resp.read()
+                return param
+            raw = (await resp.text())[:200]
+            raise RuntimeError(f"CDN 上传缺 x-encrypted-param 头: {raw}"
+                               if resp.status == 200 else f"CDN 上传 HTTP {resp.status}: {raw}")
+    return await asyncio.wait_for(_do(), timeout=120)

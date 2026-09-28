@@ -220,6 +220,30 @@ class MessageLedger:
             (session_key, window)).fetchall()
         return [self._row_to_entry(r) for r in reversed(rows)]
 
+    def since(self, session_key: str, after_seq: int, limit: int = 500) -> List[Any]:
+        """游标之后的新行（旧→新），增量渲染用。"""
+        rows = self._conn.execute(
+            "SELECT seq_id, message_id, type, sender_name, timestamp, text, meta"
+            " FROM messages WHERE session_key = ? AND seq_id > ? ORDER BY seq_id LIMIT ?",
+            (session_key, after_seq, limit)).fetchall()
+        return [self._row_to_entry(r) for r in rows]
+
+    def tail(self, session_key: str, before_seq: Optional[int] = None,
+             limit: int = 500) -> List[Any]:
+        """从最新往老翻批（新→旧），冷启动扫预算用。before_seq=None 从最新开始。"""
+        if before_seq is None:
+            rows = self._conn.execute(
+                "SELECT seq_id, message_id, type, sender_name, timestamp, text, meta"
+                " FROM messages WHERE session_key = ? ORDER BY seq_id DESC LIMIT ?",
+                (session_key, limit)).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT seq_id, message_id, type, sender_name, timestamp, text, meta"
+                " FROM messages WHERE session_key = ? AND seq_id < ?"
+                " ORDER BY seq_id DESC LIMIT ?",
+                (session_key, before_seq, limit)).fetchall()
+        return [self._row_to_entry(r) for r in rows]
+
     def by_seqs(self, session_key: str, seq_ids: List[int]) -> List[Any]:
         """按 seq 取行（引用召回用），旧→新。不在库里的 id 静默略过。"""
         ids = sorted({int(s) for s in seq_ids})

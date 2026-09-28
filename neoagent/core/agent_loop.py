@@ -19,17 +19,21 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 from uuid import uuid4
 
+from ..providers.tokens import HeuristicTokenCounter, TokenAnchor, TokenCounter, count_chat_payload
+from ..tools.file_tools import _resolve_in_roots
 from ..tools.registry import ToolRegistry
-from .events import MessageEvent, ReplyRef
+from .events import Attachment, MessageEvent, ReplyRef
 from .ledger import (MessageLedger, TYPE_ASSISTANT, TYPE_INTERNAL, TYPE_TOOL_CALL,
                      TYPE_TOOL_RESULT, TYPE_USER)
 from .llm import LLMClient
-from .render import render_messages
+from .render import TimelineCache, render_messages
 
 logger = logging.getLogger(__name__)
 
@@ -42,26 +46,65 @@ _VOICE_FALLBACK = "（语音消息，转写暂不可用）"
 MAX_IMAGES_PER_MESSAGE = 4
 MAX_BUBBLES_PER_TURN = 8      # 单 turn 气泡上限（防话痨刷屏）
 
-# 消息块抽取：非贪婪；未闭合标签匹配不到 = 草稿，丢
-_MSG_BLOCK_RE = re.compile(r"<message([^>]*)>(.*?)</message>", re.S)
-# 输出侧唯一认领的属性：replyTo="msg#N"（其余属性丢弃，模型自编一概不采信）
+# 消息块抽取：文本块与媒体自闭合标签（<img>/<file>）统一按出现顺序抽取；
+# 未闭合/没 src 的坏标签匹配不到 = 草稿，丢
+_ITEM_RE = re.compile(
+    r"<message([^>]*)>(.*?)</message>|<(img|file)\b([^>]*?)/?>", re.S)
+# 输出侧认领的属性：replyTo="msg#N"（落到通道真引用）、src（媒体路径）、name（文件显示名）
 _REPLYTO_RE = re.compile(r'replyTo\s*=\s*"msg#(\d+)"')
+_SRC_RE = re.compile(r'src\s*=\s*"([^"]*)"')
+_NAME_RE = re.compile(r'name\s*=\s*"([^"]*)"')
+
+# 媒体类型白名单（mime 前缀）；不在内 → 降级文本
+_MEDIA_MIME_PREFIXES = (
+    "image/", "video/", "audio/", "text/",
+    "application/pdf", "application/json", "application/zip",
+    "application/x-tar", "application/gzip", "application/msword",
+    "application/vnd.", "application/octet-stream",
+)
 
 
-def _extract_messages(content: Optional[str]) -> List[tuple]:
-    """从模型输出里抽 <message> 块 → [(正文, 引用 seq|None), …]。
+@dataclass
+class OutMsg:
+    """模型输出里的一条消息：文本气泡（text）或媒体消息（image/file，独立消息）。"""
+    kind: str                       # "text" | "image" | "file"
+    text: str = ""
+    path: str = ""
+    name: str = ""
+    quote_seq: Optional[int] = None
 
-    属性里只认 replyTo="msg#N"（落到通道真引用）；其余属性丢弃、空块丢弃。
-    无块 = 静默。"""
+
+def _parse_attrs(attr_text: str) -> tuple:
+    q = _REPLYTO_RE.search(attr_text)
+    src = _SRC_RE.search(attr_text)
+    name = _NAME_RE.search(attr_text)
+    return (int(q.group(1)) if q else None,
+            src.group(1).strip() if src else "",
+            name.group(1).strip() if name else "")
+
+
+def _extract_messages(content: Optional[str]) -> List[OutMsg]:
+    """从模型输出里抽消息（属性只认 replyTo/src/name，其余丢弃；空块丢弃）。
+
+    - <message>…</message> → 文本气泡；
+    - <img src="…"/> / <file src="…"/> → 媒体消息（独立消息，不是谁的附件）；
+    - 无任何块 = 静默；标签外文字 = 草稿。"""
     if not content:
         return []
-    out = []
-    for m in _MSG_BLOCK_RE.finditer(content):
-        text = m.group(2).strip()
-        if not text:
-            continue
-        q = _REPLYTO_RE.search(m.group(1))
-        out.append((text, int(q.group(1)) if q else None))
+    out: List[OutMsg] = []
+    for m in _ITEM_RE.finditer(content):
+        if m.group(1) is not None:                       # <message>
+            text = m.group(2).strip()
+            if not text:
+                continue
+            quote_seq, _src, _name = _parse_attrs(m.group(1))
+            out.append(OutMsg("text", text=text, quote_seq=quote_seq))
+        else:                                            # <img>/<file>
+            quote_seq, src, name = _parse_attrs(m.group(4) or "")
+            if not src:
+                continue                                 # 没 src 的坏标签按草稿丢
+            kind = "image" if m.group(3) == "img" else "file"
+            out.append(OutMsg(kind, path=src, name=name, quote_seq=quote_seq))
     return out
 
 
@@ -82,9 +125,12 @@ class AgentLoop:
 
     def __init__(self, llm: LLMClient, registry: ToolRegistry, ledger: MessageLedger,
                  memory_file: Path, *, identity_file: Optional[Path] = None,
-                 vision=None, transcriber=None,
-                 max_tool_rounds: int = 12, history_limit: int = 200,
-                 max_images: int = MAX_IMAGES_PER_MESSAGE) -> None:
+                 vision=None, transcriber=None, token_counter: Optional[TokenCounter] = None,
+                 max_tool_rounds: int = 12, token_budget: int = 250_000,
+                 max_images: int = MAX_IMAGES_PER_MESSAGE,
+                 media_roots: Optional[List[str]] = None,
+                 media_max_bytes: int = 20 * 1024 * 1024,
+                 workspace: Optional[Path] = None) -> None:
         self.llm = llm
         self.registry = registry
         self.ledger = ledger
@@ -92,10 +138,17 @@ class AgentLoop:
         self.identity_file = Path(identity_file) if identity_file else None
         self.vision = vision
         self.transcriber = transcriber
+        self.token_counter = token_counter or HeuristicTokenCounter()
         self.max_tool_rounds = max_tool_rounds
-        self.history_limit = history_limit
+        self.token_budget = token_budget
         self.max_images = max_images
+        self.media_roots = list(media_roots or [])
+        self.media_max_bytes = int(media_max_bytes)
+        self.workspace = Path(workspace) if workspace else None   # 工作台（相对路径基准）
         self._states: Dict[str, SessionState] = {}
+        self._caches: Dict[str, TimelineCache] = {}   # 每会话增量渲染缓存
+        self._anchors: Dict[str, TokenAnchor] = {}    # 每会话真值锚定（token 预估）
+        self._tools_est: Optional[int] = None        # 工具 schema 估算（常量，算一次）
 
     # ------------------------------------------------------------------
     # 对外入口
@@ -206,9 +259,13 @@ class AgentLoop:
 
         gen_at_render = st.input_gen
         while rounds < self.max_tool_rounds:
-            # 事实层现渲染 + 本轮工具机器件（渲染前快照输入代数）
+            # 事实层现渲染 + 本轮工具机器件（渲染前快照输入代数）。
+            # 裁剪预算扣掉：工具 schema + turn 内机器件 + 锚定残差（真值锚定）。
             gen_at_render = st.input_gen
-            messages = self._render(session_key) + turn_tool_msgs
+            overhead, extra_est = self._request_overhead(session_key, tools, turn_tool_msgs)
+            messages = self._render(session_key, overhead=overhead) + turn_tool_msgs
+            est_total = self._caches[session_key].last_cost + extra_est
+            predicted = self._anchors[session_key].predict(est_total)
 
             st.model_task = asyncio.get_event_loop().create_task(
                 self.llm.chat(messages, tools=tools))
@@ -221,6 +278,7 @@ class AgentLoop:
                 continue
             st.model_task = None
             rounds += 1
+            self._anchor_and_log(session_key, result, est_total, predicted)
 
             # ① <message> 块：立即发出 + 落账（标签属性丢弃；无块 = 静默）
             bubbles_sent += await self._emit_bubbles(
@@ -259,45 +317,119 @@ class AgentLoop:
 
         # 轮数打满还没收敛：强制收尾（同样只认 <message> 块，模型静默就静默）
         logger.warning("工具循环达到上限 %d 轮，强制收尾", self.max_tool_rounds)
-        messages = self._render(session_key) + turn_tool_msgs + [{
-            "role": "user",
-            "content": "（系统提示：工具调用轮数已达上限，请立即基于已有结果用 <message> 给用户一句总结。）",
-        }]
+        nudge = {"role": "user",
+                 "content": "（系统提示：工具调用轮数已达上限，请立即基于已有结果用 <message> 给用户一句总结。）"}
+        overhead, extra_est = self._request_overhead(session_key, tools, turn_tool_msgs)
+        messages = self._render(session_key, overhead=overhead) + turn_tool_msgs + [nudge]
+        est_total = self._caches[session_key].last_cost + extra_est \
+            + count_chat_payload(self.token_counter, [nudge])
+        predicted = self._anchors[session_key].predict(est_total)
         result = await self.llm.chat(messages)
+        self._anchor_and_log(session_key, result, est_total, predicted)
         await self._emit_bubbles(session_key, st, result.content, bubbles_sent)
         return gen_at_render
 
     async def _emit_bubbles(self, session_key: str, st: SessionState,
                             content: Optional[str], already: int) -> int:
-        """把 <message> 块逐条发出并落账（一条气泡 = 一条 assistant 账，独立 msg#）。
+        """把模型输出的 <message>/<img>/<file> 逐条发出并落账。
 
-        replyTo="msg#N" → 查库解析成平台消息 id，随 responder 传给通道挂真引用；
-        解析不到（编造 seq / 工具行 / 无平台 id）→ 降级纯文本，不炸。"""
-        bubbles = _extract_messages(content)
+        一条 = 一条独立消息（媒体消息不是谁的附件，各自 msg#、可被引用）；
+        replyTo="msg#N" → 查库解析成平台消息 id，随发送传给通道挂真引用；
+        解析不到（编造 seq / 工具行 / 无平台 id）→ 降级纯发送，不炸。"""
+        items = _extract_messages(content)
         sent = 0
-        for text, quote_seq in bubbles:
+        for it in items:
             if already + sent >= MAX_BUBBLES_PER_TURN:
-                logger.warning("单 turn 气泡超过上限 %d，丢弃剩余 %d 条",
-                               MAX_BUBBLES_PER_TURN, len(bubbles) - sent)
+                logger.warning("单 turn 消息超过上限 %d，丢弃剩余 %d 条",
+                               MAX_BUBBLES_PER_TURN, len(items) - sent)
                 break
-
-            reply_ref, quote_to = self._resolve_bubble_quote(session_key, quote_seq)
-            seq = self.ledger.add(session_key=session_key, type=TYPE_ASSISTANT,
-                                  sender_name="neoagent", text=text, reply_to=reply_ref)
-            result = None
-            if st.responder is not None:
-                try:
-                    result = await st.responder(text, quote_to=quote_to)
-                except Exception:
-                    logger.exception("回复发送失败")
-            # 回填发出消息的平台 id（以后这条气泡也能被引用）
-            sent_id = getattr(result, "message_id", None) if result is not None else None
-            if sent_id:
-                self.ledger.set_message_id(session_key, seq, sent_id)
+            reply_ref, quote_to = self._resolve_bubble_quote(session_key, it.quote_seq)
+            if it.kind == "text":
+                seq = self.ledger.add(session_key=session_key, type=TYPE_ASSISTANT,
+                                      sender_name="neoagent", text=it.text, reply_to=reply_ref)
+                result = None
+                if st.responder is not None:
+                    try:
+                        result = await st.responder(it.text, quote_to=quote_to)
+                    except Exception:
+                        logger.exception("回复发送失败")
+                self._backfill_id(session_key, seq, result)
+            else:
+                await self._send_media_item(session_key, st, it, reply_ref, quote_to)
             sent += 1
-            if sent < len(bubbles):
+            if sent < len(items):
                 await asyncio.sleep(0.3)   # 条间小间隔，像连发
         return sent
+
+    def _backfill_id(self, session_key: str, seq: int, result) -> None:
+        """回填发出消息的平台 id（以后这条也能被引用）。"""
+        sent_id = getattr(result, "message_id", None) if result is not None else None
+        if sent_id:
+            self.ledger.set_message_id(session_key, seq, sent_id)
+
+    async def _say(self, session_key: str, st: SessionState, text: str) -> None:
+        """发一条普通文本消息并落账（降级说明用）。"""
+        seq = self.ledger.add(session_key=session_key, type=TYPE_ASSISTANT,
+                              sender_name="neoagent", text=text)
+        result = None
+        if st.responder is not None:
+            try:
+                result = await st.responder(text)
+            except Exception:
+                logger.exception("回复发送失败")
+        self._backfill_id(session_key, seq, result)
+
+    async def _send_media_item(self, session_key: str, st: SessionState, it: OutMsg,
+                               reply_ref, quote_to) -> None:
+        """媒体消息：安全校验 → vision 上传（图片）→ 落账 → 走通道 send_media。
+        任何一环不成就降级为文本说明（记账记实际发出的内容）。"""
+        display = it.name or it.path.rsplit("/", 1)[-1] or it.path
+        try:
+            kind, mime, p = self._validate_media(it.path)
+        except Exception as exc:
+            logger.warning("媒体消息被拒 %s：%s", it.path, exc)
+            await self._say(session_key, st, f"（{display} 发不出去：{exc}）")
+            return
+
+        provider_ref = None
+        if kind == "image" and self.vision is not None:
+            try:
+                provider_ref = await self.vision.attach(str(p))   # 自己发的图也能被回忆
+            except Exception as exc:
+                logger.warning("发出图片上传 vision 失败 %s：%s", p, exc)
+
+        att = Attachment(kind=kind, filename=it.name or p.name, mime=mime,
+                         size=p.stat().st_size, local_path=str(p), provider_ref=provider_ref)
+        seq = self.ledger.add(session_key=session_key, type=TYPE_ASSISTANT,
+                              sender_name="neoagent", text="", attachments=[att],
+                              reply_to=reply_ref)
+        result = None
+        if st.responder is not None:
+            try:
+                result = await st.responder("", quote_to=quote_to, media=str(p))
+            except Exception:
+                logger.exception("媒体发送失败")
+        ok = bool(result is not None and getattr(result, "ok", False))
+        self._backfill_id(session_key, seq, result)
+        if not ok:
+            err = getattr(result, "error", None) or "通道不支持"
+            await self._say(session_key, st, f"（{display} 发不出去：{err}）")
+
+    def _validate_media(self, path_str: str):
+        """媒体发送前的安全校验。返回 (kind, mime, Path)，不通过直接抛异常。"""
+        if not self.media_roots:
+            raise PermissionError("未配置允许的媒体目录，禁止发送")
+        p = _resolve_in_roots(path_str, self.media_roots, base=self.workspace)  # 越界抛 PermissionError
+        if not p.is_file():
+            raise FileNotFoundError(f"文件不存在：{p}")
+        size = p.stat().st_size
+        if size > self.media_max_bytes:
+            raise ValueError(f"文件 {size // 1024}KB 超过上限 {self.media_max_bytes // 1024}KB")
+        mime = mimetypes.guess_type(str(p))[0] or ""
+        if not mime.startswith(_MEDIA_MIME_PREFIXES):
+            raise ValueError(f"不支持的文件类型：{mime or '未知'}")
+        kind = "image" if mime.startswith("image/") else "file"
+        return kind, mime, p
 
     def _resolve_bubble_quote(self, session_key: str, quote_seq: Optional[int]):
         """气泡的 replyTo 解析：(落账用 ReplyRef, 通道引用用平台 id)。"""
@@ -401,14 +533,41 @@ class AgentLoop:
             logger.warning("身份文件读取失败 %s：%s", self.identity_file, exc)
             return ""
 
-    def _render(self, session_key: str):
+    def _render(self, session_key: str, overhead: int = 0):
+        cache = self._caches.setdefault(session_key, TimelineCache())
+        identity = self._identity_text()
+        if self.workspace is not None:
+            identity += f"\n\n（你的工作目录：{self.workspace}，产出物放这里；文件工具的相对路径以它为基准）"
         return render_messages(
             self.ledger, session_key,
-            identity=self._identity_text(),
+            identity=identity,
             memory_text=self._memory_text(),
-            window=self.history_limit,
+            budget=self.token_budget,
+            counter=self.token_counter,
             vision=self.vision,
+            cache=cache,
+            overhead=overhead,
         )
+
+    def _request_overhead(self, session_key: str, tools, turn_tool_msgs) -> tuple:
+        """(裁剪用开销, 非时间线估算)。
+
+        开销 = 工具 schema + turn 内工具机器件 + 真值锚定残差——都是"时间线之外
+        但真实占用上下文"的部分，得挤占时间线预算。
+        """
+        if self._tools_est is None:
+            self._tools_est = count_chat_payload(self.token_counter, tools=tools)
+        extra_est = self._tools_est + count_chat_payload(self.token_counter, turn_tool_msgs)
+        anchor = self._anchors.setdefault(session_key, TokenAnchor())
+        return extra_est + anchor.offset, extra_est
+
+    def _anchor_and_log(self, session_key: str, result, est_total: int, predicted: int) -> None:
+        """usage 统计 + 真值锚定：拿到接口真实 prompt_tokens 就重新锚定。"""
+        u = getattr(result, "usage", None) or {}
+        logger.info("[llm] usage prompt=%s completion=%s（锚定预估=%d，本地估算=%d）",
+                    u.get("prompt_tokens"), u.get("completion_tokens"), predicted, est_total)
+        if u.get("prompt_tokens"):
+            self._anchors[session_key].update(u["prompt_tokens"], est_total)
 
     async def _execute_tool(self, name: str, arguments_json: str) -> str:
         """执行一个工具调用，永远返回字符串（错误也转成字符串回给模型自纠）。"""

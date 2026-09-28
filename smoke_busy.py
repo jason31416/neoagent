@@ -18,8 +18,11 @@ async def main() -> None:
     cfg = load_config()
     agent = build_agent(cfg)
 
-    async def printer(t: str, quote_to: str | None = None) -> None:
-        print(f"\n>>> {'（引用 ' + quote_to + '）' if quote_to else ''}{t}\n", flush=True)
+    async def printer(t: str, quote_to: str | None = None, media: str | None = None) -> None:
+        if media:
+            print(f"\n>>> （媒体：{media}）\n", flush=True)
+        else:
+            print(f"\n>>> {'（引用 ' + quote_to + '）' if quote_to else ''}{t}\n", flush=True)
 
     print("=== 用例 1：工具执行中插话（预期静默 steer：无回执，纠正进下一步）===")
     await agent.submit(mk("用 exec 工具跑 `sleep 8; echo done`，跑完告诉我"), responder=printer)

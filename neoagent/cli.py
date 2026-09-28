@@ -45,8 +45,11 @@ async def _repl() -> None:
             timestamp=time.time(),
         )
 
-        async def printer(text: str, quote_to: str | None = None):
-            print(f"\n{'（引用 ' + quote_to + '）' if quote_to else ''}{text}\n")
+        async def printer(text: str, quote_to: str | None = None, media: str | None = None):
+            if media:
+                print(f"\n（媒体：{media}）\n")
+            else:
+                print(f"\n{'（引用 ' + quote_to + '）' if quote_to else ''}{text}\n")
 
         await agent.submit(event, responder=printer)
         await agent.wait_idle(event.session_key())

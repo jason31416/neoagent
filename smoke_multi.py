@@ -1,12 +1,14 @@
-"""多消息输出协议 + 上下文消息库 冒烟（离线，stub 模型，断言式）。
+"""多消息输出协议 + 上下文消息库 + token 预算窗口 冒烟（离线，stub 模型，断言式）。
 
 覆盖：
 1. <message> 块抽取：属性丢弃 / 空块丢弃 / 未闭合丢弃 / 无块 = 静默
 2. 边干边说：中间轮气泡即时发出，msg# 每泡一个
 3. 工具流水行落库：tool_call(数组)/tool_result 配对
-4. 渲染：<message> 属性标签、引用召回（出窗口按时间归位/引用链/兜底补丁）、协议机器件配对、</message> 转义
-5. 静默：无 <message> 块 → 什么都不发
-6. replyTo 显式引用：quote_to 透传通道 / 落账 reply_to / 发出 id 回填 / 编造 seq 降级
+4. 渲染：<message> 属性标签、协议机器件配对、</message> 转义
+5. 引用召回：出窗口按时间归位（不计预算）/ 引用链 / 兜底补丁
+6. 静默：无 <message> 块 → 什么都不发
+7. replyTo 显式引用：quote_to 透传通道 / 落账 reply_to / 发出 id 回填 / 编造 seq 降级
+8. token 预算：从最老端成组抛弃 / tool 组原子 / 最新块保底截断 / 增量渲染==全量渲染
 """
 import asyncio
 import os
@@ -20,11 +22,12 @@ from neoagent.core.agent_loop import AgentLoop, _extract_messages
 from neoagent.core.events import Conversation, MessageEvent, ReplyRef, SendResult, Sender
 from neoagent.core.ledger import (MessageLedger, TYPE_ASSISTANT, TYPE_TOOL_CALL,
                                   TYPE_TOOL_RESULT, TYPE_USER)
-from neoagent.core.render import render_messages
+from neoagent.core.render import TimelineCache, render_messages
+from neoagent.providers.tokens import HeuristicTokenCounter, TokenAnchor, count_chat_payload
 from neoagent.tools.registry import ToolRegistry
 
-
 IDENTITY = (Path(__file__).parent / "IDENTITY.md").read_text(encoding="utf-8").strip()
+COUNTER = HeuristicTokenCounter()
 
 
 def check(cond: bool, label: str) -> None:
@@ -57,16 +60,27 @@ def mk_event(text: str, conv: str = "smoke") -> MessageEvent:
 
 
 class Collector:
-    """stub responder：记录 (text, quote_to)，返回带 message_id 的 SendResult。"""
+    """stub responder：记录文本/媒体发送，返回带 message_id 的 SendResult。"""
 
-    def __init__(self):
+    def __init__(self, ok: bool = True):
         self.texts = []
         self.quotes = []
+        self.media = []      # (path, quote_to)
+        self.ok = ok
 
-    async def __call__(self, text: str, quote_to: str | None = None):
-        self.texts.append(text)
-        self.quotes.append(quote_to)
-        return SendResult(ok=True, message_id=f"m{len(self.texts)}")
+    async def __call__(self, text: str, quote_to: str | None = None, media: str | None = None):
+        if media:
+            self.media.append((media, quote_to))
+        else:
+            self.texts.append(text)
+            self.quotes.append(quote_to)
+        return SendResult(ok=self.ok, error=None if self.ok else "通道不支持",
+                          message_id=f"m{len(self.texts) + len(self.media)}")
+
+
+def render(ledger, sk, budget=250_000, cache=None, overhead=0):
+    return render_messages(ledger, sk, identity=IDENTITY, memory_text="",
+                           budget=budget, counter=COUNTER, cache=cache, overhead=overhead)
 
 
 async def main() -> None:
@@ -77,13 +91,22 @@ async def main() -> None:
     sent = Collector()
 
     # ── 1. 块抽取纯函数 ──
-    print("=== 1. <message> 块抽取 ===")
+    print("=== 1. 消息/媒体块抽取 ===")
     got = _extract_messages('<message>甲</message>草稿'
-                            '<message sender="x" id="msg#9" replyTo="msg#3">乙</message>')
-    check(got == [("甲", None), ("乙", 3)], f"属性丢弃、replyTo 提取（实际 {got}）")
+                            '<img src="a.png"/>'
+                            '<message sender="x" id="msg#9" replyTo="msg#3">乙</message>'
+                            '<file src="b.pdf" name="报告"/>')
+    check([(o.kind, o.text or o.path, o.quote_seq, o.name) for o in got]
+          == [("text", "甲", None, ""), ("image", "a.png", None, ""),
+              ("text", "乙", 3, ""), ("file", "b.pdf", None, "报告")],
+          f"属性丢弃、replyTo/src/name 提取、顺序保留（实际 {got}）")
     check(_extract_messages('<message></message>\n<message>  </message>') == [], "空块丢弃")
     check(_extract_messages('<message>没闭合') == [], "未闭合标签按草稿丢")
     check(_extract_messages('纯草稿，没有标签') == [], "无块 = 静默")
+    check(_extract_messages('<img alt="没src"/>') == [], "没 src 的媒体标签按草稿丢")
+    inner = _extract_messages('<message>看这个 <img src="in.png"/></message>')
+    check(len(inner) == 1 and inner[0].kind == "text" and "<img" in inner[0].text,
+          "message 正文里的 <img> 不另拆消息")
 
     # ── 2+3. 边干边说 + 工具流水行（stub 模型走完整 turn）──
     print("=== 2. 边干边说（stub 模型两轮）===")
@@ -116,20 +139,19 @@ async def main() -> None:
 
     # ── 4. 渲染 ──
     print("=== 3. 渲染 ===")
-    msgs = render_messages(ledger, "cli:smoke", identity=IDENTITY,
-                           memory_text="", window=200)
-    flat = "\n".join(str(m) for m in msgs)
+    flat = "\n".join(str(m) for m in render(ledger, "cli:smoke"))
     check('sender="jason31416"' in flat and 'id="msg#1"' in flat, "用户行元数据进标签属性")
     check('<message sender="neoagent"' in flat, "assistant 行同语法")
     check('id="msg#99"' not in flat and "time=\"2020-01-01\"" not in flat,
           "模型自编属性不出现在任何地方")
+    msgs = render(ledger, "cli:smoke")
     tool_msgs = [m for m in msgs if m.get("role") == "tool"]
     ai_tools = [m for m in msgs if m.get("role") == "assistant" and m.get("tool_calls")]
     check(len(tool_msgs) == 2 and len(ai_tools) == 1
           and [c["id"] for c in ai_tools[0]["tool_calls"]] ==
           [m["tool_call_id"] for m in tool_msgs], "协议机器件展开且配对")
 
-    # ── 5. 引用：出窗口的被引用消息 → 按时间顺序召回进上下文 ──
+    # ── 5. 引用召回：出预算窗口的被引用消息 → 按时间顺序召回（不计预算）──
     print("=== 4. 引用召回 ===")
     sk = "cli:recall"
     s0 = ledger.add(session_key=sk, type=TYPE_USER, message_id="p0",
@@ -140,17 +162,18 @@ async def main() -> None:
                                      timestamp=0, text="最早的话", attachments=[],
                                      resolved_from="db", seq_id=s0))
     for i in range(5):
-        ledger.add(session_key=sk, type=TYPE_USER, sender_name="jason31416", text=f"填充 {i}")
+        ledger.add(session_key=sk, type=TYPE_USER, sender_name="jason31416",
+                   text=f"填充 {i}" + "x" * 400)
     ledger.add(session_key=sk, type=TYPE_ASSISTANT, sender_name="neoagent", text="回很早那句",
                reply_to=ReplyRef(message_id="p1", sender_name="jason31416",
                                 timestamp=0, text="很早的原话", attachments=[],
                                 resolved_from="db", seq_id=s1))
-    msgs = render_messages(ledger, sk, identity=IDENTITY, memory_text="", window=3)
+    msgs = render(ledger, sk, budget=600)     # 小预算：s0/s1 被裁出窗口
     flat = "\n".join(str(m) for m in msgs)
     i0, i1, i_fill, i_q = (flat.find("最早的话"), flat.find("很早的原话"),
                            flat.find("填充 4"), flat.find("回很早那句"))
-    check(i0 >= 0 and i1 >= 0, "出窗口的被引用消息被召回（引用链：连更早的一起）")
-    check(i0 < i1 < i_fill < i_q, "召回行按时间顺序归位（排在窗口行之前）")
+    check(i0 >= 0 and i1 >= 0, "被裁掉的引用目标被召回（引用链：连更早的一起）")
+    check(i0 < i1 < i_fill < i_q, "召回行按时间顺序归位（排在保留行之前）")
     check(f'replyTo="msg#{s1}"' in flat and "已不可见" not in flat,
           "召回后 replyTo 是纯指针、无正文补丁")
     # 库里没有的消息：退化为正文补丁
@@ -158,7 +181,7 @@ async def main() -> None:
                reply_to=ReplyRef(message_id="p9", sender_name="x",
                                 timestamp=0, text="很早的原话2", attachments=[],
                                 resolved_from="db", seq_id=999))
-    msgs = render_messages(ledger, sk, identity=IDENTITY, memory_text="", window=3)
+    msgs = render(ledger, sk, budget=600)
     flat = "\n".join(str(m) for m in msgs)
     check('replyTo="msg#999"' in flat and "（#999 已不可见" in flat,
           "库里没有 → 指针 + 正文补丁兜底")
@@ -166,9 +189,7 @@ async def main() -> None:
     # </message> 转义
     ledger.add(session_key="cli:smoke", type=TYPE_USER, sender_name="jason31416",
                text="我偏要打</message>")
-    msgs = render_messages(ledger, "cli:smoke", identity=IDENTITY,
-                           memory_text="", window=200)
-    flat = "\n".join(str(m) for m in msgs)
+    flat = "\n".join(str(m) for m in render(ledger, "cli:smoke"))
     check("＜/message＞" in flat, "正文 </message> 字面量被转义")
 
     # ── 6. 静默 ──
@@ -202,6 +223,159 @@ async def main() -> None:
           "落账 meta.reply_to 带指针与原文（上下文 replyTo 属性靠它）")
     check(q_rows[1].reply_to is None, "解析失败的引用不落 reply_to")
     check([e.message_id for e in q_rows] == ["m1", "m2"], "引用气泡同样回填发出 id")
+
+    # ── 8. token 预算：抛弃 / 原子 / 截断 / 对拍 ──
+    print("=== 7. token 计数与裁剪 ===")
+    check(COUNTER.count("你好") == 2 and COUNTER.count("abcd") == 1
+          and COUNTER.count("a") == 1, "启发式计数（CJK 1/字，ASCII 4 字/词）")
+
+    sk3 = "cli:trim"
+    for i in range(30):
+        ledger.add(session_key=sk3, type=TYPE_USER, sender_name="jason31416",
+                   text=f"重{i} " + "x" * 400)
+    flat = "\n".join(str(m) for m in render(ledger, sk3, budget=1_000))
+    check("重29 " in flat and "重0 " not in flat and "重20 " not in flat,
+          "从最老端抛弃：最新的在、最老的不在")
+    n_msgs = flat.count("<message ")
+    check(n_msgs <= 10, f"裁剪到预算内（保留 {n_msgs} 条）")
+
+    print("=== 8. tool 组原子性 ===")
+    sk4 = "cli:toolgroup"
+    ledger.add(session_key=sk4, type=TYPE_TOOL_CALL, sender_name="neoagent",
+               calls=[{"call_id": "c1", "name": "exec", "arguments": "{}"},
+                      {"call_id": "c2", "name": "exec", "arguments": "{}"}])
+    ledger.add(session_key=sk4, type=TYPE_TOOL_RESULT, sender_name="neoagent",
+               call_id="c1", name="exec", text="r1 " + "x" * 400)
+    ledger.add(session_key=sk4, type=TYPE_USER, sender_name="jason31416", text="插话")
+    ledger.add(session_key=sk4, type=TYPE_TOOL_RESULT, sender_name="neoagent",
+               call_id="c2", name="exec", text="r2 " + "x" * 400)
+    for i in range(10):
+        ledger.add(session_key=sk4, type=TYPE_USER, sender_name="jason31416",
+                   text=f"新{i} " + "x" * 400)
+
+    def tool_state(msgs):
+        has_call = any(m.get("tool_calls") for m in msgs)
+        n_tool = sum(1 for m in msgs if m.get("role") == "tool")
+        return has_call, n_tool
+
+    has_call, n_tool = tool_state(render(ledger, sk4, budget=1_200))
+    check(not has_call and n_tool == 0, "预算不够 → 旧 tool 组整组被抛弃")
+    has_call, n_tool = tool_state(render(ledger, sk4, budget=2_000))
+    check(has_call and n_tool == 2, "预算够 → tool_call/results 整组保留（含被插话隔开的）")
+
+    print("=== 9. 最新块保底截断 ===")
+    sk5 = "cli:overflow"
+    ledger.add(session_key=sk5, type=TYPE_USER, sender_name="jason31416",
+               text="超长 " + "x" * 5000)
+    flat = "\n".join(str(m) for m in render(ledger, sk5, budget=300))
+    check("超长截断" in flat and "超长 " in flat, "单块超预算：最新块保底并截断（保头尾）")
+
+    print("=== 10. 增量渲染 == 全量渲染 ===")
+    sk6 = "cli:inc"
+    cache = TimelineCache()
+    ledger.add(session_key=sk6, type=TYPE_USER, sender_name="jason31416",
+               text="第一段 " + "x" * 300)
+    render(ledger, sk6, cache=cache)
+    ledger.add(session_key=sk6, type=TYPE_USER, sender_name="jason31416",
+               text="第二段 " + "x" * 300)
+    ledger.add(session_key=sk6, type=TYPE_TOOL_CALL, sender_name="neoagent",
+               calls=[{"call_id": "ic1", "name": "exec", "arguments": "{}"}])
+    ledger.add(session_key=sk6, type=TYPE_TOOL_RESULT, sender_name="neoagent",
+               call_id="ic1", name="exec", text="ir " + "x" * 200)
+    inc = render(ledger, sk6, cache=cache)
+    full = render(ledger, sk6)
+    check(inc == full, "增量缓存渲染与全量渲染结果一致")
+    check(cache.last_cost > 0, f"本地 token 估算有值（{cache.last_cost}）")
+
+    print("=== 11. 媒体消息（<img>/<file> 独立消息）===")
+    img_path = Path(tmp) / "pic.png"
+    img_path.write_bytes(b"\x89PNG fake")
+    msent = Collector()
+    ev = mk_event("发图", conv="media")
+    llm4 = StubLLM([SimpleNamespace(
+        content=f'<message>图来了</message><img src="{img_path}" replyTo="msg#1"/>'
+                '<img src="/etc/hosts"/>',
+        tool_calls=None)])
+    agent4 = AgentLoop(llm=llm4, registry=registry, ledger=ledger, memory_file=mem,
+                       media_roots=[tmp])
+    await agent4.submit(ev, responder=msent)
+    await agent4.wait_idle("cli:media")
+    check(msent.media == [(str(img_path.resolve()), ev.id)],
+          f"图片走 send_media 且带 quote_to（实际 {msent.media}）")
+    check(any("发不出去" in t for t in msent.texts), "越界路径降级为文字说明")
+    m_rows = ledger.visible("cli:media", 20)
+    att_rows = [e for e in m_rows if e.type == TYPE_ASSISTANT and e.attachments]
+    check(len(att_rows) == 1 and att_rows[0].attachments[0].kind == "image"
+          and att_rows[0].text == "", "媒体消息独立成行（不是附件，自己一个 msg#）")
+    flat = "\n".join(str(m) for m in render(ledger, "cli:media"))
+    check('kind="image"' in flat, "媒体行渲染带 kind/file 属性")
+
+    # 通道不支持 → 发送失败降级文字
+    fsent = Collector(ok=False)
+    llm5 = StubLLM([SimpleNamespace(content=f'<img src="{img_path}"/>', tool_calls=None)])
+    agent5 = AgentLoop(llm=llm5, registry=registry, ledger=ledger, memory_file=mem,
+                       media_roots=[tmp])
+    await agent5.submit(mk_event("再发", conv="media2"), responder=fsent)
+    await agent5.wait_idle("cli:media2")
+    check(any("发不出去：通道不支持" in t for t in fsent.texts), "发送失败降级为文字说明")
+
+    print("=== 11b. 微信媒体出向（item 构造 + 加密）===")
+    from neoagent.channels.weixin import ilink
+    key = b"0123456789abcdef"
+    ct = ilink._aes128_ecb_encrypt(b"hello wechat media", key)
+    check(len(ct) % 16 == 0 and ilink._aes128_ecb_decrypt(ct, key) == b"hello wechat media",
+          "AES-128-ECB 加解密对称（PKCS7）")
+    item = ilink.media_item(ilink.ITEM_IMAGE, encrypt_query_param="ep", aes_key_for_api="ak",
+                            ciphertext_size=32, plaintext_size=20, filename="a.png", rawfilemd5="m")
+    check(item["type"] == ilink.ITEM_IMAGE
+          and item["image_item"]["media"]["encrypt_query_param"] == "ep"
+          and item["image_item"]["mid_size"] == 32, "image_item 构造与收包同构")
+    item = ilink.media_item(ilink.ITEM_FILE, encrypt_query_param="ep", aes_key_for_api="ak",
+                            ciphertext_size=32, plaintext_size=20, filename="r.pdf", rawfilemd5="m")
+    check(item["file_item"]["file_name"] == "r.pdf" and item["file_item"]["len"] == "20",
+          "file_item 构造")
+
+    print("=== 12. 真值锚定与载荷计价 ===")
+    anchor = TokenAnchor()
+    check(anchor.predict(1_000) == 1_000, "无锚 = 纯估算")
+    anchor.update(real_total=2_000, est_total=1_000)
+    check(anchor.predict(1_500) == 2_500, "预估 = 上次真实 + 增量估算（锚定公式）")
+    check(anchor.offset == 1_000, "残差吸收恒定开销（工具 schema/框架）")
+    anchor.update(real_total=2_100, est_total=2_000)
+    check(anchor.predict(2_000) == 2_100, "重新锚定后贴回真实值")
+    tools_est = count_chat_payload(COUNTER, tools=[{"type": "function", "function": {
+        "name": "exec", "description": "跑命令", "parameters": {"type": "object"}}}])
+    turn_est = count_chat_payload(COUNTER, [
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "exec", "arguments": '{"command":"ls"}'}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "file.txt"}])
+    check(tools_est > 0 and turn_est > 24, f"载荷计价：schema={tools_est}，机器件={turn_est}")
+    # overhead 挤占时间线预算：同样预算下保留的行变少
+    flat_free = "\n".join(str(m) for m in render(ledger, sk3, budget=1_000))
+    flat_oh = "\n".join(str(m) for m in render(ledger, sk3, budget=1_000, overhead=500))
+    check(flat_oh.count("<message ") < flat_free.count("<message "),
+          "overhead（schema/机器件/锚定残差）挤占时间线预算")
+
+    print("=== 13. 工作台（workspace）===")
+    from neoagent.tools.file_tools import _resolve_in_roots, set_workspace
+    ws = Path(tmp) / "ws"
+    ws.mkdir()
+    (ws / "rel.png").write_bytes(b"\x89PNG fake")
+    set_workspace(ws)
+    check(_resolve_in_roots("rel.png", [tmp]) == (ws / "rel.png").resolve(),
+          "read/write 相对路径基准 = 工作台")
+    set_workspace(None)
+    wsent = Collector()
+    llm6 = StubLLM([SimpleNamespace(content='<img src="rel.png"/>', tool_calls=None)])
+    agent6 = AgentLoop(llm=llm6, registry=registry, ledger=ledger, memory_file=mem,
+                       media_roots=[tmp], workspace=ws)
+    await agent6.submit(mk_event("相对路径", conv="ws"), responder=wsent)
+    await agent6.wait_idle("cli:ws")
+    check(wsent.media == [(str((ws / "rel.png").resolve()), None)],
+          f"媒体相对路径以工作台为基准（实际 {wsent.media}）")
+    sys_msg = str(llm6.seen[0][0])          # stub 模型真实收到的 system 消息
+    check("工作目录" in sys_msg and str(ws) in sys_msg, "system 附【工作目录】")
 
     ledger.close()
     print("=== 全部通过 ===")
