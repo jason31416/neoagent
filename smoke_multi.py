@@ -520,6 +520,20 @@ async def main() -> None:
     check(not any(isinstance(m.get("content"), list) for m in msgs),
           "历史残留坏图自动降级（渲染保险丝，救活中毒历史）")
 
+    # ---- feishu post 富文本解析（别再"忽略消息类型 post"） ----
+    from neoagent.channels.feishu.adapter import _parse_post as _pp
+    res = []
+    lines = _pp({"title": "标题", "content": [
+        [{"tag": "text", "text": "你好"}, {"tag": "at", "user_name": "阿水"}],
+        [{"tag": "a", "text": "链接", "href": "https://x.y"}],
+        [{"tag": "img", "image_key": "k1"}],
+    ]}, res)
+    check(lines[0] == "标题" and "你好@阿水" in lines[1], f"post 段落/标题/at 解析：{lines}")
+    check("https://x.y" in lines[2], f"post 链接解析：{lines}")
+    check(res and res[0][1] == "k1" and res[0][2] == "image", f"post 内嵌图当图片资源：{res}")
+    check(_pp({"zh_cn": {"title": "", "content": [[{"tag": "text", "text": "段"}]]}}, [])[0] == "段",
+          "post 语言包裹形态兼容")
+
     ledger.close()
     print("=== 全部通过 ===")
 

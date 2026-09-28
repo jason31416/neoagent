@@ -47,6 +47,59 @@ def _ms_to_sec(value) -> float:
         return time.time()
 
 
+def _parse_post(content: dict, resources: list) -> List[str]:
+    """post 富文本 → 段落文本列表；内嵌图追加进 resources（(att, image_key, "image")）。
+
+    形态：{"title":…, "content":[[{tag,text,href,user_id,image_key…},…],…]}；
+    部分客户端带语言包裹 {"zh_cn":{…}}。未知 tag 降级占位，不丢段落。
+    """
+    body = content
+    if "content" not in body:
+        for v in content.values():
+            if isinstance(v, dict) and "content" in v:
+                body = v
+                break
+    lines: List[str] = []
+    title = str(body.get("title") or "").strip()
+    if title:
+        lines.append(title)
+    for para in body.get("content") or []:
+        parts: List[str] = []
+        for run in para if isinstance(para, list) else [para]:
+            if not isinstance(run, dict):
+                continue
+            tag = str(run.get("tag") or "")
+            if tag in ("text", "md", "code_block"):
+                parts.append(str(run.get("text") or ""))
+            elif tag == "a":
+                label = str(run.get("text") or run.get("href") or "")
+                href = str(run.get("href") or "")
+                parts.append(f"{label}（{href}）" if href and href != label else label)
+            elif tag == "at":
+                name = str(run.get("user_name") or "")
+                uid = str(run.get("user_id") or "")
+                parts.append(f"@{name or uid}" if (name or uid) else "")
+            elif tag in ("img", "media"):
+                key = str(run.get("image_key") or run.get("file_key") or "")
+                if key:
+                    att = Attachment(kind="image", filename=f"{key}.img", mime="image/*")
+                    resources.append((att, key, "image"))
+                parts.append("（图）" if tag == "img" else "（媒体）")
+            elif tag == "emotion":
+                parts.append("（表情）")
+            elif tag == "hr":
+                parts.append("———")
+            elif tag == "plain_text":
+                parts.append(str(run.get("text") or ""))
+            else:
+                txt = str(run.get("text") or "")
+                parts.append(txt or "（不支持的内容）")
+        line = "".join(parts).strip()
+        if line:
+            lines.append(line)
+    return lines
+
+
 def _safe_filename(name: str) -> str:
     """文件名安全化：去掉路径分隔符和控制字符。"""
     import re
@@ -182,6 +235,16 @@ class FeishuAdapter(ChannelAdapter):
                         return None, []
                     for m in msg.mentions:
                         text = text.replace(f"@_user_{m.key}", "").strip()
+            elif mtype == "post":
+                # 富文本：逐段展开成纯文本；内嵌图当图片资源下载
+                text = ""
+                for para in _parse_post(content, resources):
+                    text += para + "\n"
+                text = text.strip()
+                for m in msg.mentions or []:
+                    text = text.replace(f"@_user_{m.key}", "").strip()
+                if msg.chat_type == "group" and not (msg.mentions or []):
+                    return None, []
             elif mtype == "image":
                 key = str(content.get("image_key", ""))
                 if key:
