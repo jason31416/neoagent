@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .config import Config, PROJECT_ROOT
+from .config import Config, PROJECT_ROOT, ReasoningEffortSource
 from .core.agent_loop import AgentLoop
 from .core.ledger import MessageLedger
 from .core.llm import LLMClient
@@ -62,10 +62,11 @@ def build_agent(cfg: Config) -> AgentLoop:
         identity_file = PROJECT_ROOT / identity_file
 
     llm = LLMClient(cfg.llm.base_url, cfg.llm.api_key, cfg.llm.model,
-                    thinking=cfg.llm.thinking)
+                    reasoning_effort=cfg.llm.reasoning_effort)
     return AgentLoop(llm, registry, ledger, memory_file,
                      identity_file=identity_file,
                      vision=vision, transcriber=transcriber,
+                     effort_provider=ReasoningEffortSource(initial=cfg.llm.reasoning_effort),
                      token_counter=HeuristicTokenCounter(
                          image_tokens=cfg.agent.image_token_estimate),
                      max_tool_rounds=cfg.agent.max_tool_rounds,

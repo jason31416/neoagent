@@ -6,13 +6,14 @@
 base_url = "https://api.deepseek.com"
 api_key = "sk-xxxxxxxx"
 model = "deepseek-chat"
-# DeepSeek thinking 开关（deepseek-flash 默认开；开着多轮需回传 reasoning_content，
-# 我们从消息库重渲染会丢，故默认显式关闭）。换供应商可设 "" 表示不传该参数。
-thinking = "disabled"
+# 思考档位（OpenAI 标准参数 reasoning_effort，改了下一条消息即生效）：
+# "none"=不思考 | "minimal/low/medium/high/xhigh/ultra/max"=思考，档位越高想得越多
+# | ""=不传（用服务端默认，⚠️ DeepSeek 默认是开思考）
+reasoning_effort = "medium"
 
 [agent]
 # 一次回复内最多连续调用多少轮工具（防失控）
-max_tool_rounds = 12
+max_tool_rounds = 90
 # 时间线 token 预算：从最老端成组抛弃到装进预算（引用召回不计）
 history_token_budget = 250000
 # 每张图估算 token（计数器用；providers/tokens.py 可换精确实现）

@@ -210,7 +210,25 @@ class MessageLedger:
             calls=[SimpleNamespace(**c) for c in meta.get("calls", [])],
             call_id=meta.get("call_id", ""),
             name=meta.get("name", ""),
+            reasoning=meta.get("reasoning", ""),
         )
+
+    def attach_reasoning(self, session_key: str, seq_id: int, reasoning: str) -> None:
+        """把一轮的思考草稿挂到轮首行（meta.reasoning）。
+
+        reasoning 是"模型响应轮"的产物（一份/轮），账是消息粒度——挂轮首行，
+        渲染时附到由它产生的第一条协议消息上（草稿语义：不给用户看，只回传/审计）。"""
+        row = self._conn.execute(
+            "SELECT meta FROM messages WHERE session_key = ? AND seq_id = ?",
+            (session_key, seq_id)).fetchone()
+        if row is None:
+            return
+        meta = json.loads(row[0]) if row[0] else {}
+        meta["reasoning"] = reasoning
+        self._conn.execute(
+            "UPDATE messages SET meta = ? WHERE session_key = ? AND seq_id = ?",
+            (json.dumps(meta, ensure_ascii=False), session_key, seq_id))
+        self._conn.commit()
 
     def visible(self, session_key: str, window: int) -> List[Any]:
         """渲染窗口内的行（旧→新）。全量在库里，这里只取最新 window 行。"""

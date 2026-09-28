@@ -141,9 +141,11 @@ def _truncate_text(text: str, max_tokens: int, counter) -> str:
 # ----------------------------------------------------------------------
 class _Row:
     """一行（对话/内部）的缓存渲染件。body 在建块时渲染一次，引用属性组装时现拼。
-    代价按**完整标签文本**计（含 sender/id/time 属性的框架开销）。"""
+    代价按**完整标签文本**计（含 sender/id/time 属性的框架开销）。
+    reasoning 是轮首行的思考草稿——回传进协议消息（实测不计价），不给用户看。"""
 
-    __slots__ = ("seq_id", "role", "sender", "ts", "reply_to", "body", "att", "parts", "cost")
+    __slots__ = ("seq_id", "role", "sender", "ts", "reply_to", "body", "att", "parts",
+                 "reasoning", "cost")
 
     def __init__(self, entry, counter, vision) -> None:
         self.seq_id = entry.seq_id
@@ -151,6 +153,7 @@ class _Row:
         self.sender = "internal" if entry.type == TYPE_INTERNAL else entry.sender_name
         self.ts = _fmt_ts(entry.timestamp)
         self.reply_to = entry.reply_to
+        self.reasoning = getattr(entry, "reasoning", "") or ""
         self.body = _esc_body(
             f"{entry.text}{render_attachments(entry.attachments)}".strip())
         self.att = entry.attachments[0] if entry.attachments else None
@@ -160,7 +163,7 @@ class _Row:
         self.cost = self.measure(counter)
 
     def measure(self, counter) -> int:
-        """当前形态的代价（body 截断后重算用）。"""
+        """当前形态的代价（body 截断后重算用）。reasoning 不计价（实测服务端不计）。"""
         tag = _message_tag(sender=self.sender, seq_id=self.seq_id, ts=self.ts,
                            body=self.body, att=self.att)
         cost = counter.count(tag)
@@ -168,24 +171,29 @@ class _Row:
             cost += counter.count_image() * len(self.parts)
         return cost
 
-    def compose(self, visible_seqs: set) -> dict:
+    def compose(self, visible_seqs: set, include_reasoning: bool = True) -> dict:
         reply_attr, patch = _quote_parts(self.reply_to, visible_seqs)
         body = f"{patch}{self.body}" if patch else self.body
         text = _message_tag(sender=self.sender, seq_id=self.seq_id, ts=self.ts,
                             body=body, reply_attr=reply_attr, att=self.att)
         if self.parts:
-            return {"role": self.role,
-                    "content": [{"type": "text", "text": text}] + self.parts}
-        return {"role": self.role, "content": text}
+            msg = {"role": self.role,
+                   "content": [{"type": "text", "text": text}] + self.parts}
+        else:
+            msg = {"role": self.role, "content": text}
+        if self.reasoning and include_reasoning:
+            msg["reasoning_content"] = self.reasoning
+        return msg
 
 
 class Block:
     """裁剪原子：chat = 一行对话；tool = 一个 tool_call 行 + 其全部 tool_result 行。"""
 
-    __slots__ = ("kind", "first_seq", "rows", "refs", "cost", "tool_msgs", "call_index")
+    __slots__ = ("kind", "first_seq", "rows", "refs", "cost", "tool_msgs", "call_index",
+                 "reasoning")
 
     def __init__(self, kind: str, rows: List[_Row], cost: int,
-                 tool_msgs: Optional[List[dict]] = None) -> None:
+                 tool_msgs: Optional[List[dict]] = None, reasoning: str = "") -> None:
         self.kind = kind
         self.rows = rows
         self.first_seq = rows[0].seq_id if rows else 0
@@ -193,11 +201,15 @@ class Block:
         self.cost = cost
         self.tool_msgs = tool_msgs or []
         self.call_index: Dict[str, Block] = {}   # 仅 tool 块有意义（迟到结果修复用）
+        self.reasoning = reasoning               # 轮首行的思考草稿（tool 块挂 assistant 首条）
 
-    def compose(self, visible_seqs: set) -> List[dict]:
+    def compose(self, visible_seqs: set, include_reasoning: bool = True) -> List[dict]:
         if self.kind == "tool":
-            return list(self.tool_msgs)
-        return [r.compose(visible_seqs) for r in self.rows]
+            msgs = [dict(m) for m in self.tool_msgs]
+            if self.reasoning and include_reasoning and msgs:
+                msgs[0]["reasoning_content"] = self.reasoning
+            return msgs
+        return [r.compose(visible_seqs, include_reasoning) for r in self.rows]
 
 
 class TimelineCache:
@@ -251,7 +263,7 @@ def _build_blocks(rows: list, counter, vision) -> List[Block]:
                 for r in results.get(c.call_id, ()):
                     msgs.append({"role": "tool", "tool_call_id": r.call_id, "content": r.text})
                     cost += 12 + counter.count(r.text)
-            blk = Block("tool", [], cost, tool_msgs=msgs)
+            blk = Block("tool", [], cost, tool_msgs=msgs, reasoning=e.reasoning or "")
             blk.first_seq = e.seq_id
             blk.call_index = {c.call_id: blk for c in e.calls}
             blocks.append(blk)
@@ -281,7 +293,7 @@ def _trim_blocks(blocks: List[Block], usable: int) -> Tuple[List[Block], int]:
 def render_messages(ledger, session_key: str, *, identity: str, memory_text: str,
                     budget: int, counter, vision=None,
                     cache: Optional[TimelineCache] = None,
-                    overhead: int = 0) -> List[dict]:
+                    overhead: int = 0, include_reasoning: bool = True) -> List[dict]:
     """把消息库渲染成 OpenAI messages。每次 LLM 调用现渲染，不落状态。
 
     budget    时间线 token 预算（system 不占；召回不计）
@@ -289,6 +301,8 @@ def render_messages(ledger, session_key: str, *, identity: str, memory_text: str
     cache     TimelineCache（不传 = 全量渲染，测试对拍用）
     overhead  时间线之外但要计入预算的开销估算（工具 schema / turn 内工具机器件 /
               真值锚定残差）——这些是会增长的大头，得挤占时间线预算
+    include_reasoning  协议消息是否带 reasoning_content（思考草稿回传；某供应商的
+              非思考请求若拒收就关掉，实测 DeepSeek 无所谓）
     """
     cache = cache if cache is not None else TimelineCache()
 
@@ -318,7 +332,7 @@ def render_messages(ledger, session_key: str, *, identity: str, memory_text: str
     visible_seqs = {r.seq_id for b in visible for r in b.rows}
     msgs: List[dict] = [{"role": "system", "content": system}]
     for b in visible:
-        msgs.extend(b.compose(visible_seqs))
+        msgs.extend(b.compose(visible_seqs, include_reasoning))
     cache.last_cost = counter.count(system) + sum(b.cost for b in visible)
     return msgs
 

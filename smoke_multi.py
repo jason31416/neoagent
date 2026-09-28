@@ -37,15 +37,20 @@ def check(cond: bool, label: str) -> None:
 
 
 class StubLLM:
-    """按脚本回放模型返回（SimpleNamespace: content / tool_calls）。"""
+    """按脚本回放模型返回（SimpleNamespace: content / tool_calls / reasoning）。"""
 
     def __init__(self, script):
         self.script = list(script)
         self.seen = []          # 每次调用的 messages（渲染检查用）
+        self.efforts = []       # 每次调用的 reasoning_effort
 
-    async def chat(self, messages, tools=None):
+    async def chat(self, messages, tools=None, reasoning_effort=None):
         self.seen.append(messages)
-        return self.script.pop(0)
+        self.efforts.append(reasoning_effort)
+        r = self.script.pop(0)
+        if not hasattr(r, "reasoning"):
+            r.reasoning = None
+        return r
 
 
 def tc(id, name, arguments):
@@ -376,6 +381,42 @@ async def main() -> None:
           f"媒体相对路径以工作台为基准（实际 {wsent.media}）")
     sys_msg = str(llm6.seen[0][0])          # stub 模型真实收到的 system 消息
     check("工作目录" in sys_msg and str(ws) in sys_msg, "system 附【工作目录】")
+
+    print("=== 14. reasoning_effort 与思考草稿 ===")
+    think_llm = StubLLM([
+        SimpleNamespace(content='<message>想好了</message>草稿不要我',
+                        tool_calls=[tc("tt1", "noop", "{}")], reasoning="我先想想"),
+        SimpleNamespace(content='<message>做完了</message>',
+                        tool_calls=None, reasoning="收尾思考"),
+    ])
+    agent7 = AgentLoop(llm=think_llm, registry=registry, ledger=ledger, memory_file=mem,
+                       effort_provider=lambda: "low")
+    tsent = Collector()
+    await agent7.submit(mk_event("想个办法", conv="think"), responder=tsent)
+    await agent7.wait_idle("cli:think")
+    check(think_llm.efforts == ["low", "low"],
+          f"每轮按 effort_provider 取档位（实际 {think_llm.efforts}）")
+    t_rows = ledger.visible("cli:think", 20)
+    check(t_rows[1].reasoning == "我先想想" and t_rows[4].reasoning == "收尾思考",
+          "思考草稿挂轮首行（meta.reasoning）")
+    flat = "\n".join(str(m) for m in think_llm.seen[-1])
+    check("reasoning_content" in flat and "我先想想" in flat, "渲染回传 reasoning_content")
+    msgs = render_messages(ledger, "cli:think", identity=IDENTITY, memory_text="",
+                           budget=250_000, counter=COUNTER, include_reasoning=False)
+    check("reasoning_content" not in str(msgs), "include_reasoning=False 逃生门生效")
+    check("想好了" in flat and all("草稿不要我" not in (r.text or "") for r in t_rows),
+          "标签外草稿不进账（当轮协议原始输出除外）")
+
+    print("=== 15. effort 热调整（config 改了即生效）===")
+    import time as _time
+    from neoagent.config import ReasoningEffortSource
+    cfg_path = Path(tmp) / "effort.toml"
+    cfg_path.write_text('[llm]\nreasoning_effort = "none"\n', encoding="utf-8")
+    src = ReasoningEffortSource(cfg_path, initial="medium")
+    check(src.get() == "none", "改配置即生效（none）")
+    _time.sleep(0.02)
+    cfg_path.write_text('[llm]\nreasoning_effort = "high"\n', encoding="utf-8")
+    check(src.get() == "high", "再改再生效（high）")
 
     ledger.close()
     print("=== 全部通过 ===")

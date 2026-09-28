@@ -21,7 +21,9 @@ class LLMConfig:
     base_url: str = "https://api.deepseek.com"
     api_key: str = ""
     model: str = "deepseek-chat"
-    thinking: str = "disabled"   # DeepSeek thinking 开关；"" = 不传该参数
+    # 思考档位（OpenAI 标准参数 reasoning_effort）：
+    # "none" 关思考 | "minimal/low/medium/high/xhigh/ultra/max" 开思考 | "" = 不传（用服务端默认）
+    reasoning_effort: str = "medium"
 
 
 @dataclass
@@ -114,7 +116,12 @@ def load_config(path: Path | None = None) -> Config:
         cfg.llm.base_url = llm.get("base_url", cfg.llm.base_url)
         cfg.llm.api_key = llm.get("api_key", cfg.llm.api_key)
         cfg.llm.model = llm.get("model", cfg.llm.model)
-        cfg.llm.thinking = str(llm.get("thinking", cfg.llm.thinking))
+        cfg.llm.reasoning_effort = str(llm.get("reasoning_effort", cfg.llm.reasoning_effort))
+        # 旧字段 thinking 兼容映射（只在没配 reasoning_effort 时生效）：
+        # "disabled"→"none"，"enabled"→"medium"，""→不传
+        if "reasoning_effort" not in llm and "thinking" in llm:
+            t = str(llm.get("thinking", ""))
+            cfg.llm.reasoning_effort = {"disabled": "none", "enabled": "medium"}.get(t, t)
 
         ag = raw.get("agent", {})
         cfg.agent.max_tool_rounds = int(ag.get("max_tool_rounds", cfg.agent.max_tool_rounds))
@@ -167,7 +174,8 @@ def load_config(path: Path | None = None) -> Config:
     cfg.llm.api_key = os.environ.get("NEOAGENT_LLM_API_KEY", cfg.llm.api_key)
     cfg.llm.base_url = os.environ.get("NEOAGENT_LLM_BASE_URL", cfg.llm.base_url)
     cfg.llm.model = os.environ.get("NEOAGENT_LLM_MODEL", cfg.llm.model)
-    cfg.llm.thinking = os.environ.get("NEOAGENT_LLM_THINKING", cfg.llm.thinking)
+    cfg.llm.reasoning_effort = os.environ.get("NEOAGENT_LLM_REASONING_EFFORT",
+                                             cfg.llm.reasoning_effort)
     cfg.asr.api_key = os.environ.get("NEOAGENT_ASR_API_KEY", cfg.asr.api_key)
     cfg.feishu.app_id = os.environ.get("NEOAGENT_FEISHU_APP_ID", cfg.feishu.app_id)
     cfg.feishu.app_secret = os.environ.get("NEOAGENT_FEISHU_APP_SECRET", cfg.feishu.app_secret)
@@ -178,3 +186,28 @@ def load_config(path: Path | None = None) -> Config:
 
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
     return cfg
+
+
+class ReasoningEffortSource:
+    """reasoning_effort 热调整：config.toml 改了下一轮就生效（按 mtime 重载）。
+
+    每次模型调用前 get()——文件没变零成本；变了就重读（小 toml，毫秒级）。
+    配置坏了沿用旧值，绝不炸请求。将来"聊天指令调档"可替换本类接入。"""
+
+    def __init__(self, path: Path | None = None, initial: str = "medium") -> None:
+        self._path = Path(path) if path else PROJECT_ROOT / "config.toml"
+        self._value = initial
+        self._mtime: float | None = None
+
+    def get(self) -> str:
+        try:
+            mtime = self._path.stat().st_mtime
+        except OSError:
+            return self._value
+        if mtime != self._mtime:
+            self._mtime = mtime
+            try:
+                self._value = load_config(self._path).llm.reasoning_effort
+            except Exception:
+                pass
+        return self._value
