@@ -14,9 +14,9 @@ import logging
 from .app import build_agent
 from .config import load_config
 from .core.channel import ChannelAdapter
+from .log import setup_logging
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+setup_logging()
 logger = logging.getLogger("neoagent")
 
 
