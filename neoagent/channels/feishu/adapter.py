@@ -248,7 +248,7 @@ class FeishuAdapter(ChannelAdapter):
                 path = self._save_media(data, message_id, att.filename)
                 att.size = len(data)
                 att.local_path = str(path)
-                logger.info("[feishu] 附件已落盘 %s（%d 字符）", path.name, len(data))
+                logger.info("[feishu] 附件已落盘 %s（%d 字节）", path.name, len(data))
             except Exception as exc:
                 logger.warning("[feishu] 资源下载失败 %s：%s", att.filename, exc)
 

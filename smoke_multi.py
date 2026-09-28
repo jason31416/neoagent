@@ -423,7 +423,7 @@ async def main() -> None:
     print("=== 16. 图片落库与协议角色 ===")
     from neoagent.providers.vision import OpenAIImageVision
     ov = OpenAIImageVision()
-    png = b"\x89PNG fake bytes for blob"
+    png = b"\x89PNG\r\n\x1a\n" + b"fake bytes for blob"
     sk7 = "cli:imgrole"
     ledger.add(session_key=sk7, type=TYPE_USER, sender_name="jason31416", text="用户发的图",
                attachments=[Attachment(kind="image", filename="u.png", mime="image/png",
@@ -475,6 +475,10 @@ async def main() -> None:
     check(isinstance(out2, str) and "二进制文件读不出文本" in out2, "非图二进制明确拒绝，不吐乱码")
     out3 = await read_file({"path": str(rf_dir / "t.txt")})
     check(isinstance(out3, str) and "hello 文本" in out3, "文本文件照常读")
+    (rf_dir / "x.svg").write_text("<svg><!-- 矢量图是文本 --></svg>", encoding="utf-8")
+    out4 = await read_file({"path": str(rf_dir / "x.svg")})
+    check(isinstance(out4, str) and "<svg>" in out4,
+          "svg 按文本读源码（不塞视觉接口）")
 
     # 全链路：stub 模型两轮都调"看图"工具 → 信封进请求、同轮去重
     reg2 = ToolRegistry()
@@ -499,6 +503,22 @@ async def main() -> None:
           and "不重复" in look_rows[1].text,
           "同轮同图去重（第二条只留说明不重复嵌）")
     set_allowed_roots([])
+
+    print("=== 18. 图片格式保险丝（坏图绝不进上下文）===")
+    from neoagent.providers.vision import normalize_image, sniff_image_mime
+    ok_norm = normalize_image(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16, "image/*")
+    check(ok_norm is not None and ok_norm[1] == "image/png",
+          "魔数嗅探为准（mime 占位符/后缀不可信——飞书 .img 实锤）")
+    ok_bad = normalize_image(b"NOTANIMAGE\x00\x01\x02")
+    check(ok_bad is None or sniff_image_mime(ok_bad[0]) != "",
+          f"异类格式：转 png 或拒绝（实际 {'转换' if ok_bad else '拒绝'}）")
+    ledger.add(session_key="cli:poison", type=TYPE_USER, sender_name="x", text="坏图",
+               attachments=[Attachment(kind="image", filename="bad.img", mime="image/*",
+                                       size=9, local_path="", data=b"NOTANIMAGE\x00")])
+    msgs = render_messages(ledger, "cli:poison", identity=IDENTITY, memory_text="",
+                           budget=250_000, counter=COUNTER, vision=ov)
+    check(not any(isinstance(m.get("content"), list) for m in msgs),
+          "历史残留坏图自动降级（渲染保险丝，救活中毒历史）")
 
     ledger.close()
     print("=== 全部通过 ===")

@@ -27,6 +27,7 @@ from typing import Dict, List, Optional, Tuple
 from .events import Attachment, ReplyRef
 from .ledger import (TYPE_ASSISTANT, TYPE_INTERNAL, TYPE_TOOL_CALL, TYPE_TOOL_RESULT,
                      TYPE_USER)
+from ..providers.vision import sniff_image_mime
 
 # 单条引用内联摘要的上限（防超长引用刷屏）
 _QUOTE_TEXT_MAX = 200
@@ -158,10 +159,16 @@ class _Row:
             f"{entry.text}{render_attachments(entry.attachments)}".strip())
         self.att = entry.attachments[0] if entry.attachments else None
         # 图片 parts 只给 user 行（协议限制：assistant 消息不能带图；
-        # M 发出的图本就不回灌，tool 行的图走 tool 信封，见 _tool_result_msg）
-        images = [a for a in entry.attachments
-                  if a.kind == "image" and a.data and self.role == "user" and vision is not None]
-        self.parts = [vision.content_part(a.data, a.mime) for a in images] or None
+        # M 发出的图本就不回灌，tool 行的图走 tool 信封，见 _tool_result_msg）。
+        # 魔数嗅探是最后保险丝：格式不支持的图（含历史残留）绝不进上下文——
+        # 一张坏图会让之后每个请求 400。
+        parts = []
+        for a in entry.attachments:
+            if a.kind == "image" and a.data and self.role == "user" and vision is not None:
+                mime = sniff_image_mime(a.data)
+                if mime:
+                    parts.append(vision.content_part(a.data, mime))
+        self.parts = parts or None
         self.cost = self.measure(counter)
 
     def measure(self, counter) -> int:
@@ -231,14 +238,17 @@ class TimelineCache:
 def _tool_result_msg(r, vision, counter):
     """tool_result 行 → 协议 tool 消息。带图走 content 数组信封
     （实测 DeepSeek 收 tool 消息带图——工具结果信封是 OpenAI 协议下唯一原生等价物）。"""
-    imgs = [a for a in r.attachments
-            if a.kind == "image" and a.data and vision is not None]
-    if imgs:
-        content = [{"type": "text", "text": r.text}] + [
-            vision.content_part(a.data, a.mime) for a in imgs]
+    parts = []
+    for a in r.attachments:
+        if a.kind == "image" and a.data and vision is not None:
+            mime = sniff_image_mime(a.data)      # 保险丝：格式不支持的不进上下文
+            if mime:
+                parts.append(vision.content_part(a.data, mime))
+    if parts:
+        content = [{"type": "text", "text": r.text}] + parts
     else:
         content = r.text
-    cost = 12 + counter.count(r.text) + sum(counter.count_image() for _ in imgs)
+    cost = 12 + counter.count(r.text) + sum(counter.count_image() for _ in parts)
     return {"role": "tool", "tool_call_id": r.call_id, "content": content}, cost
 
 

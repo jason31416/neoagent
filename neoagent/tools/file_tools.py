@@ -52,9 +52,10 @@ async def read_file(args: Dict[str, Any]):
     if not path.is_file():
         return f"不是普通文件：{path}"
 
-    # 图片 → 工具结果信封（图像内容随工具结果进上下文，主模型亲眼看）
+    # 图片 → 工具结果信封（图像内容随工具结果进上下文，主模型亲眼看）。
+    # svg 例外：矢量图本质是文本，读源码更有用（也塞不进视觉接口）
     mime = mimetypes.guess_type(str(path))[0] or ""
-    if mime.startswith("image/"):
+    if mime.startswith("image/") and mime != "image/svg+xml":
         size = path.stat().st_size
         if size > IMAGE_READ_MAX_BYTES:
             return f"图片太大（{size // 1024}KB，上限 {IMAGE_READ_MAX_BYTES // 1024}KB），看不了"

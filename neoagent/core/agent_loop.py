@@ -27,6 +27,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from uuid import uuid4
 
 from ..providers.tokens import HeuristicTokenCounter, TokenAnchor, TokenCounter, count_chat_payload
+from ..providers.vision import normalize_image
 from ..tools.file_tools import _resolve_in_roots
 from ..tools.registry import ToolOutput, ToolRegistry
 from .events import Attachment, MessageEvent, ReplyRef
@@ -498,14 +499,22 @@ class AgentLoop:
             text = text or _VOICE_FALLBACK
 
         # 图片 → 读字节入账（blobs 内容寻址；渲染时现编码进上下文，
-        # 本地删/移文件不影响上下文还原）
+        # 本地删/移文件不影响上下文还原）。格式归一化：不支持的图绝不进上下文
+        # （一张坏图会让之后每个请求 400）。
         images = [a for a in attachments if a.kind == "image"][:self.max_images]
         for a in images:
             if a.local_path and not a.data:
                 try:
-                    a.data = Path(a.local_path).read_bytes()
+                    raw = Path(a.local_path).read_bytes()
                 except OSError as exc:
                     logger.warning("图片读取失败 %s：%s", a.filename, exc)  # 渲染层降级"（图内容未附）"
+                    continue
+                norm = normalize_image(raw, a.mime)
+                if norm is None:
+                    logger.warning("图片格式不支持，不进上下文 %s（mime=%s）",
+                                   a.filename, a.mime or "未知")
+                    continue
+                a.data, a.mime = norm
 
         return text, attachments
 
@@ -635,11 +644,15 @@ class AgentLoop:
                 continue
             seen.add(key)
             try:
-                data = Path(p).read_bytes()
+                raw = Path(p).read_bytes()
             except OSError as exc:
                 notes.append(f"\n（图 {Path(p).name} 读取失败：{exc}）")
                 continue
-            atts.append(Attachment(kind="image", filename=Path(p).name,
-                                   mime=mimetypes.guess_type(p)[0] or "image/jpeg",
+            norm = normalize_image(raw, mimetypes.guess_type(p)[0] or "")
+            if norm is None:
+                notes.append(f"\n（图 {Path(p).name} 格式不支持（仅 webp/png/jpeg/gif），看不了）")
+                continue
+            data, mime = norm
+            atts.append(Attachment(kind="image", filename=Path(p).name, mime=mime,
                                    size=len(data), local_path=p, data=data))
         return atts, "".join(notes)
