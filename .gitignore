@@ -15,3 +15,6 @@ dist/
 
 # IDE
 .idea/
+
+# 临时便签
+tmp-todo.txt

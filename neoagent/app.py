@@ -40,15 +40,19 @@ def build_agent(cfg: Config) -> AgentLoop:
         cfg.asr.provider, cfg.asr.base_url, cfg.asr.api_key, cfg.asr.model,
         cfg.asr.language, cfg.asr.max_audio_seconds)
 
-    # 消息库（SQLite，全量落盘）+ 记忆文件
+    # 消息库（SQLite，全量落盘）+ 记忆文件 + 身份文件
     ledger = MessageLedger(cfg.data_dir / "neoagent.db")
     memory_file = Path(cfg.agent.memory_file)
     if not memory_file.is_absolute():
         memory_file = PROJECT_ROOT / memory_file
+    identity_file = Path(cfg.agent.identity_file)
+    if not identity_file.is_absolute():
+        identity_file = PROJECT_ROOT / identity_file
 
     llm = LLMClient(cfg.llm.base_url, cfg.llm.api_key, cfg.llm.model,
                     thinking=cfg.llm.thinking)
     return AgentLoop(llm, registry, ledger, memory_file,
+                     identity_file=identity_file,
                      vision=vision, transcriber=transcriber,
                      max_tool_rounds=cfg.agent.max_tool_rounds,
                      history_limit=cfg.agent.history_limit,

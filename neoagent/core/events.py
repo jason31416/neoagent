@@ -89,6 +89,8 @@ class MessageEvent:
 
 @dataclass
 class SendResult:
-    """send_reply 的结果。ok=False 时 error 里是失败原因。"""
+    """send_reply 的结果。ok=False 时 error 里是失败原因。
+    message_id 是通道回执的平台消息 id（回填进账，供以后被引用）。"""
     ok: bool = True
     error: Optional[str] = None
+    message_id: Optional[str] = None

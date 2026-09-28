@@ -42,12 +42,16 @@ async def _run() -> None:
         logger.info("[%s] 收到：%s", event.channel, event.text[:80])
         adapter = event_adapter(event.channel)
 
-        async def responder(text: str, _event=event, _adapter=adapter) -> None:
-            """回复出口：M 的话经原通道发回（忙时回执也走这里）。"""
-            logger.info("[%s] 回复 >>>\n%s", _event.channel, text)
-            result = await _adapter.send_reply(_event, text)
+        async def responder(text: str, quote_to: str | None = None,
+                            _event=event, _adapter=adapter):
+            """回复出口：M 的话经原通道发回（忙时回执也走这里）。
+            quote_to：M 的 replyTo → 通道级引用；返回 SendResult（message_id 回填账用）。"""
+            logger.info("[%s] 回复 >>>%s\n%s", _event.channel,
+                        f"（引用 {quote_to}）" if quote_to else "", text)
+            result = await _adapter.send_reply(_event, text, quote_to=quote_to)
             if not result.ok:
                 logger.error("[%s] 回复失败：%s", _event.channel, result.error)
+            return result
 
         # 空闲开 turn，忙则 steer/redirect 注入当前 turn（不起并行任务）
         await agent.submit(event, quote_fetcher=adapter.fetch_message_text,
@@ -68,13 +72,19 @@ async def _run() -> None:
     try:
         await asyncio.Event().wait()  # 常驻，直到被 Ctrl-C 打断
     finally:
-        await asyncio.gather(*(a.disconnect() for a in adapters), return_exceptions=True)
+        # 收尾限时：哪个通道断得慢都别拖住退出
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(a.disconnect() for a in adapters), return_exceptions=True),
+                timeout=5)
+        except Exception:
+            logger.exception("断开通道超时/出错，直接退出")
 
 
 def main() -> None:
     try:
         asyncio.run(_run())
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("收到中断，退出")
 
 

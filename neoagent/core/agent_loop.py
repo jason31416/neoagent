@@ -2,11 +2,15 @@
 
 架构要点：
 - 每个会话**单活跃 turn**（turn 循环）；turn 中到达的消息不另起任务——
-  忙时输入走 steer/redirect（设计稿第八节）：
+  忙时输入走 steer/redirect（设计稿第八节，**静默执行、不发回执**）：
     · 正在生成（模型请求在飞）→ 取消这次请求（redirect），重渲染重跑，不扣轮数
     · 正在执行工具           → steer：本轮工具跑完、下次渲染自然带上
   因为**每轮模型调用前都从消息库现渲染**，插话（独立用户消息）自动进上下文；
 - 回复只从这里出（M 是唯一的声音）；
+- **消息协议**：模型每条要说的话用 <message>…</message> 包起来
+  （replyTo="msg#N" 落到通道真引用，其余属性是元数据、一律丢弃），
+  可连发多条、可干活中途先发一条；无块 = 静默；标签外文字 = 草稿，丢弃不入账；
+- 工具流水（tool_call/tool_result）当轮即落消息库——事实层 = 完整上下文快照；
 - 内部消息（E/cron/jev）走 inject_internal() 注入时间线，本期恒空。
 """
 
@@ -16,36 +20,49 @@ import asyncio
 import json
 import logging
 import re
-import time
 from pathlib import Path
-from typing import Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
+from uuid import uuid4
 
 from ..tools.registry import ToolRegistry
 from .events import MessageEvent, ReplyRef
-from .ledger import MessageLedger, ToolCallRecord
+from .ledger import (MessageLedger, TYPE_ASSISTANT, TYPE_INTERNAL, TYPE_TOOL_CALL,
+                     TYPE_TOOL_RESULT, TYPE_USER)
 from .llm import LLMClient
 from .render import render_messages
 
 logger = logging.getLogger(__name__)
 
 # 【它是谁】：M 的身份与行为准则（产品文档上下文第 1 段）
-IDENTITY_PROMPT = """你是 neoagent，一个跑在微信/飞书里的个人助手，是这个产品里"唯一的声音"。
-
-行为准则：
-- 用工具干活：读写文件用 read_file / write_file，跑命令用 exec。不要假装做了没做的事。
-- 回复面向聊天窗口：简短、自然、口语化，像朋友发消息，不要写大段报告。
-- 需要多步操作时自己一步步做完再汇报，不要每步都问用户。
-- 拿不准用户的意图时，简单问一句，不要猜着乱动文件。
-- 消息里的 [msg#N | 时间 | 名字] 是会话记录标记；（引用 #N）指向上文某条消息。
-- 你自己回复时**绝对不要**输出 [msg#N] 这类标记，正常说话就行。"""
+# ——内容在独立文件 IDENTITY.md（仓库根，可配置 agent.identity_file），这里不重复。
 
 # 兜底：语音转写失败/不可用时正文的占位
 _VOICE_FALLBACK = "（语音消息，转写暂不可用）"
 
 MAX_IMAGES_PER_MESSAGE = 4
+MAX_BUBBLES_PER_TURN = 8      # 单 turn 气泡上限（防话痨刷屏）
 
-# 防模仿：模型偶尔学上下文里的 [msg#N | ...] 前缀写进回复，发出前剥掉
-_MSG_PREFIX_RE = re.compile(r"^\[msg#\d+ \| \d{4}-\d{2}-\d{2} \d{2}:\d{2} \| [^\]]*\]\s*", re.M)
+# 消息块抽取：非贪婪；未闭合标签匹配不到 = 草稿，丢
+_MSG_BLOCK_RE = re.compile(r"<message([^>]*)>(.*?)</message>", re.S)
+# 输出侧唯一认领的属性：replyTo="msg#N"（其余属性丢弃，模型自编一概不采信）
+_REPLYTO_RE = re.compile(r'replyTo\s*=\s*"msg#(\d+)"')
+
+
+def _extract_messages(content: Optional[str]) -> List[tuple]:
+    """从模型输出里抽 <message> 块 → [(正文, 引用 seq|None), …]。
+
+    属性里只认 replyTo="msg#N"（落到通道真引用）；其余属性丢弃、空块丢弃。
+    无块 = 静默。"""
+    if not content:
+        return []
+    out = []
+    for m in _MSG_BLOCK_RE.finditer(content):
+        text = m.group(2).strip()
+        if not text:
+            continue
+        q = _REPLYTO_RE.search(m.group(1))
+        out.append((text, int(q.group(1)) if q else None))
+    return out
 
 
 class SessionState:
@@ -56,21 +73,23 @@ class SessionState:
         self.model_task: Optional[asyncio.Task] = None  # 在飞的模型请求（redirect 的取消对象）
         self.tool_running: bool = False                 # 正在执行工具（steer 的判定）
         self.input_gen: int = 0                          # 输入代数（单调递增）
-        self.responder: Optional[Callable] = None       # 回复出口（绑定通道适配器）
-        self.last_ack_ts: float = 0.0                   # 忙时回执限频
+        self.responder: Optional[Callable] = None       # 回复出口（绑定通道适配器）：
+        #   调用 responder(text, quote_to=平台消息id|None) → SendResult（message_id 回填账）
 
 
 class AgentLoop:
     """一个核心循环实例服务所有通道、所有会话。"""
 
     def __init__(self, llm: LLMClient, registry: ToolRegistry, ledger: MessageLedger,
-                 memory_file: Path, *, vision=None, transcriber=None,
+                 memory_file: Path, *, identity_file: Optional[Path] = None,
+                 vision=None, transcriber=None,
                  max_tool_rounds: int = 12, history_limit: int = 200,
                  max_images: int = MAX_IMAGES_PER_MESSAGE) -> None:
         self.llm = llm
         self.registry = registry
         self.ledger = ledger
         self.memory_file = Path(memory_file)
+        self.identity_file = Path(identity_file) if identity_file else None
         self.vision = vision
         self.transcriber = transcriber
         self.max_tool_rounds = max_tool_rounds
@@ -83,7 +102,7 @@ class AgentLoop:
     # ------------------------------------------------------------------
     async def submit(self, event: MessageEvent,
                      *, quote_fetcher: Optional[Callable[[str], Awaitable[Optional[str]]]] = None,
-                     responder: Optional[Callable[[str], Awaitable[None]]] = None) -> None:
+                     responder: Optional[Callable[..., Awaitable[Any]]] = None) -> None:
         """提交一条入站消息（不等待回复；回复经 responder 送回通道）。
 
         空闲 → 开新 turn；忙 → steer/redirect 注入当前 turn（不起并行任务）。
@@ -97,13 +116,23 @@ class AgentLoop:
         # 2) 引用解析：先查库（指认），取不到才走通道兜底
         reply_to = await self._resolve_reply(event, session_key, quote_fetcher)
 
-        # 3) 记账（事实层）——插话也是一等公民消息（独立 seq、可被引用）
-        self.ledger.add(
-            session_key=session_key, role="user", message_id=event.id,
-            sender_name=event.sender.name or event.sender.id,
-            text=text, timestamp=event.timestamp,
-            attachments=attachments, reply_to=reply_to,
-        )
+        # 3) 记账（事实层）：文本一行 + 每个附件一行，各自独立 msg#、可被引用。
+        #    语音附件只是转写原料（正文已是转写文本），不单独成行；
+        #    平台消息 id 记在首行（引用解析按 id 命中首行）。
+        atts = [a for a in attachments if a.kind != "audio"]
+        rows: List[tuple] = []
+        if text.strip() or not atts:
+            rows.append((text, None))
+        rows.extend(("", a) for a in atts)
+        for i, (row_text, att) in enumerate(rows):
+            self.ledger.add(
+                session_key=session_key, type=TYPE_USER,
+                message_id=event.id if i == 0 else "",
+                sender_name=event.sender.name or event.sender.id,
+                text=row_text, timestamp=event.timestamp,
+                attachments=[att] if att is not None else [],
+                reply_to=reply_to if i == 0 else None,
+            )
 
         st = self._states.setdefault(session_key, SessionState())
         if responder is not None:
@@ -114,14 +143,13 @@ class AgentLoop:
         if st.task is None or st.task.done():
             st.task = asyncio.get_event_loop().create_task(self._turn_loop(session_key))
         else:
-            # 忙时输入
+            # 忙时输入（静默执行，不发回执）
             if st.model_task is not None and not st.model_task.done():
                 # redirect：取消在飞的模型请求，重渲染重跑（不扣轮数）
                 st.model_task.cancel()
-                await self._busy_ack(st, "↪ 已转向当前任务，按你的新消息调整。")
             elif st.tool_running:
                 # steer：不杀工具，本轮工具跑完、下次渲染自然带上
-                await self._busy_ack(st, "⏩ 已插话，下一步就带上。")
+                pass
             # 缝隙（两态都不在）：pending 已置，下次渲染自然带上
 
     async def wait_idle(self, session_key: str) -> None:
@@ -135,37 +163,16 @@ class AgentLoop:
 
     def inject_internal(self, session_key: str, text: str) -> None:
         """内部消息注入（E 的输出 / cron / jev 的提醒）。本期无人调用，接口留好。"""
-        self.ledger.add(session_key=session_key, role="internal", text=text)
-
-    async def _busy_ack(self, st: SessionState, text: str) -> None:
-        """忙时回执（限频，防连环插话刷屏）。"""
-        now = time.time()
-        if now - st.last_ack_ts < 5:
-            return
-        st.last_ack_ts = now
-        if st.responder is not None:
-            try:
-                await st.responder(text)
-            except Exception:
-                logger.exception("忙时回执发送失败")
+        self.ledger.add(session_key=session_key, type=TYPE_INTERNAL, text=text)
 
     # ------------------------------------------------------------------
-    # turn 循环：一条消息或一批插话共用一轮；回复经 responder 发出
+    # turn 循环：一条消息或一批插话共用一轮；气泡在 _run_turn 内即时发出
     # ------------------------------------------------------------------
     async def _turn_loop(self, session_key: str) -> None:
         st = self._states[session_key]
         try:
             while True:
-                reply, trace, gen_at_render = await self._run_turn(session_key, st)
-                self.ledger.add(
-                    session_key=session_key, role="assistant", message_id="",
-                    sender_name="neoagent", text=reply, tool_trace=trace,
-                )
-                if st.responder is not None:
-                    try:
-                        await st.responder(reply)
-                    except Exception:
-                        logger.exception("回复发送失败")
+                gen_at_render = await self._run_turn(session_key, st)
                 # 只有"这一轮最终渲染之后又来了新输入"才再跑一轮。
                 # redirect 重跑时新输入已随重渲染进上下文并被回答，
                 # 代数已含在 gen_at_render 里——不会多跑幽灵轮。
@@ -185,13 +192,17 @@ class AgentLoop:
             st.model_task = None
             st.tool_running = False
 
-    async def _run_turn(self, session_key: str, st: SessionState):
-        """一轮：渲染 → 模型调用/工具循环。每轮模型调用前**重新渲染**，
-        所以 turn 中入库的插话自动出现在上下文里（steer/redirect 共用这条性质）。"""
+    async def _run_turn(self, session_key: str, st: SessionState) -> int:
+        """一轮：渲染 → 模型调用/工具循环，返回最终渲染时的输入代数。
+
+        每轮模型返回后立即处理（边干边说）：
+        - <message> 块 → 当场逐条发送 + 各落一条 assistant 账；
+        - tool_calls → 落 tool_call 行（一轮数组），执行后逐个落 tool_result 行。
+        """
         tools = self.registry.schemas()
-        trace: List[ToolCallRecord] = []
-        turn_tool_msgs: List[dict] = []   # 本轮的 tool_calls / tool 结果机器件（未入库，本地暂存）
+        turn_tool_msgs: List[dict] = []   # 本轮的 tool_calls / tool 结果机器件（本地暂存，未入库）
         rounds = 0
+        bubbles_sent = 0
 
         gen_at_render = st.input_gen
         while rounds < self.max_tool_rounds:
@@ -204,16 +215,26 @@ class AgentLoop:
             try:
                 result = await st.model_task
             except asyncio.CancelledError:
-                # redirect：被新消息取消 → 重渲染重跑；这一步不扣轮数
+                # redirect：被新消息取消 → 重渲染重跑；这一步不扣轮数、不落账
                 logger.info("[turn] 模型请求被转向，重渲染重跑（不扣轮数）")
                 st.model_task = None
                 continue
             st.model_task = None
             rounds += 1
 
+            # ① <message> 块：立即发出 + 落账（标签属性丢弃；无块 = 静默）
+            bubbles_sent += await self._emit_bubbles(
+                session_key, st, result.content, bubbles_sent)
+
             if not result.tool_calls:
-                return (_sanitize_reply(result.content or "（我好像没想好说什么，稍等下再问我一次）"),
-                        trace, gen_at_render)
+                return gen_at_render
+
+            # ② 工具流水落库：tool_call 行（本轮数组，一条协议消息）
+            rid = uuid4().hex[:8]
+            calls = [{"call_id": f"call_{rid}_{i}", "name": tc.name, "arguments": tc.arguments}
+                     for i, tc in enumerate(result.tool_calls)]
+            self.ledger.add(session_key=session_key, type=TYPE_TOOL_CALL,
+                            sender_name="neoagent", calls=calls)
 
             turn_tool_msgs.append({
                 "role": "assistant",
@@ -227,23 +248,75 @@ class AgentLoop:
 
             st.tool_running = True
             try:
-                for tc in result.tool_calls:
+                for i, tc in enumerate(result.tool_calls):
                     output = await self._execute_tool(tc.name, tc.arguments)
-                    trace.append(ToolCallRecord(name=tc.name, arguments=tc.arguments, result=output))
+                    self.ledger.add(session_key=session_key, type=TYPE_TOOL_RESULT,
+                                    sender_name="neoagent", text=output,
+                                    call_id=calls[i]["call_id"], name=tc.name)
                     turn_tool_msgs.append({"role": "tool", "tool_call_id": tc.id, "content": output})
             finally:
                 st.tool_running = False
 
-        # 轮数打满还没收敛：强制收尾
+        # 轮数打满还没收敛：强制收尾（同样只认 <message> 块，模型静默就静默）
         logger.warning("工具循环达到上限 %d 轮，强制收尾", self.max_tool_rounds)
         messages = self._render(session_key) + turn_tool_msgs + [{
             "role": "user",
-            "content": "（系统提示：工具调用轮数已达上限，请立即基于已有结果给用户一句总结。）",
+            "content": "（系统提示：工具调用轮数已达上限，请立即基于已有结果用 <message> 给用户一句总结。）",
         }]
         result = await self.llm.chat(messages)
-        return (_sanitize_reply(
-            result.content or "这活比我想象的绕，我先汇报下进展：工具调用次数超上限了，"
-            "你要不要换个说法让我再来一次？"), trace, gen_at_render)
+        await self._emit_bubbles(session_key, st, result.content, bubbles_sent)
+        return gen_at_render
+
+    async def _emit_bubbles(self, session_key: str, st: SessionState,
+                            content: Optional[str], already: int) -> int:
+        """把 <message> 块逐条发出并落账（一条气泡 = 一条 assistant 账，独立 msg#）。
+
+        replyTo="msg#N" → 查库解析成平台消息 id，随 responder 传给通道挂真引用；
+        解析不到（编造 seq / 工具行 / 无平台 id）→ 降级纯文本，不炸。"""
+        bubbles = _extract_messages(content)
+        sent = 0
+        for text, quote_seq in bubbles:
+            if already + sent >= MAX_BUBBLES_PER_TURN:
+                logger.warning("单 turn 气泡超过上限 %d，丢弃剩余 %d 条",
+                               MAX_BUBBLES_PER_TURN, len(bubbles) - sent)
+                break
+
+            reply_ref, quote_to = self._resolve_bubble_quote(session_key, quote_seq)
+            seq = self.ledger.add(session_key=session_key, type=TYPE_ASSISTANT,
+                                  sender_name="neoagent", text=text, reply_to=reply_ref)
+            result = None
+            if st.responder is not None:
+                try:
+                    result = await st.responder(text, quote_to=quote_to)
+                except Exception:
+                    logger.exception("回复发送失败")
+            # 回填发出消息的平台 id（以后这条气泡也能被引用）
+            sent_id = getattr(result, "message_id", None) if result is not None else None
+            if sent_id:
+                self.ledger.set_message_id(session_key, seq, sent_id)
+            sent += 1
+            if sent < len(bubbles):
+                await asyncio.sleep(0.3)   # 条间小间隔，像连发
+        return sent
+
+    def _resolve_bubble_quote(self, session_key: str, quote_seq: Optional[int]):
+        """气泡的 replyTo 解析：(落账用 ReplyRef, 通道引用用平台 id)。"""
+        if quote_seq is None:
+            return None, None
+        rows = self.ledger.by_seqs(session_key, [quote_seq])
+        row = rows[0] if rows else None
+        if row is None or row.type not in (TYPE_USER, TYPE_ASSISTANT, TYPE_INTERNAL):
+            logger.warning("replyTo=msg#%s 解析不到（不存在或非对话行），降级纯文本", quote_seq)
+            return None, None
+        ref = ReplyRef(
+            message_id=row.message_id, sender_name=row.sender_name,
+            timestamp=row.timestamp, text=row.text, attachments=row.attachments,
+            resolved_from="db", seq_id=row.seq_id)
+        if not row.message_id:
+            logger.warning("replyTo=msg#%s 没有平台消息 id（发出未回执/旧数据），降级纯文本",
+                           quote_seq)
+            return ref, None
+        return ref, row.message_id
 
     # ------------------------------------------------------------------
     # 预处理 / 引用解析
@@ -253,7 +326,7 @@ class AgentLoop:
         attachments = list(event.attachments)
 
         # 语音 → 转写成正文（按普通文本消息处理，音频只是转写原料）。
-        # 转写失败降级为占位文本；附件仍记账但渲染时不出附件行。
+        # 转写失败降级为占位文本。
         audio_atts = [a for a in attachments if a.kind == "audio"]
         if audio_atts and self.transcriber is not None:
             try:
@@ -318,10 +391,20 @@ class AgentLoop:
             logger.warning("记忆文件读取失败：%s", exc)
             return ""
 
+    def _identity_text(self) -> str:
+        """【它是谁】段：IDENTITY.md 全文（独立文件，可配置 agent.identity_file）。"""
+        if self.identity_file is None:
+            return ""
+        try:
+            return self.identity_file.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            logger.warning("身份文件读取失败 %s：%s", self.identity_file, exc)
+            return ""
+
     def _render(self, session_key: str):
         return render_messages(
             self.ledger, session_key,
-            identity=IDENTITY_PROMPT,
+            identity=self._identity_text(),
             memory_text=self._memory_text(),
             window=self.history_limit,
             vision=self.vision,
@@ -347,8 +430,3 @@ class AgentLoop:
         snippet = output[:500] + ("…" if len(output) > 500 else "")
         logger.info("工具 %s 结果（%d 字符）：%s", name, len(output), snippet)
         return output
-
-
-def _sanitize_reply(text: str) -> str:
-    """剥掉模型模仿出来的 [msg#N | ...] 行首标记（防模仿的最后一道网）。"""
-    return _MSG_PREFIX_RE.sub("", text).strip()

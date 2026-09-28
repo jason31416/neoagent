@@ -333,7 +333,10 @@ class WeixinAdapter(ChannelAdapter):
             msg_id = str(ref_item.get("msg_id") or ref.get("message_id")
                          or ref.get("svrid") or "")
             ts_ms = ref_item.get("create_time_ms") or ref.get("create_time_ms")
-            timestamp = float(ts_ms) / 1000 if ts_ms else 0.0
+            try:
+                timestamp = float(ts_ms) / 1000 if ts_ms else 0.0
+            except (TypeError, ValueError):
+                timestamp = 0.0
             # 理论上 type=ITEM_TEXT 的 ref_item 才内联文本，绝大多数情况为空
             text = ilink.extract_text([ref_item]) if ref_item else ""
             atts = []
@@ -354,7 +357,8 @@ class WeixinAdapter(ChannelAdapter):
     # ------------------------------------------------------------------
     # 发消息
     # ------------------------------------------------------------------
-    async def send_reply(self, event: MessageEvent, text: str) -> SendResult:
+    async def send_reply(self, event: MessageEvent, text: str,
+                         quote_to: Optional[str] = None) -> SendResult:
         assert self._session is not None
         to = str(event.metadata.get("to_user_id") or event.conversation.id)
         # 优先用事件里的 token，拿不到回退到 token 缓存（重启后靠它）
@@ -362,23 +366,25 @@ class WeixinAdapter(ChannelAdapter):
             or self._tokens.get(self._account_id, to)
 
         try:
-            # 微信单条消息别太长，超长按 1500 字符切条发
-            for chunk in _split_text(text, 1500):
+            sent_id = None
+            # 微信单条消息别太长，超长按 1500 字符切条发；引用只挂在第一条
+            for i, chunk in enumerate(_split_text(text, 1500)):
                 resp = await ilink.send_text(self._session, base_url=self._base_url,
                                              token=self._token, to=to, text=chunk,
-                                             context_token=context_token)
+                                             context_token=context_token,
+                                             ref_msg_id=quote_to if i == 0 else None)
                 ret = resp.get("ret", 0)
                 if ret not in (0, None):
                     err = f"sendmessage ret={ret} errcode={resp.get('errcode')} errmsg={resp.get('errmsg')}"
                     logger.error("[weixin] %s", err)
-                    return SendResult(ok=False, error=err)
-                # 探针：看 sendmessage 响应里有没有我们回复的 msg_id
-                #（将来引用 bot 自己的回复要用；确认后可改为正式存库）
+                    return SendResult(ok=False, error=err, message_id=sent_id)
+                sent_id = ilink.sent_msg_id(resp) or sent_id
+                # 探针：看 sendmessage 响应载荷（sent_msg_id 键名靠它定案）
                 if not getattr(self, "_send_resp_logged", False):
                     self._send_resp_logged = True
                     logger.info("[weixin] sendmessage 响应载荷 %.300s",
                                 json.dumps(resp, ensure_ascii=False)[:300])
-            return SendResult(ok=True)
+            return SendResult(ok=True, message_id=sent_id)
         except Exception as exc:
             logger.exception("[weixin] 发送失败")
             return SendResult(ok=False, error=str(exc))

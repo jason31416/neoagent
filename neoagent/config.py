@@ -29,6 +29,7 @@ class AgentConfig:
     max_tool_rounds: int = 12
     history_limit: int = 200          # LLM 窗口：渲染时取最新 N 条
     memory_file: str = "data/MEMORY.md"  # 记忆文件（M 自己编辑，全文注入【记忆】段）
+    identity_file: str = "IDENTITY.md"   # 身份文件（【它是谁】段，仓库根）
 
 
 @dataclass
@@ -117,6 +118,7 @@ def load_config(path: Path | None = None) -> Config:
         cfg.agent.max_tool_rounds = int(ag.get("max_tool_rounds", cfg.agent.max_tool_rounds))
         cfg.agent.history_limit = int(ag.get("history_limit", cfg.agent.history_limit))
         cfg.agent.memory_file = str(ag.get("memory_file", cfg.agent.memory_file))
+        cfg.agent.identity_file = str(ag.get("identity_file", cfg.agent.identity_file))
 
         md = raw.get("media", {})
         cfg.media.max_bytes = int(md.get("max_bytes", cfg.media.max_bytes))

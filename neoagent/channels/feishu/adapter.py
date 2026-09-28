@@ -4,7 +4,7 @@
 - 收：P2ImMessageReceiveV1 事件（文本 / 图片 / 文件 / 语音 / 视频）
 - DM 直接回，群聊仅在 @机器人 时回（否则群里会被刷屏）
 - 引用：parent_id → 先查消息库（核心层），库没有才 message.get 拉文本
-- 回：reply 接口回到原消息（自动挂到会话里）
+- 回：create 接口发普通消息到会话（不做消息级引用）
 
 用法前置：飞书开放平台建自建应用，开通 im:message 收发权限
 （群聊引用解析还需 im:message.group_msg），把 App ID / Secret 填进 config.toml。
@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 from typing import List, Optional, Tuple
 
@@ -28,11 +29,20 @@ try:
     import lark_oapi as lark
     from lark_oapi.api.im.v1 import (
         GetMessageRequest, GetMessageResourceRequest,
+        CreateMessageRequest, CreateMessageRequestBody,
         P2ImMessageReceiveV1, ReplyMessageRequest, ReplyMessageRequestBody,
     )
     LARK_AVAILABLE = True
 except ImportError:
     LARK_AVAILABLE = False
+
+
+def _ms_to_sec(value) -> float:
+    """飞书 create_time 是毫秒时间戳字符串（偶尔是 int），统一转秒。"""
+    try:
+        return int(value) / 1000
+    except (TypeError, ValueError):
+        return time.time()
 
 
 def _safe_filename(name: str) -> str:
@@ -58,6 +68,7 @@ class FeishuAdapter(ChannelAdapter):
         self._client = None          # lark REST 客户端（发消息/下载资源用）
         self._ws_client = None       # lark WS 客户端（收消息用）
         self._loop = None            # 主事件循环（connect 时记录）
+        self._ws_loop = None         # WS 线程专用事件循环（disconnect 时停它）
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -86,23 +97,43 @@ class FeishuAdapter(ChannelAdapter):
         # 坑：SDK 是在我们的事件循环里被导入的，它抓到的 loop 就是我们正在跑的
         # 那个，直接 start() 会报 "This event loop is already running"。
         # 解法：在专用线程里给 SDK 换一个全新的 loop 再 start。
+        # 线程必须是 daemon 且可停：start() 卡在 run_until_complete(_select())（无限 sleep），
+        # 停法 = 停它专用的 loop（run_until_complete 随之抛 RuntimeError 收场）。
         self._loop = asyncio.get_running_loop()
+        self._ws_loop: Optional[asyncio.AbstractEventLoop] = None
 
         def _run_ws() -> None:
             import lark_oapi.ws.client as lark_ws_client_mod
             ws_loop = asyncio.new_event_loop()
             lark_ws_client_mod.loop = ws_loop  # SDK 模块级 loop 指到本线程专用
+            self._ws_loop = ws_loop
             try:
-                self._ws_client.start()       # 内部 run_until_complete，阻塞到断开
+                self._ws_client.start()       # 内部 run_until_complete，阻塞到 loop 停
+            except RuntimeError:
+                logger.info("[feishu] WS 线程收尾退出")   # loop 被停是预期收场
             except Exception:
                 logger.exception("[feishu] WS 线程异常退出")
 
-        self._loop.run_in_executor(None, _run_ws)
+        threading.Thread(target=_run_ws, name="feishu-ws", daemon=True).start()
         logger.info("[feishu] WS 长连接启动")
 
     async def disconnect(self) -> None:
-        # lark-oapi 的 ws client 没有优雅 stop 接口，进程退出即断开
-        logger.info("[feishu] 断开（进程退出）")
+        """停掉 WS：先尽量关 socket，再停它专用的事件循环。
+        线程是 daemon——就算这里没停干净，进程退出也不会被它拖住。"""
+        ws_loop = self._ws_loop
+        if ws_loop is None:
+            return
+        try:
+            if self._ws_client is not None and hasattr(self._ws_client, "_disconnect"):
+                fut = asyncio.run_coroutine_threadsafe(self._ws_client._disconnect(), ws_loop)
+                fut.result(timeout=2)
+        except Exception:
+            pass                        # 关不掉就算了，loop 一停 socket 也活不了
+        try:
+            ws_loop.call_soon_threadsafe(ws_loop.stop)
+        except RuntimeError:
+            pass
+        logger.info("[feishu] 断开")
 
     # ------------------------------------------------------------------
     # 收消息
@@ -191,7 +222,7 @@ class FeishuAdapter(ChannelAdapter):
                     id=msg.chat_id,
                     type="group" if msg.chat_type == "group" else "direct"),
                 text=text,
-                timestamp=(msg.create_time / 1000 if msg.create_time else time.time()),
+                timestamp=_ms_to_sec(msg.create_time),
                 attachments=[a for a, _k, _t in resources],
                 reply_to=reply_to,
                 metadata={"message_id": msg.message_id, "chat_id": msg.chat_id},
@@ -272,23 +303,39 @@ class FeishuAdapter(ChannelAdapter):
     # ------------------------------------------------------------------
     # 发消息
     # ------------------------------------------------------------------
-    async def send_reply(self, event: MessageEvent, text: str) -> SendResult:
-        """用 reply 接口回到原消息（挂在同一会话里）。"""
+    async def send_reply(self, event: MessageEvent, text: str,
+                         quote_to: Optional[str] = None) -> SendResult:
+        """发消息到会话。quote_to 有值且可用时走 reply 接口挂真引用（M 的 replyTo
+        落到通道 UI），否则 create 发普通消息。"""
         try:
-            body = (ReplyMessageRequestBody.builder()
-                    .content(json.dumps({"text": text}, ensure_ascii=False))
-                    .msg_type("text")
-                    .build())
-            request = (ReplyMessageRequest.builder()
-                       .message_id(event.metadata["message_id"])
-                       .request_body(body)
-                       .build())
-            response = self._client.im.v1.message.reply(request)
+            content = json.dumps({"text": text}, ensure_ascii=False)
+            if quote_to:
+                body = (ReplyMessageRequestBody.builder()
+                        .content(content)
+                        .msg_type("text")
+                        .build())
+                request = (ReplyMessageRequest.builder()
+                           .message_id(quote_to)
+                           .request_body(body)
+                           .build())
+                response = self._client.im.v1.message.reply(request)
+            else:
+                body = (CreateMessageRequestBody.builder()
+                        .receive_id(event.metadata.get("chat_id") or event.conversation.id)
+                        .msg_type("text")
+                        .content(content)
+                        .build())
+                request = (CreateMessageRequest.builder()
+                           .receive_id_type("chat_id")
+                           .request_body(body)
+                           .build())
+                response = self._client.im.v1.message.create(request)
             if not response.success():
                 err = f"code={response.code} msg={response.msg}"
-                logger.error("[feishu] 回复失败 %s", err)
+                logger.error("[feishu] 发送失败 %s", err)
                 return SendResult(ok=False, error=err)
-            return SendResult(ok=True)
+            sent_id = getattr(getattr(response, "data", None), "message_id", None)
+            return SendResult(ok=True, message_id=sent_id)
         except Exception as exc:
-            logger.exception("[feishu] 回复异常")
+            logger.exception("[feishu] 发送异常")
             return SendResult(ok=False, error=str(exc))

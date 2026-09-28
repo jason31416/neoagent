@@ -57,9 +57,14 @@ class ChannelAdapter(abc.ABC):
         """干净断开。"""
 
     @abc.abstractmethod
-    async def send_reply(self, event: MessageEvent, text: str) -> SendResult:
+    async def send_reply(self, event: MessageEvent, text: str,
+                         quote_to: Optional[str] = None) -> SendResult:
         """把 agent 的回复发回原会话。event 携带通道回复所需的私有信息
-        （例如微信的 context_token、飞书的 message_id）。"""
+        （例如微信的 context_token、飞书的 chat_id）。
+
+        quote_to：要引用的平台消息 id（M 的 replyTo 语义落到通道 UI）；
+        不支持引用的通道可忽略它发普通消息。返回的 SendResult.message_id
+        是这条发出消息的平台 id（核心回填进账，供以后被引用）。"""
 
     async def fetch_message_text(self, message_id: str) -> Optional[str]:
         """按平台消息 id 取消息文本（引用解析的最后一级兜底）。

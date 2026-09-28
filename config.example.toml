@@ -17,6 +17,8 @@ max_tool_rounds = 12
 history_limit = 200
 # 记忆文件（M 自己用 write_file 维护，全文注入【记忆】段）
 memory_file = "data/MEMORY.md"
+# 身份文件（【它是谁】段全文；改它就改了 M 的人设与消息协议说明）
+identity_file = "IDENTITY.md"
 
 [files]
 # read_file / write_file 允许访问的根目录（防越界）

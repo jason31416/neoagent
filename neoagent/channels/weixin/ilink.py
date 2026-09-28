@@ -194,15 +194,37 @@ async def get_updates(session: aiohttp.ClientSession, *, base_url: str, token: s
         return {"ret": 0, "msgs": [], "get_updates_buf": sync_buf}
 
 
+def sent_msg_id(resp: Dict[str, Any]) -> Optional[str]:
+    """从 sendmessage 响应里掏我们发出消息的 id（键名未定案，多试几处；
+    探针日志确认后收紧）。拿不到就 None——引用自己的回复依赖它。"""
+    for key in ("msg_id", "svrid", "message_id"):
+        v = resp.get(key)
+        if v:
+            return str(v)
+    msg = resp.get("msg") or {}
+    if isinstance(msg, dict):
+        for key in ("msg_id", "svrid", "message_id"):
+            v = msg.get(key)
+            if v:
+                return str(v)
+    return None
+
+
 async def send_text(session: aiohttp.ClientSession, *, base_url: str, token: str,
-                    to: str, text: str, context_token: Optional[str]) -> Dict[str, Any]:
-    """回一条文本消息。context_token 必带（拿不到就多半发不出去）。"""
+                    to: str, text: str, context_token: Optional[str],
+                    ref_msg_id: Optional[str] = None) -> Dict[str, Any]:
+    """回一条文本消息。context_token 必带（拿不到就多半发不出去）。
+    ref_msg_id：引用（回复）同会话里的某条消息——协议对称（收包 ref_msg 同构），
+    服务端不认就当普通消息发出去，不炸。"""
+    item: Dict[str, Any] = {"type": ITEM_TEXT, "text_item": {"text": text}}
+    if ref_msg_id:
+        item["ref_msg"] = {"message_item": {"type": ITEM_TEXT, "msg_id": str(ref_msg_id)}}
     message: Dict[str, Any] = {
         "from_user_id": "", "to_user_id": to,
         "client_id": secrets.token_hex(8),       # 幂等去重用，随机即可
         "message_type": MSG_TYPE_BOT,
         "message_state": MSG_STATE_FINISH,
-        "item_list": [{"type": ITEM_TEXT, "text_item": {"text": text}}],
+        "item_list": [item],
     }
     if context_token:
         message["context_token"] = context_token
