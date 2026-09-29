@@ -2,11 +2,14 @@
 
 - 时间只留 HH:MM（发消息的场景不需要日期）；
 - 不打 logger 类路径（模块名噪音），级别用颜色区分；
-- 着色分两层：
-  · formatter 只管**通用 pattern**（级别名、[…] 组件标签 → 青），全文正则匹配
-    到此为止，不再对任意文本做花样匹配（误伤不可控，踩过）；
-  · 具体某条日志里的重点（<< 箭头、工具名…）由**打日志的调用点**用下面的
-    cyan()/green()/bold_cyan() 等辅助函数显式包起来。
+- 配色克制：颜色只标「状态 / 方向」，其余中性，不搞满屏彩字：
+  · 时间、[…] 组件标签、工具参数与结果摘要、引用注释 → 灰；
+  · 级别名：INFO 粗白、DEBUG 灰、WARNING 黄、ERROR 红；
+  · `<<` 入站 → 亮青、`>>` 出站 → 亮绿（方向锚点）；工具名 → 粗白。
+- 着色分两层：formatter 只管**通用 pattern**（级别名、[…] 标签），具体某条
+  日志里的重点（箭头、工具名、参数）由**打日志的调用点**用下面的
+  gray()/bold()/bold_cyan() 等辅助函数显式包着写——不做全文正则匹配
+  （误伤不可控，踩过）。
 - 辅助函数在非 TTY / NO_COLOR 下原样返回纯文本，管道输出不会夹带 ANSI。
 """
 
@@ -23,8 +26,8 @@ _BOLD = "\033[1m"
 _DIM = "\033[2m"
 
 _LEVEL_COLOR = {
-    "DEBUG": "\033[2;36m",        # dim cyan
-    "INFO": "\033[36m",           # cyan
+    "DEBUG": "\033[90m",          # gray
+    "INFO": "",                   # 粗白（head 统一加粗）
     "WARNING": "\033[33m",        # yellow
     "ERROR": "\033[1;31m",        # bold red
     "CRITICAL": "\033[1;35m",     # bold magenta
@@ -34,12 +37,12 @@ _TAG_RE = re.compile(r"\[([A-Za-z_][\w.]*)\]")     # [weixin] [M] [turn] …（�
 
 
 def _paint(msg: str) -> str:
-    """通用 pattern 着色：[…] 组件标签 → 青，别的一律不匹配。
+    """通用 pattern 着色：[…] 组件标签 → 灰，别的一律不匹配。
 
     消息内其余颜色由**打日志的调用点**用下面的辅助函数显式包起来；
     调用点着色的内容里不要再写 `[...]` 标签（会被这条通用规则再包一层 ANSI）。
     """
-    return _TAG_RE.sub(lambda m: f"\033[36m[{m.group(1)}]{_RESET}", msg)
+    return _TAG_RE.sub(lambda m: f"\033[90m[{m.group(1)}]{_RESET}", msg)
 
 
 # ---- 调用点着色辅助（非 TTY / NO_COLOR 下原样返回纯文本，管道输出不夹带 ANSI） ----
@@ -51,6 +54,7 @@ def _w(code: str, s) -> str:
     return f"\033[{code}m{s}{_RESET}" if _COLOR_ON else str(s)
 
 
+def gray(s) -> str:        return _w("90", s)      # noqa: E704
 def cyan(s) -> str:        return _w("36", s)      # noqa: E704
 def green(s) -> str:       return _w("32", s)      # noqa: E704
 def red(s) -> str:         return _w("31", s)      # noqa: E704
@@ -71,7 +75,7 @@ class ColorFormatter(logging.Formatter):
     def format(self, record) -> str:
         level = record.levelname
         color = _LEVEL_COLOR.get(level, "")
-        head = f"{_DIM}{self.formatTime(record)}{_RESET} {color}{_BOLD}{level:<7}{_RESET}"
+        head = f"\033[90m{self.formatTime(record)}{_RESET} {color}{_BOLD}{level:<7}{_RESET}"
         msg = _paint(record.getMessage())
         out = f"{head} {msg}"
         if record.exc_info:

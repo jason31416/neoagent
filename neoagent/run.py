@@ -14,7 +14,7 @@ import logging
 from .app import build_agent
 from .config import load_config
 from .core.channel import ChannelAdapter
-from .log import bold_cyan, bold_green, magenta, setup_logging
+from .log import bold_cyan, bold_green, gray, setup_logging
 
 setup_logging()
 logger = logging.getLogger("neoagent")
@@ -52,9 +52,10 @@ async def _run() -> None:
             """回复出口：M 的话经原通道发回（忙时回执也走这里）。
             quote_to：M 的 replyTo → 通道级引用；media：媒体消息（<img>/<file>，独立消息）。
             返回 SendResult（message_id 回填账用）。"""
-            note = magenta(f"（引用 {quote_to}）") if quote_to else ""
+            note = gray(f"（引用 {quote_to}）") if quote_to else ""
             if media:
-                logger.info("[%s] %s（媒体 %s）%s", _event.channel, bold_green(">>"), media, note)
+                logger.info("[%s] %s %s%s", _event.channel, bold_green(">>"),
+                            gray(f"（媒体 {media}）"), note)
                 result = await _adapter.send_media(_event, media, quote_to=quote_to)
             else:
                 logger.info("[%s] %s %s%s", _event.channel, bold_green(">>"), note, text)

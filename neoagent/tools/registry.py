@@ -12,7 +12,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Union
 
-from ..log import bold_cyan
+from ..log import bold, gray
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +50,9 @@ class ToolEntry:
 
 
 class ToolRegistry:
-    def __init__(self, part: str = "M") -> None:
-        """part：这套工具属于哪个部件（M=主模型 / R=记忆整理），日志里写清楚。"""
+    def __init__(self, part: str = "messenger") -> None:
+        """part：这套工具属于哪个部件（messenger=M 主模型 / recorder=R 记忆整理），
+        日志里标全称。"""
         self.part = part
         self._tools: Dict[str, ToolEntry] = {}
 
@@ -80,17 +81,17 @@ class ToolRegistry:
     async def call(self, name: str, args: Dict[str, Any]) -> Union[str, ToolOutput]:
         """按名字执行工具。未知工具返回错误字符串（让模型自己纠正）。
 
-        调用与结果各打一行日志，写清部件与工具名（[M]/[R] 标签走通用 pattern 染色，
-        工具名在这里显式 bold_cyan）：
+        调用与结果各打一行日志，写清部件与工具名（部件标签走通用 pattern 灰染；
+        工具名粗白、参数与结果摘要灰色，参数不加括号——括号里塞 JSON 太挤）：
         结果优先用工具自带的 stat（"+2 行 -1 行" 这类操作摘要），否则取首行前 20 字符。"""
         entry = self._tools.get(name)
         if entry is None:
             return f"未知工具：{name}，可用工具：{', '.join(self._tools)}"
-        logger.info("[%s] 调用工具 %s(%s)", self.part, bold_cyan(name), _args_preview(args))
+        logger.info("[%s] 调用工具 %s %s", self.part, bold(name), gray(_args_preview(args)))
         out = await entry.handler(args)
         text = out.text if isinstance(out, ToolOutput) else str(out)
         stat = (out.stat if isinstance(out, ToolOutput) else "") or _result_preview(text)
-        logger.info("[%s] 工具 %s 结果 %s", self.part, bold_cyan(name), stat)
-        logger.debug("[%s] 工具 %s 结果全文（%d 字符）：%s", self.part, bold_cyan(name),
-                     len(text), text[:500])
+        logger.info("[%s] 工具 %s 结果 %s", self.part, bold(name), gray(stat))
+        logger.debug("[%s] 工具 %s 结果全文%s：%s", self.part, bold(name),
+                     gray(f"（{len(text)} 字符）"), gray(text[:500]))
         return out
