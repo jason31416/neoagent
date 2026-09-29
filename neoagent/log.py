@@ -91,6 +91,7 @@ def setup_logging(level: int = logging.INFO) -> None:
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(level)
-    # httpx 每个请求打一行 "HTTP Request: …"，纯噪音——压到 WARNING 以下不露面
-    # （要排查接口问题就把 level 调 DEBUG，那时光线不够用）。
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    # httpx 每个请求打一行 "HTTP Request: …"，纯噪音——压到 WARNING 以下不露面。
+    # ⚠️ venv 里装的 httpx 分叉包 logger 叫 "httpx2"，只压 "httpx" 没用（踩过）。
+    for name in ("httpx", "httpx2", "httpcore", "httpcore2"):
+        logging.getLogger(name).setLevel(logging.WARNING)

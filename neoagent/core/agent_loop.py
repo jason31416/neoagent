@@ -633,7 +633,7 @@ class AgentLoop:
         except json.JSONDecodeError as e:
             return f"工具参数不是合法 JSON：{e}", []
 
-        logger.debug("调用工具 %s(%s)", name, arguments_json[:200])
+        logger.info("调用工具 %s(%s)", name, arguments_json[:200])
         try:
             output = await self.registry.call(name, args)
         except Exception as e:  # 工具内部炸了也不能炸掉整个循环
@@ -651,6 +651,8 @@ class AgentLoop:
         snippet = output[:500] + ("…" if len(output) > 500 else "")
         logger.debug("工具 %s 结果（%d 字符%s）：%s", name, len(output),
                      f"，{len(images)} 图" if images else "", snippet)
+        logger.info("工具 %s 结果（%d 字符%s）", name, len(output),
+                    f"，{len(images)} 图" if images else "")
         return output, images
 
     def _embed_images(self, paths: List[str], seen: set) -> tuple:
