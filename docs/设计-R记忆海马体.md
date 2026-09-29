@@ -14,7 +14,7 @@
 - **记忆的唯一写者**。M 只读记忆，R 只写记忆。硬线落在**工具注册表**上，不落在提示词上：R 的工具沙箱限定 `data/memory/`，M 的工具面里没有记忆写入口。
 - **上下文的整理者**。M 的上下文退役多少（切点）由 R 判断。"压缩筛选 M 的上下文"与"写记忆"是同一次整理的两面——**先落盘后切断**。
 - 没有声音，不和用户对话。R 的工作简报只进日志。
-- 不设闹钟、不管人格与规矩（那是 `IDENTITY.md` / 配置的活）。
+- 不设闹钟、不管人格与规矩（那是 `../IDENTITY.md` / 配置的活）。
 
 ### 设计原则
 
@@ -277,11 +277,11 @@ reasoning_effort = "medium"       # 快慢同档；要省可降
 
 | 位置 | 改动 |
 |---|---|
-| `neoagent/tools/` | 新增 `record_memory`（M 侧，只入账）；新增 R 工具组（read/write/patch/delete/move/set_cut_point，沙箱 `data/memory/`） |
-| `neoagent/core/render.py` | 切点生效（低于 `cut_seq` 不渲染）；引用召回内联化（删 `_recall_missing` 回插）；`<record>` 内联标签渲染（tool_call 行里 name=record_memory 者） |
-| `neoagent/core/agent_loop.py` | 紧急压缩钩子（挂起 turn → 跑 R → 恢复）；【neoagent的记忆】注入固定带"以对话为准"约定行 |
-| `neoagent/app.py` | R 调度器（停顿 / 慢周期 / 紧急 三触发）；"压缩上下文中 / 压缩完成"直发通道（不经过 M 的模型） |
-| 新 `neoagent/core/recorder.py` | R 的上下文构造 + 工具循环 + 双周期提示词 |
+| `../neoagent/tools` | 新增 `record_memory`（M 侧，只入账）；新增 R 工具组（read/write/patch/delete/move/set_cut_point，沙箱 `data/memory/`） |
+| `../neoagent/core/render.py` | 切点生效（低于 `cut_seq` 不渲染）；引用召回内联化（删 `_recall_missing` 回插）；`<record>` 内联标签渲染（tool_call 行里 name=record_memory 者） |
+| `../neoagent/core/agent_loop.py` | 紧急压缩钩子（挂起 turn → 跑 R → 恢复）；【neoagent的记忆】注入固定带"以对话为准"约定行 |
+| `../neoagent/app.py` | R 调度器（停顿 / 慢周期 / 紧急 三触发）；"压缩上下文中 / 压缩完成"直发通道（不经过 M 的模型） |
+| 新 `../neoagent/core/recorder.py` | R 的上下文构造 + 工具循环 + 双周期提示词 |
 
 **不变的**：M 只读；账本是事实层；消息协议；真值锚定；渲染端预算兜底截断。
 
