@@ -28,6 +28,9 @@ workspace = "data/workspace"
 # 模型请求上下文落盘（调试用）：每会话一份 md（m_xxx.md / r_xxx.md），
 # 每次请求覆盖、只存 messages（真换行可直接读）；置空 = 关闭
 modellog_dir = "data/modellog"
+# 气泡连发间隔（秒）：多条消息发送之间的随机停顿，模拟真实节奏也给阅读时间；0 = 不间隔
+bubble_gap_min = 1.5
+bubble_gap_max = 2.5
 
 [recorder]
 # R（Recorder）——记忆整理模块：记忆的唯一写者 + 上下文退役的判断者。
@@ -35,8 +38,8 @@ modellog_dir = "data/modellog"
 memory_dir = "data/memory"
 # 对话停顿判定：末条消息静默这么久后跑一次快周期整理
 pause_debounce_seconds = 150
-# 慢周期整理节律（小时）：长期归纳、归档清理、合并重排
-slow_interval_hours = 24
+# 慢周期整理节律（秒）：长期归纳、归档清理、合并重排
+slow_interval = 86400
 # 慢周期回看起点（天）
 slow_lookback_days = 7
 # 一次整理跑最多连续调用多少轮工具

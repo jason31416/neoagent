@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import json
 import logging
 import mimetypes
@@ -132,6 +133,7 @@ class AgentLoop:
                  max_images: int = MAX_IMAGES_PER_MESSAGE,
                  media_roots: Optional[List[str]] = None,
                  media_max_bytes: int = 20 * 1024 * 1024,
+                 bubble_gap_min: float = 0.0, bubble_gap_max: float = 0.0,
                  workspace: Optional[Path] = None,
                  effort_provider: Optional[Callable[[], str]] = None,
                  recorder=None) -> None:
@@ -148,6 +150,9 @@ class AgentLoop:
         self.max_images = max_images
         self.media_roots = list(media_roots or [])
         self.media_max_bytes = int(media_max_bytes)
+        # 气泡连发间隔（秒）：0=不间隔（smoke 用默认）；产品默认 1.5–2.5 走 config 注入
+        self.bubble_gap_min = float(bubble_gap_min)
+        self.bubble_gap_max = float(bubble_gap_max)
         self.workspace = Path(workspace) if workspace else None   # 工作台（相对路径基准）
         # 思考档位（reasoning_effort）：每轮请求前现取 → 改配置即生效，可随时切换
         # 思考/非思考混用；默认 "medium"（none=不思考）
@@ -404,8 +409,9 @@ class AgentLoop:
                 seq = await self._send_media_item(session_key, st, it, reply_ref, quote_to)
                 first_seq = first_seq or seq
             sent += 1
-            if sent < len(items):
-                await asyncio.sleep(0.3)   # 条间小间隔，像连发
+            if sent < len(items) and self.bubble_gap_max > 0:
+                # 条间随机间隔：真实感 + 给用户阅读时间（每次都不一样，别用固定值）
+                await asyncio.sleep(random.uniform(self.bubble_gap_min, self.bubble_gap_max))
         return sent, first_seq
 
     def _backfill_id(self, session_key: str, seq: int, result) -> None:

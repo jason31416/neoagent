@@ -95,6 +95,8 @@ def build_agent(cfg: Config) -> AgentLoop:
                       max_images=cfg.media.max_images_per_message,
                       media_roots=file_roots,
                       media_max_bytes=cfg.media.max_bytes,
+                      bubble_gap_min=cfg.agent.bubble_gap_min,
+                      bubble_gap_max=cfg.agent.bubble_gap_max,
                       workspace=workspace)
 
     # R（Recorder）：记忆整理 + 上下文退役。与 M 共用 LLM 与预算，快慢同档。
@@ -108,5 +110,5 @@ def build_agent(cfg: Config) -> AgentLoop:
     agent.recorder_scheduler = RecorderScheduler(
         recorder, ledger,
         debounce_seconds=cfg.recorder.pause_debounce_seconds,
-        slow_interval_hours=cfg.recorder.slow_interval_hours)
+        slow_interval=cfg.recorder.slow_interval)
     return agent

@@ -37,6 +37,9 @@ class AgentConfig:
     # 模型请求上下文落盘（M/R 共用，调试用）：每会话一份 md、只留最新一次请求，
     # 置空关闭
     modellog_dir: str = "data/modellog"
+    # 气泡连发间隔（秒）：多条消息发送之间的随机停顿（真实感 + 给阅读时间），0 = 不间隔
+    bubble_gap_min: float = 1.5
+    bubble_gap_max: float = 2.5
 
 
 @dataclass
@@ -44,7 +47,7 @@ class RecorderConfig:
     """R（Recorder）——记忆整理模块：记忆的唯一写者 + 上下文退役的判断者。"""
     memory_dir: str = "data/memory"        # 记忆库：memory.md（注入 M）+ 子文件 + old/ 归档
     pause_debounce_seconds: int = 150      # 停顿判定（末条用户消息后多久算对话停顿）
-    slow_interval_hours: int = 24          # 慢周期整理的节律
+    slow_interval: int = 86400          # 慢周期整理的节律
     slow_lookback_days: int = 7            # 慢周期回看起点（天）
     max_tool_rounds: int = 12              # 一次整理跑的工具轮上限
     reasoning_effort: str = "medium"       # 整理用的思考档位（快慢同档）
@@ -141,13 +144,15 @@ def load_config(path: Path | None = None) -> Config:
         cfg.agent.identity_file = str(ag.get("identity_file", cfg.agent.identity_file))
         cfg.agent.workspace = str(ag.get("workspace", cfg.agent.workspace))
         cfg.agent.modellog_dir = str(ag.get("modellog_dir", cfg.agent.modellog_dir))
+        cfg.agent.bubble_gap_min = float(ag.get("bubble_gap_min", cfg.agent.bubble_gap_min))
+        cfg.agent.bubble_gap_max = float(ag.get("bubble_gap_max", cfg.agent.bubble_gap_max))
 
         rc = raw.get("recorder", {})
         cfg.recorder.memory_dir = str(rc.get("memory_dir", cfg.recorder.memory_dir))
         cfg.recorder.pause_debounce_seconds = int(rc.get("pause_debounce_seconds",
                                                          cfg.recorder.pause_debounce_seconds))
-        cfg.recorder.slow_interval_hours = int(rc.get("slow_interval_hours",
-                                                      cfg.recorder.slow_interval_hours))
+        cfg.recorder.slow_interval = int(rc.get("slow_interval",
+                                                      cfg.recorder.slow_interval))
         cfg.recorder.slow_lookback_days = int(rc.get("slow_lookback_days",
                                                      cfg.recorder.slow_lookback_days))
         cfg.recorder.max_tool_rounds = int(rc.get("max_tool_rounds",
