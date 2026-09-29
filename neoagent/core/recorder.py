@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from ..tools.memory_tools import build_memory_registry, record_payload
+from . import modellog
 from .ledger import (TYPE_ASSISTANT, TYPE_INTERNAL, TYPE_TOOL_CALL, TYPE_TOOL_RESULT,
                      TYPE_USER, MessageLedger)
 from .llm import LLMClient
@@ -124,9 +125,15 @@ class Recorder:
 
         report = ""
         last_usage: Optional[dict] = None
-        for _ in range(self.max_tool_rounds):
+        for rnd in range(self.max_tool_rounds):
+            # 请求发出前落 modellog：R 的工具流水不进账本，它的请求现场只在这里有
+            effort = self.effort_provider()
+            modellog.dump("r", session_key, {
+                "cycle": cycle, "round": rnd, "model": getattr(self.llm, "model", ""),
+                "reasoning_effort": effort,
+                "tools": registry.schemas(), "messages": msgs})
             result = await self.llm.chat(msgs, tools=registry.schemas(),
-                                         reasoning_effort=self.effort_provider())
+                                         reasoning_effort=effort)
             report = result.content or report
             last_usage = result.usage or last_usage
             if not result.tool_calls:

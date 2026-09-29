@@ -30,6 +30,7 @@ from ..providers.tokens import HeuristicTokenCounter, TokenAnchor, TokenCounter,
 from ..providers.vision import normalize_image
 from ..tools.file_tools import _resolve_in_roots
 from ..tools.registry import ToolOutput, ToolRegistry
+from . import modellog
 from .events import Attachment, MessageEvent, ReplyRef
 from .ledger import (MessageLedger, TYPE_ASSISTANT, TYPE_INTERNAL, TYPE_TOOL_CALL,
                      TYPE_TOOL_RESULT, TYPE_USER)
@@ -294,9 +295,13 @@ class AgentLoop:
             est_total = self._caches[session_key].last_cost + extra_est
             predicted = self._anchors[session_key].predict(est_total)
 
+            # 请求发出前先落 modellog（400 翻车现场也留证据；未开启时空转）
+            effort = self.effort_provider()
+            modellog.dump("m", session_key, {
+                "round": rounds, "model": getattr(self.llm, "model", ""), "reasoning_effort": effort,
+                "tools": tools, "messages": messages})
             st.model_task = asyncio.get_event_loop().create_task(
-                self.llm.chat(messages, tools=tools,
-                              reasoning_effort=self.effort_provider()))
+                self.llm.chat(messages, tools=tools, reasoning_effort=effort))
             try:
                 result = await st.model_task
             except asyncio.CancelledError:
@@ -359,7 +364,11 @@ class AgentLoop:
         est_total = self._caches[session_key].last_cost + extra_est \
             + count_chat_payload(self.token_counter, [nudge])
         predicted = self._anchors[session_key].predict(est_total)
-        result = await self.llm.chat(messages, reasoning_effort=self.effort_provider())
+        effort = self.effort_provider()
+        modellog.dump("m", session_key, {
+            "round": rounds, "phase": "max_tool_rounds", "model": getattr(self.llm, "model", ""),
+            "reasoning_effort": effort, "tools": tools, "messages": messages})
+        result = await self.llm.chat(messages, reasoning_effort=effort)
         self._anchor_and_log(session_key, result, est_total, predicted)
         sent, first_seq = await self._emit_bubbles(session_key, st, result.content, bubbles_sent)
         if result.reasoning and first_seq:

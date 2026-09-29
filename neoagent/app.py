@@ -9,6 +9,7 @@ import shutil
 from pathlib import Path
 
 from .config import Config, PROJECT_ROOT, ReasoningEffortSource
+from .core import modellog
 from .core.agent_loop import AgentLoop
 from .core.ledger import MessageLedger
 from .core.llm import LLMClient
@@ -37,6 +38,13 @@ def build_agent(cfg: Config) -> AgentLoop:
     workspace.mkdir(parents=True, exist_ok=True)
     file_roots = list(dict.fromkeys([*cfg.files.allowed_roots, str(workspace)]))
     exec_roots = list(dict.fromkeys([*cfg.exec.allowed_roots, str(workspace)]))
+
+    # 模型请求上下文落盘（调试用；modellog_dir 置空关闭）
+    if cfg.agent.modellog_dir:
+        ml_dir = Path(cfg.agent.modellog_dir)
+        if not ml_dir.is_absolute():
+            ml_dir = PROJECT_ROOT / ml_dir
+        modellog.setup(ml_dir, keep=cfg.agent.modellog_keep)
 
     # 工具（本期变体：M 直接持有工具——产品文档里这些是 E 的活）
     registry = ToolRegistry()

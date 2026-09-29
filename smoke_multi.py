@@ -11,6 +11,7 @@
 8. token 预算：从最老端成组抛弃 / tool 组原子 / 最新块保底截断 / 增量渲染==全量渲染
 """
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -668,6 +669,47 @@ async def main() -> None:
     texts_fix, runs_fix = await _compress_case(False)
     check(texts_fix[:2] == ["压缩上下文中", "压缩完成"]
           and len(runs_fix) == 1, "R 未推进切点：不死循环，走渲染端兜底")
+
+    # ---- 23. modellog 上下文落盘 ----
+    print("=== 23. modellog 上下文落盘 ===")
+    from neoagent.core import modellog
+    check(not modellog.enabled() and modellog.dump("m", "cli:x", {"messages": []}) is None,
+          "未 setup 不落盘（默认空转）")
+    mldir = Path(tmp) / "modellog"
+    modellog.setup(mldir, keep=50)
+    ml_llm = StubLLM([
+        SimpleNamespace(content='<message>先干活</message>',
+                        tool_calls=[tc("ml1", "noop", "{}")], reasoning="想想"),
+        SimpleNamespace(content='<message>好了</message>', tool_calls=None, reasoning=None),
+    ])
+    agent_ml = AgentLoop(llm=ml_llm, registry=registry, ledger=ledger, memory_file=mem)
+    await agent_ml.submit(mk_event("落盘测试", conv="ml"), responder=Collector())
+    await agent_ml.wait_idle("cli:ml")
+    m_files = sorted(mldir.glob("*_m_*.json"))
+    check(len(m_files) == 2, f"M 每请求落一份（实际 {len(m_files)}）")
+    doc = json.loads(m_files[0].read_text(encoding="utf-8"))
+    check(doc["kind"] == "m" and doc["reasoning_effort"] == "medium"
+          and doc["messages"][0]["role"] == "system"
+          and isinstance(doc.get("tools"), list),
+          "落盘内容 = 原样请求载荷（messages/tools/effort）")
+    check("落盘测试" in json.dumps(doc, ensure_ascii=False), "用户消息在载荷里（可对账）")
+
+    r_ml = StubLLM([
+        SimpleNamespace(content="", tool_calls=[tc("mr1", "set_cut_point", '{"msg_seq":1}')],
+                        usage=None),
+        SimpleNamespace(content="整理完毕", tool_calls=[], usage=None),
+    ])
+    rec_ml = Recorder(r_ml, ledger, memdir)
+    await rec_ml.run(sk8, "fast")
+    r_files = sorted(mldir.glob("*_r_*.json"))
+    check(len(r_files) == 2 and json.loads(r_files[0].read_text(encoding="utf-8"))["cycle"] == "fast",
+          f"R 每请求落一份、带周期标记（实际 {len(r_files)}）")
+    modellog.setup(mldir, keep=3)
+    for i in range(3):
+        modellog.dump("m", "cli:keep", {"round": 10 + i, "messages": []})
+    check(len(list(mldir.glob("*.json"))) == 3, "留存上限自动删最老（keep=3）")
+    modellog.setup(None)
+    check(not modellog.enabled(), "setup(None) 关闭落盘")
 
     ledger.close()
     print("=== 全部通过 ===")

@@ -25,6 +25,11 @@ identity_file = "IDENTITY.md"
 # 工作台：agent 的工作目录（exec 默认 cwd、相对路径基准、产出物落脚点）；
 # 自动并入 files/exec/media 允许范围，无需再配 roots
 workspace = "data/workspace"
+# 模型请求上下文落盘（M/R 共用，调试用）：一个请求一个 JSON（可原样重放），
+# 请求发出前落盘（400 翻车现场也有证据）；置空 = 关闭
+modellog_dir = "data/modellog"
+# 最多留几份（上下文能有几 MB/份，超了自动删最老）
+modellog_keep = 200
 
 [recorder]
 # R（Recorder）——记忆整理模块：记忆的唯一写者 + 上下文退役的判断者。
