@@ -91,3 +91,6 @@ def setup_logging(level: int = logging.INFO) -> None:
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(level)
+    # httpx 每个请求打一行 "HTTP Request: …"，纯噪音——压到 WARNING 以下不露面
+    # （要排查接口问题就把 level 调 DEBUG，那时光线不够用）。
+    logging.getLogger("httpx").setLevel(logging.WARNING)

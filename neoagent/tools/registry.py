@@ -44,7 +44,7 @@ class ToolRegistry:
         if name in self._tools:
             raise ValueError(f"工具重复注册：{name}")
         self._tools[name] = ToolEntry(name, description, parameters, handler)
-        logger.info("注册工具 %s", name)
+        logger.debug("注册工具 %s", name)     # R 每次整理都重建工具组，INFO 会刷屏
 
     def schemas(self) -> List[Dict[str, Any]]:
         """导出给 LLM 的工具列表（OpenAI function-calling 格式）。"""
