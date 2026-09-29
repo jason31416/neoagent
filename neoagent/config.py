@@ -34,9 +34,9 @@ class AgentConfig:
     memory_file: str = "data/MEMORY.md"  # 旧记忆文件（仅用于一次性迁移到 recorder 的 memory_dir）
     identity_file: str = "IDENTITY.md"   # 身份文件（【它是谁】段，仓库根）
     workspace: str = "data/workspace"    # 工作台：exec 默认 cwd、相对路径基准、产出物落脚点
-    # 模型请求上下文落盘（M/R 共用，调试用）：一个请求一个 JSON，置空关闭
+    # 模型请求上下文落盘（M/R 共用，调试用）：每会话一份 md、只留最新一次请求，
+    # 置空关闭
     modellog_dir: str = "data/modellog"
-    modellog_keep: int = 200             # 最多留几个（上下文能有几 MB/份，不封顶撑磁盘）
 
 
 @dataclass
@@ -141,7 +141,6 @@ def load_config(path: Path | None = None) -> Config:
         cfg.agent.identity_file = str(ag.get("identity_file", cfg.agent.identity_file))
         cfg.agent.workspace = str(ag.get("workspace", cfg.agent.workspace))
         cfg.agent.modellog_dir = str(ag.get("modellog_dir", cfg.agent.modellog_dir))
-        cfg.agent.modellog_keep = int(ag.get("modellog_keep", cfg.agent.modellog_keep))
 
         rc = raw.get("recorder", {})
         cfg.recorder.memory_dir = str(rc.get("memory_dir", cfg.recorder.memory_dir))

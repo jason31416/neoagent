@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from ..tools.memory_tools import build_memory_registry, record_payload
+from ..tools.registry import ToolOutput
 from . import modellog
 from .ledger import (TYPE_ASSISTANT, TYPE_INTERNAL, TYPE_TOOL_CALL, TYPE_TOOL_RESULT,
                      TYPE_USER, MessageLedger)
@@ -118,6 +119,7 @@ class Recorder:
             return "（无待整理流水）"
 
         registry = build_memory_registry(self.ledger, session_key, self.memory_dir)
+        _, cut_before = self.ledger.get_recorder_state(session_key)
         msgs = [
             {"role": "system", "content": _SYSTEM + "\n" + _CYCLE_NOTES.get(cycle, "")},
             {"role": "user", "content": self._context(session_key, cycle, rows)},
@@ -129,9 +131,7 @@ class Recorder:
             # 请求发出前落 modellog：R 的工具流水不进账本，它的请求现场只在这里有
             effort = self.effort_provider()
             modellog.dump("r", session_key, {
-                "cycle": cycle, "round": rnd, "model": getattr(self.llm, "model", ""),
-                "reasoning_effort": effort,
-                "tools": registry.schemas(), "messages": msgs})
+                "cycle": cycle, "round": rnd, "messages": msgs})
             result = await self.llm.chat(msgs, tools=registry.schemas(),
                                          reasoning_effort=effort)
             report = result.content or report
@@ -155,8 +155,9 @@ class Recorder:
                 except (TypeError, ValueError):
                     args = {}
                 out = await registry.call(tc.name, args)
+                text = out.text if isinstance(out, ToolOutput) else str(out)
                 msgs.append({"role": "tool", "tool_call_id": tc.id,
-                             "content": str(out)[:2000]})
+                             "content": text[:2000]})
         else:
             logger.warning("[recorder] 整理达到工具轮上限 %d，提前收束 session=%s",
                            self.max_tool_rounds, session_key)
@@ -164,10 +165,14 @@ class Recorder:
         # 推进增量游标（委托随之算已消化——"委托不丢"靠切点不越未消化行保证）
         if rows:
             self.ledger.set_recorder_state(session_key, r_seen_seq=rows[-1].seq_id)
-        logger.info("[recorder] %s整理完成 session=%s 流水 %s～%s%s",
+        _, cut_after = self.ledger.get_recorder_state(session_key)
+        cut_note = (f"切点 msg#{cut_before}→msg#{cut_after}" if cut_after != cut_before
+                    else f"切点 msg#{cut_after} 未动")
+        logger.info("[recorder] %s整理完成 session=%s 流水 %s～%s %s%s",
                     "快" if cycle == "fast" else "慢", session_key,
                     f"msg#{rows[0].seq_id}" if rows else "（空）",
                     f"msg#{rows[-1].seq_id}" if rows else "（空）",
+                    cut_note,
                     f" prompt={last_usage.get('prompt_tokens')}" if last_usage else "")
         return report or "（静默收工）"
 

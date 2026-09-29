@@ -297,9 +297,7 @@ class AgentLoop:
 
             # 请求发出前先落 modellog（400 翻车现场也留证据；未开启时空转）
             effort = self.effort_provider()
-            modellog.dump("m", session_key, {
-                "round": rounds, "model": getattr(self.llm, "model", ""), "reasoning_effort": effort,
-                "tools": tools, "messages": messages})
+            modellog.dump("m", session_key, {"round": rounds, "messages": messages})
             st.model_task = asyncio.get_event_loop().create_task(
                 self.llm.chat(messages, tools=tools, reasoning_effort=effort))
             try:
@@ -366,8 +364,7 @@ class AgentLoop:
         predicted = self._anchors[session_key].predict(est_total)
         effort = self.effort_provider()
         modellog.dump("m", session_key, {
-            "round": rounds, "phase": "max_tool_rounds", "model": getattr(self.llm, "model", ""),
-            "reasoning_effort": effort, "tools": tools, "messages": messages})
+            "round": rounds, "phase": "max_tool_rounds", "messages": messages})
         result = await self.llm.chat(messages, reasoning_effort=effort)
         self._anchor_and_log(session_key, result, est_total, predicted)
         sent, first_seq = await self._emit_bubbles(session_key, st, result.content, bubbles_sent)
@@ -633,7 +630,6 @@ class AgentLoop:
         except json.JSONDecodeError as e:
             return f"工具参数不是合法 JSON：{e}", []
 
-        logger.info("调用工具 %s(%s)", name, arguments_json[:200])
         try:
             output = await self.registry.call(name, args)
         except Exception as e:  # 工具内部炸了也不能炸掉整个循环
@@ -648,11 +644,6 @@ class AgentLoop:
         if len(output) > 20000:
             output = output[:20000] + "\n…（输出过长已截断）"
 
-        snippet = output[:500] + ("…" if len(output) > 500 else "")
-        logger.debug("工具 %s 结果（%d 字符%s）：%s", name, len(output),
-                     f"，{len(images)} 图" if images else "", snippet)
-        logger.info("工具 %s 结果（%d 字符%s）", name, len(output),
-                    f"，{len(images)} 图" if images else "")
         return output, images
 
     def _embed_images(self, paths: List[str], seen: set) -> tuple:

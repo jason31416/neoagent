@@ -30,6 +30,8 @@ _TAG_RE = re.compile(r"\[([A-Za-z_][\w.]*)\]")     # [weixin] [llm] [turn] …
 _QUOTE_RE = re.compile(r"（引用 [^）]*）")
 _PAREN_RE = re.compile(r"（[^）]*）")               # 其余括号注释 → 暗
 _TOOL_RE = re.compile(r"((?:调用工具|工具) )([A-Za-z_][\w.]*)")
+_PLUS_RE = re.compile(r"\+(\d+ 行)")               # 文件工具统计：+绿
+_MINUS_RE = re.compile(r"-(\d+ 行)")               # 文件工具统计：-红
 
 
 def _paint(msg: str) -> str:
@@ -44,8 +46,10 @@ def _paint(msg: str) -> str:
     msg = _QUOTE_RE.sub(_stash, msg)
     msg = _TOOL_RE.sub(lambda m: f"{m.group(1)}{_BOLD}\033[36m{m.group(2)}{_RESET}", msg)  # 工具名 → 亮青
     msg = _TAG_RE.sub(lambda m: f"\033[36m[{m.group(1)}]{_RESET}", msg)          # 通道/组件标签 → 青
-    msg = msg.replace(">>>", f"{_BOLD}\033[32m>>>{_RESET}")                       # 箭头 → 亮绿
-    msg = msg.replace("HTTP Request:", f"{_DIM}HTTP Request:{_RESET}")           # httpx 噪音 → 暗
+    msg = msg.replace("<<", f"{_BOLD}\033[36m<<{_RESET}")                       # 入站箭头 → 亮青
+    msg = msg.replace(">>", f"{_BOLD}\033[32m>>{_RESET}")                       # 出站箭头 → 亮绿
+    msg = _PLUS_RE.sub(lambda m: f"\033[32m+{m.group(1)}{_RESET}", msg)         # +N 行 → 绿
+    msg = _MINUS_RE.sub(lambda m: f"\033[31m-{m.group(1)}{_RESET}", msg)        # -N 行 → 红
     msg = _PAREN_RE.sub(lambda m: f"{_DIM}{m.group(0)}{_RESET}", msg)            # 括号注释 → 暗
     for i, q in enumerate(quotes):
         msg = msg.replace(f"\x00{i}\x00", q)

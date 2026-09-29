@@ -257,9 +257,9 @@ class WeixinAdapter(ChannelAdapter):
             },
         )
         att_names = ",".join(a.filename for a in attachments) or "-"
-        logger.info("[weixin] 收到消息 from=%s chat=%s att=%d[%s] ref=%s",
-                    sender_id[:8], chat_id[:8], len(attachments), att_names,
-                    bool(reply_to))
+        logger.debug("[weixin] 收到消息 from=%s chat=%s att=%d[%s] ref=%s",
+                     sender_id[:8], chat_id[:8], len(attachments), att_names,
+                     bool(reply_to))
         await self._dispatch(event)
 
     # ------------------------------------------------------------------

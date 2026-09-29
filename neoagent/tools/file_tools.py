@@ -82,19 +82,22 @@ async def read_file(args: Dict[str, Any]):
     note = ""
     if offset - 1 + limit < len(lines):
         note = f"\n…（共 {len(lines)} 行，继续读用 offset={offset + limit}）"
-    return (numbered or "（空文件）") + note
+    return ToolOutput(text=(numbered or "（空文件）") + note,
+                      stat=f"读 {len(chunk)} 行")
 
 
-async def write_file(args: Dict[str, Any]) -> str:
+async def write_file(args: Dict[str, Any]):
     """write_file 工具实现：整文件覆盖写，自动建父目录。"""
     path = _resolve_in_roots(str(args.get("path", "")), _allowed_roots())
     content = args.get("content")
     if content is None:
         return "缺少 content 参数"
 
+    text = str(content)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(str(content), encoding="utf-8")
-    return f"已写入 {path}（{len(str(content))} 字符）"
+    path.write_text(text, encoding="utf-8")
+    return ToolOutput(text=f"已写入 {path}（{len(text)} 字符）",
+                      stat=f"+{len(text.splitlines()) or 1} 行")
 
 
 def _allowed_roots() -> List[str]:

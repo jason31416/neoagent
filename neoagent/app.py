@@ -44,7 +44,7 @@ def build_agent(cfg: Config) -> AgentLoop:
         ml_dir = Path(cfg.agent.modellog_dir)
         if not ml_dir.is_absolute():
             ml_dir = PROJECT_ROOT / ml_dir
-        modellog.setup(ml_dir, keep=cfg.agent.modellog_keep)
+        modellog.setup(ml_dir)
 
     # 工具（本期变体：M 直接持有工具——产品文档里这些是 E 的活）
     registry = ToolRegistry()

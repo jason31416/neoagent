@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .file_tools import _resolve_in_roots
-from .registry import ToolRegistry
+from .registry import ToolOutput, ToolRegistry
 
 _RECORD_ACK = "已记下（将在下次整理时入档，近期以对话为准）"
 
@@ -30,7 +30,7 @@ def build_memory_registry(ledger, session_key: str, memory_dir: Path) -> ToolReg
         # 相对路径以 memory_dir 为基准（R 说 memory.md / old/x.md 就是这里）
         return _resolve_in_roots(path_str, roots, base=memory_dir)
 
-    async def read_file(args: Dict[str, Any]) -> str:
+    async def read_file(args: Dict[str, Any]):
         try:
             path = _p(str(args.get("path", "")))
         except PermissionError as e:
@@ -38,11 +38,12 @@ def build_memory_registry(ledger, session_key: str, memory_dir: Path) -> ToolReg
         if not path.is_file():
             return f"文件不存在：{args.get('path')}"
         try:
-            return path.read_text(encoding="utf-8", errors="replace")
+            text = path.read_text(encoding="utf-8", errors="replace")
         except OSError as e:
             return f"读取失败：{e}"
+        return ToolOutput(text=text, stat=f"读 {len(text.splitlines())} 行")
 
-    async def write_file(args: Dict[str, Any]) -> str:
+    async def write_file(args: Dict[str, Any]):
         try:
             path = _p(str(args.get("path", "")))
         except PermissionError as e:
@@ -50,14 +51,16 @@ def build_memory_registry(ledger, session_key: str, memory_dir: Path) -> ToolReg
         content = args.get("content")
         if content is None:
             return "缺少 content 参数"
+        text = str(content)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(str(content), encoding="utf-8")
+            path.write_text(text, encoding="utf-8")
         except OSError as e:
             return f"写入失败：{e}"
-        return f"已写入 {path.name}（{len(str(content))} 字符）"
+        return ToolOutput(text=f"已写入 {path.name}（{len(text)} 字符）",
+                          stat=f"+{len(text.splitlines()) or 1} 行")
 
-    async def patch_file(args: Dict[str, Any]) -> str:
+    async def patch_file(args: Dict[str, Any]):
         try:
             path = _p(str(args.get("path", "")))
         except PermissionError as e:
@@ -77,7 +80,8 @@ def build_memory_registry(ledger, session_key: str, memory_dir: Path) -> ToolReg
         if n > 1:
             return f"old 匹配到 {n} 处，不唯一（请扩大 old 的范围使其唯一）"
         path.write_text(text.replace(str(old), str(new), 1), encoding="utf-8")
-        return f"已更新 {path.name}"
+        return ToolOutput(text=f"已更新 {path.name}",
+                          stat=f"+{len(str(new).splitlines())} -{len(str(old).splitlines())} 行")
 
     async def delete_file(args: Dict[str, Any]) -> str:
         try:

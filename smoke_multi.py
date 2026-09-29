@@ -38,6 +38,11 @@ def check(cond: bool, label: str) -> None:
         sys.exit(1)
 
 
+def txt(out) -> str:
+    """工具结果取文本（handler 可能返回 str 或 ToolOutput）。"""
+    return out.text if hasattr(out, "text") else str(out)
+
+
 class StubLLM:
     """按脚本回放模型返回（SimpleNamespace: content / tool_calls / reasoning）。"""
 
@@ -502,10 +507,11 @@ async def main() -> None:
     out2 = await read_file({"path": str(rf_dir / "blob.bin")})
     check(isinstance(out2, str) and "二进制文件读不出文本" in out2, "非图二进制明确拒绝，不吐乱码")
     out3 = await read_file({"path": str(rf_dir / "t.txt")})
-    check(isinstance(out3, str) and "hello 文本" in out3, "文本文件照常读")
+    check(isinstance(out3, ToolOutput) and "hello 文本" in out3.text
+          and out3.stat == "读 1 行", "文本文件照常读（stat=读 N 行）")
     (rf_dir / "x.svg").write_text("<svg><!-- 矢量图是文本 --></svg>", encoding="utf-8")
     out4 = await read_file({"path": str(rf_dir / "x.svg")})
-    check(isinstance(out4, str) and "<svg>" in out4,
+    check(isinstance(out4, ToolOutput) and "<svg>" in out4.text,
           "svg 按文本读源码（不塞视觉接口）")
 
     # 全链路：stub 模型两轮都调"看图"工具 → 信封进请求、同轮去重
@@ -572,11 +578,13 @@ async def main() -> None:
     (memdir / "memory.md").write_text("# 记忆\n- wifi 是 123", encoding="utf-8")
     (memdir / "old/旧.md").write_text("归档内容", encoding="utf-8")
     regm = build_memory_registry(ledger, "cli:r", memdir)
-    check("wifi 是 123" in await regm.call("read_file", {"path": "memory.md"}),
+    check("wifi 是 123" in txt(await regm.call("read_file", {"path": "memory.md"})),
           "read_file 读记忆（相对路径以记忆库为基准）")
-    check("已更新" in await regm.call("patch_file",
-          {"path": "memory.md", "old": "123", "new": "456"})
-          and "456" in (memdir / "memory.md").read_text(), "patch_file 精确替换")
+    patched = await regm.call("patch_file",
+                              {"path": "memory.md", "old": "123", "new": "456\n789"})
+    check("已更新" in txt(patched) and patched.stat == "+2 -1 行",
+          f"patch_file 精确替换（stat={getattr(patched, 'stat', '?')}）")
+    check("456" in (memdir / "memory.md").read_text(), "patch_file 落盘生效")
     check("允许范围" in await regm.call("move_file", {"src": "memory.md", "dst": "/etc/x"}),
           "move 越界拒绝（src/dst 都查）")
     check("已移动" in await regm.call("move_file", {"src": "old/旧.md", "dst": "old/新.md"})
@@ -676,23 +684,31 @@ async def main() -> None:
     check(not modellog.enabled() and modellog.dump("m", "cli:x", {"messages": []}) is None,
           "未 setup 不落盘（默认空转）")
     mldir = Path(tmp) / "modellog"
-    modellog.setup(mldir, keep=50)
+    modellog.setup(mldir)
     ml_llm = StubLLM([
         SimpleNamespace(content='<message>先干活</message>',
                         tool_calls=[tc("ml1", "noop", "{}")], reasoning="想想"),
         SimpleNamespace(content='<message>好了</message>', tool_calls=None, reasoning=None),
+        SimpleNamespace(content='<message>第二轮</message>', tool_calls=None, reasoning=None),
     ])
     agent_ml = AgentLoop(llm=ml_llm, registry=registry, ledger=ledger, memory_file=mem)
     await agent_ml.submit(mk_event("落盘测试", conv="ml"), responder=Collector())
     await agent_ml.wait_idle("cli:ml")
-    m_files = sorted(mldir.glob("*_m_*.json"))
-    check(len(m_files) == 2, f"M 每请求落一份（实际 {len(m_files)}）")
-    doc = json.loads(m_files[0].read_text(encoding="utf-8"))
-    check(doc["kind"] == "m" and doc["reasoning_effort"] == "medium"
-          and doc["messages"][0]["role"] == "system"
-          and isinstance(doc.get("tools"), list),
-          "落盘内容 = 原样请求载荷（messages/tools/effort）")
-    check("落盘测试" in json.dumps(doc, ensure_ascii=False), "用户消息在载荷里（可对账）")
+    m_file = mldir / "m_cli_ml.md"
+    md = m_file.read_text(encoding="utf-8")
+    check(m_file.exists() and len(list(mldir.glob("m_*.md"))) == 1,
+          f"每会话一份 md、不累积（实际 {len(list(mldir.glob('m_*.md')))} 份）")
+    check(md.startswith("# modellog") and "\n## system" in md
+          and "落盘测试" in md and "想想" in md,
+          "md 分节 + 真换行（草稿以引用块回传）")
+    check('"messages"' not in md and "**tool_calls**" in md,
+          "只存 messages（无 JSON 外壳），tool_calls 可读")
+    await agent_ml.submit(mk_event("第二轮消息", conv="ml"), responder=Collector())
+    await agent_ml.wait_idle("cli:ml")
+    md2 = m_file.read_text(encoding="utf-8")
+    check("第二轮消息" in md2 and "落盘测试" in md2
+          and len(list(mldir.glob("m_*.md"))) == 1,
+          "覆盖为最新一次请求（历史仍可从账本重建）")
 
     r_ml = StubLLM([
         SimpleNamespace(content="", tool_calls=[tc("mr1", "set_cut_point", '{"msg_seq":1}')],
@@ -701,13 +717,9 @@ async def main() -> None:
     ])
     rec_ml = Recorder(r_ml, ledger, memdir)
     await rec_ml.run(sk8, "fast")
-    r_files = sorted(mldir.glob("*_r_*.json"))
-    check(len(r_files) == 2 and json.loads(r_files[0].read_text(encoding="utf-8"))["cycle"] == "fast",
-          f"R 每请求落一份、带周期标记（实际 {len(r_files)}）")
-    modellog.setup(mldir, keep=3)
-    for i in range(3):
-        modellog.dump("m", "cli:keep", {"round": 10 + i, "messages": []})
-    check(len(list(mldir.glob("*.json"))) == 3, "留存上限自动删最老（keep=3）")
+    r_file = mldir / "r_cli_rflow.md"
+    check(r_file.exists() and "周期 fast" in r_file.read_text(encoding="utf-8"),
+          "R 每会话一份、带周期标记")
     modellog.setup(None)
     check(not modellog.enabled(), "setup(None) 关闭落盘")
 
