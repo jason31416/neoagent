@@ -39,6 +39,11 @@ _SCAN_BATCH = 500
 _RECALL_CAP = 32
 _RECALL_DEPTH = 3          # <recall> 引用链内嵌深度
 _RECALL_TEXT_MAX = 800     # <recall> 单条全文上限（字节截字符）
+# assistant 消息 reasoning_content 的占位垫片：DeepSeek 思考模式**强制**要这个字段
+# （带 tool_calls 的消息在工具续传请求里缺了直接 400 "must be passed back"）；
+# 没草稿就垫一个空格——空串会被 DeepSeek V4 系拒收，单空格全系放行（hermes 踩坑结论）。
+# 实测历史 reasoning_content 不计价、不占预算（measure() 不计它）。
+_REASONING_PAD = " "
 
 _TYPE_ROLE = {TYPE_USER: "user", TYPE_ASSISTANT: "assistant", TYPE_INTERNAL: "system"}
 
@@ -150,7 +155,7 @@ def _truncate_text(text: str, max_tokens: int, counter) -> str:
 class _Row:
     """一行（对话/内部）的缓存渲染件。body 在建块时渲染一次，引用属性组装时现拼。
     代价按**完整标签文本**计（含 sender/id/time 属性的框架开销）。
-    reasoning 是轮首行的思考草稿——回传进协议消息（实测不计价），不给用户看。"""
+    reasoning 是轮的思考草稿——回传进协议消息（实测不计价），不给用户看。"""
 
     __slots__ = ("seq_id", "role", "sender", "ts", "reply_to", "body", "att", "parts",
                  "reasoning", "cost")
@@ -198,8 +203,8 @@ class _Row:
                    "content": [{"type": "text", "text": text}] + self.parts}
         else:
             msg = {"role": self.role, "content": text}
-        if self.reasoning and include_reasoning and self.role == "assistant":
-            msg["reasoning_content"] = self.reasoning
+        if include_reasoning and self.role == "assistant":
+            msg["reasoning_content"] = self.reasoning or _REASONING_PAD
         return msg
 
 
@@ -224,8 +229,10 @@ class Block:
                 recalled: Optional[Dict[int, str]] = None) -> List[dict]:
         if self.kind == "tool":
             msgs = [dict(m) for m in self.tool_msgs]
-            if self.reasoning and include_reasoning and msgs:
-                msgs[0]["reasoning_content"] = self.reasoning
+            if include_reasoning and msgs:
+                # 必带 reasoning_content（真草稿或 " " 垫片）：DeepSeek 思考模式对
+                # 带 tool_calls 的消息强制回传，缺了 400——不能只在有草稿时才写。
+                msgs[0]["reasoning_content"] = self.reasoning or _REASONING_PAD
             return msgs
         return [r.compose(visible_seqs, include_reasoning, recalled) for r in self.rows]
 
@@ -338,8 +345,9 @@ def render_messages(ledger, session_key: str, *, identity: str, memory_text: str
     cache     TimelineCache（不传 = 全量渲染，测试对拍用）
     overhead  时间线之外但要计入预算的开销估算（工具 schema /
               真值锚定残差）——这些是会增长的大头，得挤占时间线预算
-    include_reasoning  协议消息是否带 reasoning_content（思考草稿回传；某供应商的
-              非思考请求若拒收就关掉，实测 DeepSeek 无所谓）
+    include_reasoning  协议消息是否带 reasoning_content（思考草稿回传）。DeepSeek
+              思考模式**强制**要这个字段（缺了 400），没草稿垫 " "；碰到见这个字段
+              就拒收的严格供应商（Mistral/Groq 等）关掉本开关。
     cut_seq   上下文切点（Recorder 的 set_cut_point）：低于它的行不再渲染（账本不动）
     """
     cache = cache if cache is not None else TimelineCache()

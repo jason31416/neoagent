@@ -131,8 +131,11 @@ class Recorder:
             last_usage = result.usage or last_usage
             if not result.tool_calls:
                 break
+            # reasoning_content 必带（真草稿或 " " 垫片）：DeepSeek 思考模式回放
+            # 带 tool_calls 的消息强制要求该字段，缺了 400——不能指望"id 豁免"。
             msgs.append({
                 "role": "assistant", "content": result.content,
+                "reasoning_content": result.reasoning or " ",
                 "tool_calls": [
                     {"id": tc.id, "type": "function",
                      "function": {"name": tc.name, "arguments": tc.arguments}}

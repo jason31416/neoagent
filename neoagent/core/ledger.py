@@ -264,10 +264,11 @@ class MessageLedger:
         return (row[0] or "", bytes(row[1])) if row else None
 
     def attach_reasoning(self, session_key: str, seq_id: int, reasoning: str) -> None:
-        """把一轮的思考草稿挂到轮首行（meta.reasoning）。
+        """把一轮的思考草稿挂到指定行（meta.reasoning）。
 
-        reasoning 是"模型响应轮"的产物（一份/轮），账是消息粒度——挂轮首行，
-        渲染时附到由它产生的第一条协议消息上（草稿语义：不给用户看，只回传/审计）。"""
+        reasoning 是"模型响应轮"的产物（一份/轮），账是消息粒度——轮的气泡行与
+        tool 行都挂（渲染时随各自协议消息回传；tool 行缺草稿会被 DeepSeek 400），
+        草稿语义：不给用户看，只回传/审计。"""
         row = self._conn.execute(
             "SELECT meta FROM messages WHERE session_key = ? AND seq_id = ?",
             (session_key, seq_id)).fetchone()

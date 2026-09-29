@@ -408,15 +408,32 @@ async def main() -> None:
     check(think_llm.efforts == ["low", "low"],
           f"每轮按 effort_provider 取档位（实际 {think_llm.efforts}）")
     t_rows = ledger.visible("cli:think", 20)
-    check(t_rows[1].reasoning == "我先想想" and t_rows[4].reasoning == "收尾思考",
-          "思考草稿挂轮首行（meta.reasoning）")
+    check(t_rows[1].reasoning == "我先想想" and t_rows[2].reasoning == "我先想想",
+          "思考草稿挂气泡行 + tool 行（同轮两行同一份）")
+    check(t_rows[4].reasoning == "收尾思考", "纯气泡轮草稿挂轮首行")
     flat = "\n".join(str(m) for m in think_llm.seen[-1])
     check("reasoning_content" in flat and "我先想想" in flat, "渲染回传 reasoning_content")
+    tool_renders = [m for m in think_llm.seen[-1] if m.get("tool_calls")]
+    check(tool_renders and tool_renders[0].get("reasoning_content") == "我先想想",
+          "tool_calls 消息必带 reasoning_content（DeepSeek 工具续传必查）")
     msgs = render_messages(ledger, "cli:think", identity=IDENTITY, memory_text="",
                            budget=250_000, counter=COUNTER, include_reasoning=False)
     check("reasoning_content" not in str(msgs), "include_reasoning=False 逃生门生效")
     check("想好了" in flat and all("草稿不要我" not in (r.text or "") for r in t_rows),
           "标签外草稿不进账（当轮协议原始输出除外）")
+
+    # 无草稿轮：assistant 消息一律垫 " "（缺字段 400、空串 V4 拒收）
+    pad_llm = StubLLM([
+        SimpleNamespace(content='<message>没草稿也说话</message>',
+                        tool_calls=[tc("pd1", "noop", "{}")], reasoning=None),
+        SimpleNamespace(content='<message>好</message>', tool_calls=None, reasoning=None),
+    ])
+    agent7b = AgentLoop(llm=pad_llm, registry=registry, ledger=ledger, memory_file=mem)
+    await agent7b.submit(mk_event("垫片测试", conv="pad"), responder=Collector())
+    await agent7b.wait_idle("cli:pad")
+    pad_asst = [m for m in pad_llm.seen[-1] if m.get("role") == "assistant"]
+    check(pad_asst and all(m.get("reasoning_content") == " " for m in pad_asst),
+          '无草稿轮垫 " " 空格垫片（所有 assistant 消息都带字段）')
 
     print("=== 15. effort 热调整（config 改了即生效）===")
     import time as _time
@@ -604,6 +621,10 @@ async def main() -> None:
     check("789" in (memdir / "memory.md").read_text(), "整理跑：工具循环改记忆")
     check(ledger.get_recorder_state(sk8) == (3, 2), "整理跑：r_seen_seq 推进、切点生效")
     check(report == "整理完毕", "工作简报返回（只进日志）")
+    rec_calls = [m for m in r_stub2.seen[-1]
+                 if m.get("role") == "assistant" and m.get("tool_calls")]
+    check(rec_calls and all(m.get("reasoning_content") == " " for m in rec_calls),
+          'R 的 tool_calls 消息带 reasoning_content（垫 " "，不指望 id 豁免）')
 
     # ---- 22. record_memory 回执 + 紧急压缩钩子 ----
     print("=== 22. record_memory 与紧急压缩 ===")

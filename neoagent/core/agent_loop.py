@@ -313,6 +313,7 @@ class AgentLoop:
                 session_key, st, result.content, bubbles_sent)
             bubbles_sent += sent
 
+            tool_seq: Optional[int] = None
             if result.tool_calls:
                 # ② 工具流水落库：tool_call 行（本轮数组，一条协议消息）
                 rid = uuid4().hex[:8]
@@ -324,9 +325,13 @@ class AgentLoop:
                     sender_name="neoagent", calls=calls)
                 first_seq = first_seq or tool_seq
 
-            # ③ 思考草稿挂轮首行（一份/轮；不给用户看，回传/审计用。静默轮无行可挂就丢）
-            if result.reasoning and first_seq:
-                self.ledger.attach_reasoning(session_key, first_seq, result.reasoning)
+            # ③ 思考草稿回传锚点：气泡行 + tool 行都挂（同一份，一份/轮）。
+            # tool 行必须带草稿——DeepSeek 思考模式回放带 tool_calls 的 assistant 消息时
+            # 强制要求 reasoning_content（工具续传请求必查，缺了 400 "must be passed back"）。
+            # 不给用户看，纯回传/审计用。静默轮无行可挂就丢。
+            if result.reasoning:
+                for seq in dict.fromkeys(s for s in (first_seq, tool_seq) if s):
+                    self.ledger.attach_reasoning(session_key, seq, result.reasoning)
 
             if not result.tool_calls:
                 return gen_at_render
