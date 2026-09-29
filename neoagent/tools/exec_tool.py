@@ -3,7 +3,7 @@
 防线分四层（demo 够用，不是生产级）：
 1. cwd 只能在 exec.allowed_roots 内
 2. 命令命中 deny_patterns 正则直接拒绝（弱防线，挡住最蠢的事故）
-3. 超时强杀（默认 60s）
+3. 超时强杀（默认 60s）——按进程组整棵杀（bash 的孙进程会攥着管道拖死收尸）
 4. 输出截断（默认 20KB），防止把 LLM 上下文撑爆
 
 ⚠️ 不做交互式确认（IM 场景等不起），所以 deny_patterns 只是最后一道兜底，
@@ -13,10 +13,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import re
+import signal
 from typing import Any, Dict, List
 
 from .registry import ToolRegistry
+
+logger = logging.getLogger(__name__)
 
 
 class ExecPolicy:
@@ -43,6 +48,20 @@ def set_exec_policy(policy: ExecPolicy) -> None:
     _POLICY = policy
 
 
+def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
+    """把整棵进程组杀掉（start_new_session=True 后 pgid == proc.pid）。
+
+    只 proc.kill() 杀得了 bash，杀不了它生的孙进程；孙进程活着一天，
+    管道不断开，proc.wait() 就一天不返回。杀组是唯一治本的招。"""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            proc.kill()                  # 组没了就退化成单杀（进程可能已死）
+        except ProcessLookupError:
+            pass
+
+
 async def exec_command(args: Dict[str, Any]) -> str:
     """exec 工具实现：在受限环境里跑一条 bash 命令。"""
     policy = _POLICY or ExecPolicy()
@@ -65,21 +84,32 @@ async def exec_command(args: Dict[str, Any]) -> str:
     if not ok:
         return f"cwd 超出允许范围（allowed_roots={policy.allowed_roots}）：{cwd_p}"
 
-    # 3. 跑命令（bash -c 支持管道/重定向；超时强杀）
+    # 3. 跑命令（bash -c 支持管道/重定向；超时按进程组整棵强杀）
     try:
         proc = await asyncio.create_subprocess_exec(
             "bash", "-c", command,
             cwd=str(cwd_p),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,      # 独立进程组：超时时能连孙进程一起杀
         )
         try:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=policy.timeout_seconds)
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            return f"命令超时（>{policy.timeout_seconds}s），已终止：{command}"
+            # 为什么不能只 proc.kill()：bash 里生出的孙进程会继承 stdout/stderr 管道，
+            # 而 asyncio 的 proc.wait() 要等**所有管道断开**才返回（CPython
+            # base_subprocess 语义）——杀掉 bash 后收尸照样挂几分钟，直到孙进程自己死。
+            # 所以：按进程组整棵杀 + 限时收尸，两步都必须有（2026-09-29 实测挂 8 分钟）。
+            _kill_process_group(proc)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                logger.warning("[exec] 杀进程组后 5s 仍未收尸（pgid=%s），放弃等待", proc.pid)
+            logger.warning("[exec] 命令超时（>%ds），已杀进程组 pgid=%s：%s",
+                           policy.timeout_seconds, proc.pid, command[:200])
+            echo = command if len(command) <= 200 else command[:200] + "…（命令过长截断）"
+            return f"命令超时（>{policy.timeout_seconds}s），已终止：{echo}"
     except OSError as e:
         return f"命令启动失败：{e}"
 
