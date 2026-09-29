@@ -14,7 +14,7 @@ import logging
 from .app import build_agent
 from .config import load_config
 from .core.channel import ChannelAdapter
-from .log import setup_logging
+from .log import bold_cyan, bold_green, magenta, setup_logging
 
 setup_logging()
 logger = logging.getLogger("neoagent")
@@ -44,7 +44,7 @@ async def _run() -> None:
 
     # 核心入口：submit 即返回；回复经 responder 由原通道发回
     async def on_message(event) -> None:
-        logger.info("[%s] << %s", event.channel, event.text[:80])
+        logger.info("[%s] %s %s", event.channel, bold_cyan("<<"), event.text[:80])
         adapter = event_adapter(event.channel)
 
         async def responder(text: str, quote_to: str | None = None, media: str | None = None,
@@ -52,13 +52,12 @@ async def _run() -> None:
             """回复出口：M 的话经原通道发回（忙时回执也走这里）。
             quote_to：M 的 replyTo → 通道级引用；media：媒体消息（<img>/<file>，独立消息）。
             返回 SendResult（message_id 回填账用）。"""
+            note = magenta(f"（引用 {quote_to}）") if quote_to else ""
             if media:
-                logger.info("[%s] >>（媒体 %s）%s", _event.channel, media,
-                            f"（引用 {quote_to}）" if quote_to else "")
+                logger.info("[%s] %s（媒体 %s）%s", _event.channel, bold_green(">>"), media, note)
                 result = await _adapter.send_media(_event, media, quote_to=quote_to)
             else:
-                logger.info("[%s] >> %s%s", _event.channel,
-                            f"（引用 {quote_to}）" if quote_to else "", text)
+                logger.info("[%s] %s %s%s", _event.channel, bold_green(">>"), note, text)
                 result = await _adapter.send_reply(_event, text, quote_to=quote_to)
             if not result.ok:
                 logger.error("[%s] 回复失败：%s", _event.channel, result.error)

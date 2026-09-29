@@ -2,8 +2,12 @@
 
 - 时间只留 HH:MM（发消息的场景不需要日期）；
 - 不打 logger 类路径（模块名噪音），级别用颜色区分；
-- 消息内部也着色：通道标签、箭头、引用、工具名、HTTP 噪音、括号注释各有颜色，
-  不搞满屏白字。
+- 着色分两层：
+  · formatter 只管**通用 pattern**（级别名、[…] 组件标签 → 青），全文正则匹配
+    到此为止，不再对任意文本做花样匹配（误伤不可控，踩过）；
+  · 具体某条日志里的重点（<< 箭头、工具名…）由**打日志的调用点**用下面的
+    cyan()/green()/bold_cyan() 等辅助函数显式包起来。
+- 辅助函数在非 TTY / NO_COLOR 下原样返回纯文本，管道输出不会夹带 ANSI。
 """
 
 from __future__ import annotations
@@ -19,41 +23,43 @@ _BOLD = "\033[1m"
 _DIM = "\033[2m"
 
 _LEVEL_COLOR = {
-    "DEBUG": "\033[36m",          # cyan
-    "INFO": "\033[32m",           # green
+    "DEBUG": "\033[2;36m",        # dim cyan
+    "INFO": "\033[36m",           # cyan
     "WARNING": "\033[33m",        # yellow
     "ERROR": "\033[1;31m",        # bold red
     "CRITICAL": "\033[1;35m",     # bold magenta
 }
 
-_TAG_RE = re.compile(r"\[([A-Za-z_][\w.]*)\]")     # [weixin] [llm] [turn] …
-_QUOTE_RE = re.compile(r"（引用 [^）]*）")
-_PAREN_RE = re.compile(r"（[^）]*）")               # 其余括号注释 → 暗
-_TOOL_RE = re.compile(r"((?:调用工具|工具) )([A-Za-z_][\w.]*)")
-_PLUS_RE = re.compile(r"\+(\d+ 行)")               # 文件工具统计：+绿
-_MINUS_RE = re.compile(r"-(\d+ 行)")               # 文件工具统计：-红
+_TAG_RE = re.compile(r"\[([A-Za-z_][\w.]*)\]")     # [weixin] [M] [turn] …（唯一的通用 pattern）
 
 
 def _paint(msg: str) -> str:
-    """消息内重点着色（管道/非 TTY 时调用方应使用纯文本 formatter）。"""
-    # 引用先暂存（避免被括号规则二次着色把 ANSI 套乱），最后还原
-    quotes: list = []
+    """通用 pattern 着色：[…] 组件标签 → 青，别的一律不匹配。
 
-    def _stash(m: re.Match) -> str:
-        quotes.append(f"\033[35m{m.group(0)}{_RESET}")
-        return f"\x00{len(quotes) - 1}\x00"
+    消息内其余颜色由**打日志的调用点**用下面的辅助函数显式包起来；
+    调用点着色的内容里不要再写 `[...]` 标签（会被这条通用规则再包一层 ANSI）。
+    """
+    return _TAG_RE.sub(lambda m: f"\033[36m[{m.group(1)}]{_RESET}", msg)
 
-    msg = _QUOTE_RE.sub(_stash, msg)
-    msg = _TOOL_RE.sub(lambda m: f"{m.group(1)}{_BOLD}\033[36m{m.group(2)}{_RESET}", msg)  # 工具名 → 亮青
-    msg = _TAG_RE.sub(lambda m: f"\033[36m[{m.group(1)}]{_RESET}", msg)          # 通道/组件标签 → 青
-    msg = msg.replace("<<", f"{_BOLD}\033[36m<<{_RESET}")                       # 入站箭头 → 亮青
-    msg = msg.replace(">>", f"{_BOLD}\033[32m>>{_RESET}")                       # 出站箭头 → 亮绿
-    msg = _PLUS_RE.sub(lambda m: f"\033[32m+{m.group(1)}{_RESET}", msg)         # +N 行 → 绿
-    msg = _MINUS_RE.sub(lambda m: f"\033[31m-{m.group(1)}{_RESET}", msg)        # -N 行 → 红
-    msg = _PAREN_RE.sub(lambda m: f"{_DIM}{m.group(0)}{_RESET}", msg)            # 括号注释 → 暗
-    for i, q in enumerate(quotes):
-        msg = msg.replace(f"\x00{i}\x00", q)
-    return msg
+
+# ---- 调用点着色辅助（非 TTY / NO_COLOR 下原样返回纯文本，管道输出不夹带 ANSI） ----
+
+_COLOR_ON = False
+
+
+def _w(code: str, s) -> str:
+    return f"\033[{code}m{s}{_RESET}" if _COLOR_ON else str(s)
+
+
+def cyan(s) -> str:        return _w("36", s)      # noqa: E704
+def green(s) -> str:       return _w("32", s)      # noqa: E704
+def red(s) -> str:         return _w("31", s)      # noqa: E704
+def yellow(s) -> str:      return _w("33", s)      # noqa: E704
+def magenta(s) -> str:     return _w("35", s)      # noqa: E704
+def dim(s) -> str:         return _w("2", s)       # noqa: E704
+def bold(s) -> str:        return _w("1", s)       # noqa: E704
+def bold_cyan(s) -> str:   return _w("1;36", s)    # noqa: E704
+def bold_green(s) -> str:  return _w("1;32", s)    # noqa: E704
 
 
 class ColorFormatter(logging.Formatter):
@@ -86,8 +92,10 @@ def _use_color(stream) -> bool:
 
 def setup_logging(level: int = logging.INFO) -> None:
     """全局日志配置（run/cli 共用）。管道/非 TTY 自动退化为纯文本。"""
+    global _COLOR_ON
     handler = logging.StreamHandler(sys.stderr)
-    if _use_color(sys.stderr):
+    _COLOR_ON = _use_color(sys.stderr)
+    if _COLOR_ON:
         handler.setFormatter(ColorFormatter())
     else:
         handler.setFormatter(logging.Formatter(

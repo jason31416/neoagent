@@ -121,7 +121,7 @@ def build_memory_registry(ledger, session_key: str, memory_dir: Path) -> ToolReg
         ledger.set_recorder_state(session_key, cut_seq=seq)
         return f"切点已推进到 msg#{seq}"
 
-    registry = ToolRegistry()
+    registry = ToolRegistry(part="R")   # R 的工具组，日志里标 [R]
     registry.register("read_file", "读取记忆文件全文（相对路径以记忆库为基准）",
                       {"type": "object",
                        "properties": {"path": {"type": "string",

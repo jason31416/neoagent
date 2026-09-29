@@ -47,7 +47,7 @@ def build_agent(cfg: Config) -> AgentLoop:
         modellog.setup(ml_dir)
 
     # 工具（本期变体：M 直接持有工具——产品文档里这些是 E 的活）
-    registry = ToolRegistry()
+    registry = ToolRegistry(part="M")
     set_workspace(workspace)
     register_file_tools(registry, file_roots)
     register_exec_tool(registry, ExecPolicy(

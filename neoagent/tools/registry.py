@@ -12,6 +12,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Union
 
+from ..log import bold_cyan
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,7 +50,9 @@ class ToolEntry:
 
 
 class ToolRegistry:
-    def __init__(self) -> None:
+    def __init__(self, part: str = "M") -> None:
+        """part：这套工具属于哪个部件（M=主模型 / R=记忆整理），日志里写清楚。"""
+        self.part = part
         self._tools: Dict[str, ToolEntry] = {}
 
     def register(self, name: str, description: str,
@@ -76,15 +80,17 @@ class ToolRegistry:
     async def call(self, name: str, args: Dict[str, Any]) -> Union[str, ToolOutput]:
         """按名字执行工具。未知工具返回错误字符串（让模型自己纠正）。
 
-        调用与结果各打一行日志（M/R 共用这条路径，两边的工具过程都看得见）：
+        调用与结果各打一行日志，写清部件与工具名（[M]/[R] 标签走通用 pattern 染色，
+        工具名在这里显式 bold_cyan）：
         结果优先用工具自带的 stat（"+2 行 -1 行" 这类操作摘要），否则取首行前 20 字符。"""
         entry = self._tools.get(name)
         if entry is None:
             return f"未知工具：{name}，可用工具：{', '.join(self._tools)}"
-        logger.info("调用工具 %s(%s)", name, _args_preview(args))
+        logger.info("[%s] 调用工具 %s(%s)", self.part, bold_cyan(name), _args_preview(args))
         out = await entry.handler(args)
         text = out.text if isinstance(out, ToolOutput) else str(out)
         stat = (out.stat if isinstance(out, ToolOutput) else "") or _result_preview(text)
-        logger.info("工具 %s 结果 %s", name, stat)
-        logger.debug("工具 %s 结果全文（%d 字符）：%s", name, len(text), text[:500])
+        logger.info("[%s] 工具 %s 结果 %s", self.part, bold_cyan(name), stat)
+        logger.debug("[%s] 工具 %s 结果全文（%d 字符）：%s", self.part, bold_cyan(name),
+                     len(text), text[:500])
         return out
