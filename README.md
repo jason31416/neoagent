@@ -42,8 +42,9 @@ CLI      ───────────────────────�
 
 - **通道与核心解耦**：适配器只做"消息 ↔ MessageEvent"，agent 核心不知道自己挂在哪个 IM 上（同一核心、多通道）。将来产品文档里的 M（唯一的声音）就落在核心层。
 - **工具是注册制**：JSON Schema + handler，加新工具不需要动 agent 循环。
-- **消息库 = 完整上下文存储**（SQLite 全量落盘）：对话、工具流水、内部消息一行一条，重启不丢；LLM 上下文每次现渲染，按 token 预算从最老端成组抛弃（增量缓存，大块只算一次）。
+- **消息库 = 完整上下文存储**（SQLite 全量落盘）：对话、工具流水、内部消息一行一条，重启不丢；LLM 上下文每次现渲染，按 token 预算裁剪（增量缓存，大块只算一次）。
 - **多消息输出**：模型用 `<message>…</message>` 包住每条要说的话，可连发多条、可干活中途先说一句、也可保持静默；一条气泡 = 一条可被引用的消息。
+- **记忆由 R（Recorder）整理**：记忆的唯一写者（M 只读注入 `data/memory/memory.md`）。对话停顿时把值得长存的事实写进记忆库、判断上下文切点（旧上下文退役、被引用时仍可回补）；M 随时可用 `record_memory` 提案要记的内容（异步入账，R 定稿）。设计见 `设计-R记忆海马体.md`。
 
 ## 安全边界（demo 也必须有）
 
@@ -60,12 +61,12 @@ IM 里的 LLM 等于拿着一台 shell，三道防线都在 `config.toml` 里可
 
 ```
 neoagent/
-├── core/          MessageEvent / ChannelAdapter / LLM 客户端 / agent 循环
+├── core/          MessageEvent / ChannelAdapter / LLM 客户端 / agent 循环 / Recorder
 ├── channels/
 │   ├── weixin/    iLink Bot API 协议层 + 适配器 + 扫码登录
 │   └── feishu/    lark-oapi 适配器
-├── tools/         工具注册表 + read_file / write_file / exec
-├── app.py         组装（配置 → 工具 → agent）
+├── tools/         工具注册表 + read_file / write_file / exec / record_memory / 记忆工具组
+├── app.py         组装（配置 → 工具 → agent + Recorder）
 ├── run.py         服务入口
 └── cli.py         终端入口（M0 验证载体）
 ```

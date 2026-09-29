@@ -37,6 +37,8 @@ _BUDGET_SAFETY = 0.9
 _SCAN_BATCH = 500
 # 引用召回上限（防恶意引用链撑爆上下文）
 _RECALL_CAP = 32
+_RECALL_DEPTH = 3          # <recall> 引用链内嵌深度
+_RECALL_TEXT_MAX = 800     # <recall> 单条全文上限（字节截字符）
 
 _TYPE_ROLE = {TYPE_USER: "user", TYPE_ASSISTANT: "assistant", TYPE_INTERNAL: "system"}
 
@@ -57,11 +59,14 @@ def _esc_body(text: str) -> str:
     return (text or "").replace("</message>", "＜/message＞")
 
 
-def _quote_parts(ref: Optional[ReplyRef], visible_seqs: set) -> Tuple[str, str]:
+def _quote_parts(ref: Optional[ReplyRef], visible_seqs: set,
+                 recalled: Optional[Dict[int, str]] = None) -> Tuple[str, str]:
     """引用渲染：返回 (replyTo 属性值, 正文补丁)。
 
-    - 被引用消息在上下文里（含召回）→ 纯指针 replyTo="msg#N"，模型自己往上翻；
-    - 库里没有 / 召回超限 → 退化为正文补丁（罕见路径）。
+    - 被引用消息在上下文里 → 纯指针 replyTo="msg#N"，模型自己往上翻；
+    - 被切点裁掉/超窗 → <recall> 独立标签**内联在本消息里**（全文、含引用链），
+      不回插时间线——回插会把内容钉在旧位置，破坏前缀缓存；
+    - 库里也没有 → 退化为引用快照补丁（罕见路径）。
     """
     if ref is None:
         return "", ""
@@ -70,6 +75,8 @@ def _quote_parts(ref: Optional[ReplyRef], visible_seqs: set) -> Tuple[str, str]:
         attr = f"msg#{ref.seq_id}"
         if ref.seq_id in visible_seqs:
             return attr, ""
+        if recalled and ref.seq_id in recalled:
+            return attr, recalled[ref.seq_id]
         text = (ref.text or "").strip()
         if text:
             if len(text) > _QUOTE_TEXT_MAX:
@@ -180,8 +187,9 @@ class _Row:
             cost += counter.count_image() * len(self.parts)
         return cost
 
-    def compose(self, visible_seqs: set, include_reasoning: bool = True) -> dict:
-        reply_attr, patch = _quote_parts(self.reply_to, visible_seqs)
+    def compose(self, visible_seqs: set, include_reasoning: bool = True,
+                recalled: Optional[Dict[int, str]] = None) -> dict:
+        reply_attr, patch = _quote_parts(self.reply_to, visible_seqs, recalled)
         body = f"{patch}{self.body}" if patch else self.body
         text = _message_tag(sender=self.sender, seq_id=self.seq_id, ts=self.ts,
                             body=body, reply_attr=reply_attr, att=self.att)
@@ -212,13 +220,14 @@ class Block:
         self.call_index: Dict[str, Block] = {}   # 仅 tool 块有意义（迟到结果修复用）
         self.reasoning = reasoning               # 轮首行的思考草稿（tool 块挂 assistant 首条）
 
-    def compose(self, visible_seqs: set, include_reasoning: bool = True) -> List[dict]:
+    def compose(self, visible_seqs: set, include_reasoning: bool = True,
+                recalled: Optional[Dict[int, str]] = None) -> List[dict]:
         if self.kind == "tool":
             msgs = [dict(m) for m in self.tool_msgs]
             if self.reasoning and include_reasoning and msgs:
                 msgs[0]["reasoning_content"] = self.reasoning
             return msgs
-        return [r.compose(visible_seqs, include_reasoning) for r in self.rows]
+        return [r.compose(visible_seqs, include_reasoning, recalled) for r in self.rows]
 
 
 class TimelineCache:
@@ -227,9 +236,9 @@ class TimelineCache:
     def __init__(self) -> None:
         self.built_until_seq = 0                 # 已建块的游标
         self.blocks: List[Block] = []            # 基线块（旧→新，可被裁剪）
-        self.recalled: Dict[int, Block] = {}     # 召回块缓存（seq → 块，不计预算）
         self.call_blocks: Dict[str, Block] = {}  # call_id → tool 块（迟到结果修复）
         self.last_cost = 0                       # 最近一次渲染的时间线估算 token
+        self.trimmed = False                     # 本次渲染被迫砍了最老（欠一次整理的信号）
 
 
 # ----------------------------------------------------------------------
@@ -320,53 +329,58 @@ def _trim_blocks(blocks: List[Block], usable: int) -> Tuple[List[Block], int]:
 def render_messages(ledger, session_key: str, *, identity: str, memory_text: str,
                     budget: int, counter, vision=None,
                     cache: Optional[TimelineCache] = None,
-                    overhead: int = 0, include_reasoning: bool = True) -> List[dict]:
+                    overhead: int = 0, include_reasoning: bool = True,
+                    cut_seq: int = 0) -> List[dict]:
     """把消息库渲染成 OpenAI messages。每次 LLM 调用现渲染，不落状态。
 
-    budget    时间线 token 预算（system 不占；召回不计）
+    budget    时间线 token 预算（system 不占；内联回补不计）
     counter   TokenCounter 实现（providers/tokens.py）
     cache     TimelineCache（不传 = 全量渲染，测试对拍用）
-    overhead  时间线之外但要计入预算的开销估算（工具 schema / turn 内工具机器件 /
+    overhead  时间线之外但要计入预算的开销估算（工具 schema /
               真值锚定残差）——这些是会增长的大头，得挤占时间线预算
     include_reasoning  协议消息是否带 reasoning_content（思考草稿回传；某供应商的
               非思考请求若拒收就关掉，实测 DeepSeek 无所谓）
+    cut_seq   上下文切点（Recorder 的 set_cut_point）：低于它的行不再渲染（账本不动）
     """
     cache = cache if cache is not None else TimelineCache()
 
     # ── 段 1+2：system = 它是谁 + 记忆 ──
     system = identity
     if memory_text.strip():
-        system += f"\n\n【neoagent 的记忆】\n{memory_text.strip()}"
+        system += (f"\n\n【neoagent 的记忆】（记忆与最近对话冲突时，以对话为准）"
+                   f"\n{memory_text.strip()}")
     usable = max(int(budget * _BUDGET_SAFETY) - max(overhead, 0), 1)
 
     # ── 1) 新行进缓存：冷启动翻批扫到够预算；增量只取游标后 ──
-    rows = _fetch_rows(ledger, session_key, cache, usable, counter)
+    rows = _fetch_rows(ledger, session_key, cache, usable, counter, cut_seq)
     _absorb(cache, rows, counter, vision)
+    if cut_seq:                     # 切点前进：已退役的块退出渲染（缓存同步瘦身）
+        cache.blocks = [b for b in cache.blocks if b.first_seq >= cut_seq]
 
     # ── 2) 裁剪（从最老端成组抛弃；最新块保底）──
     kept, kept_cost = _trim_blocks(cache.blocks, usable)
+    cache.trimmed = len(kept) < len(cache.blocks)   # 被迫砍最老 = 欠一次整理
     if kept_cost > usable and len(kept) == 1 and kept[0].kind == "chat":
         row = kept[0].rows[0]
         row.body = _truncate_text(row.body, usable, counter)
         kept[0].cost = kept_cost = row.measure(counter)
     cache.blocks = kept                        # 顺手淘汰掉出窗口的块（回收内存）
 
-    # ── 3) 引用召回：被保留行引用的旧消息无条件回补（不计预算）──
-    recalled = _recall_missing(ledger, session_key, cache, kept, counter, vision)
+    # ── 3) 引用回补：窗外引用内联 <recall>（不回插时间线，保前缀缓存；不计预算）──
+    recalled = _build_recalls(ledger, session_key, kept)
 
     # ── 4) 组装（按 seq 时间序）──
-    visible = sorted(kept + recalled, key=lambda b: b.first_seq)
-    visible_seqs = {r.seq_id for b in visible for r in b.rows}
+    visible_seqs = {r.seq_id for b in kept for r in b.rows}
     msgs: List[dict] = [{"role": "system", "content": system}]
-    for b in visible:
-        msgs.extend(b.compose(visible_seqs, include_reasoning))
-    cache.last_cost = counter.count(system) + sum(b.cost for b in visible)
+    for b in kept:
+        msgs.extend(b.compose(visible_seqs, include_reasoning, recalled))
+    cache.last_cost = counter.count(system) + sum(b.cost for b in kept)
     return msgs
 
 
 def _fetch_rows(ledger, session_key: str, cache: TimelineCache,
-                usable: int, counter) -> list:
-    """取需要建块的新行（旧→新）。"""
+                usable: int, counter, cut_seq: int = 0) -> list:
+    """取需要建块的新行（旧→新）。切点之下是退役区，不再取。"""
     if cache.built_until_seq:
         rows: list = []
         cur = cache.built_until_seq
@@ -388,8 +402,12 @@ def _fetch_rows(ledger, session_key: str, cache: TimelineCache,
         batch = ledger.tail(session_key, before, limit=_SCAN_BATCH)
         if not batch:
             break
+        below = [e for e in batch if e.seq_id < cut_seq]
+        batch = [e for e in batch if e.seq_id >= cut_seq]
         rows = list(reversed(batch)) + rows     # batch 新→旧，拼成旧→新
         rough += sum(counter.count(e.text or "") + 32 for e in batch)   # 粗估（含标签框架）
+        if below or not batch:
+            break                               # 摸到切点：更老的都是退役区
         before = batch[-1].seq_id
         if rough >= target or len(batch) < _SCAN_BATCH:
             break
@@ -420,33 +438,38 @@ def _absorb(cache: TimelineCache, rows: list, counter, vision) -> None:
     cache.built_until_seq = rows[-1].seq_id
 
 
-def _recall_missing(ledger, session_key: str, cache: TimelineCache,
-                    kept: List[Block], counter, vision) -> List[Block]:
-    """召回被引用但不在上下文里的行（含引用链，去重防环，上限 _RECALL_CAP）。"""
-    have = {r.seq_id for b in kept for r in b.rows}
-    pending = {ref.seq_id for b in kept for ref in b.refs
-               if ref.seq_id and ref.seq_id not in have}
-    fetched: Dict[int, object] = {}
-    while pending and len(fetched) < _RECALL_CAP:
-        batch = sorted(pending)[:_RECALL_CAP - len(fetched)]
-        pending -= set(batch)
-        for r in ledger.by_seqs(session_key, batch):
-            if r.seq_id in have or r.seq_id in fetched:
-                continue
-            fetched[r.seq_id] = r
-            if r.reply_to and r.reply_to.seq_id \
-                    and r.reply_to.seq_id not in have and r.reply_to.seq_id not in fetched:
-                pending.add(r.reply_to.seq_id)
+def _build_recalls(ledger, session_key: str, kept: List[Block]) -> Dict[int, str]:
+    """窗外引用 → <recall> 内联文本（seq → 标签串），只做文本不再建块。
 
-    out: List[Block] = []
-    new_cache: Dict[int, Block] = {}
-    for seq in sorted(fetched):
-        blk = cache.recalled.get(seq)
-        if blk is None:
-            built = _build_blocks([fetched[seq]], counter, vision)
-            blk = built[0] if built else None
-        if blk is not None:
-            new_cache[seq] = blk
-            out.append(blk)
-    cache.recalled = new_cache                 # 顺手淘汰不再被引用的召回块
-    return out
+    引用链跟走（深度 ≤ _RECALL_DEPTH，拉平内嵌）；总量上限 _RECALL_CAP。
+    这是"切断 ≠ 销毁"的回补通道：被切点退役的消息被引用时照样能捞回全文。
+    """
+    have = {r.seq_id for b in kept for r in b.rows}
+    want = {ref.seq_id for b in kept for ref in b.refs
+            if ref.seq_id and ref.seq_id not in have}
+    rows: Dict[int, object] = {}
+    while want and len(rows) < _RECALL_CAP:
+        batch = sorted(want)[:_RECALL_CAP - len(want)]
+        want = set()
+        for r in ledger.by_seqs(session_key, batch):
+            if r.seq_id in have or r.seq_id in rows:
+                continue
+            rows[r.seq_id] = r
+            if r.reply_to and r.reply_to.seq_id \
+                    and r.reply_to.seq_id not in have and r.reply_to.seq_id not in rows:
+                want.add(r.reply_to.seq_id)
+
+    def one(seq: int, depth: int) -> str:
+        r = rows.get(seq)
+        if r is None:
+            return ""
+        body = _esc_body(r.text or "")
+        if len(body) > _RECALL_TEXT_MAX:
+            body = body[:_RECALL_TEXT_MAX] + "…"
+        inner = ""
+        if depth < _RECALL_DEPTH and r.reply_to and r.reply_to.seq_id:
+            inner = one(r.reply_to.seq_id, depth + 1)   # 引用链内嵌（rows 已去重防环）
+        return (f'<recall id="msg#{seq}" sender="{_esc_attr(r.sender_name)}"'
+                f' time="{_fmt_ts(r.timestamp)}">{body}{inner}</recall>')
+
+    return {seq: one(seq, 0) for seq in rows if seq not in have}

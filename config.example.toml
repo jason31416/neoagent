@@ -18,13 +18,28 @@ max_tool_rounds = 90
 history_token_budget = 250000
 # 每张图估算 token（计数器用；providers/tokens.py 可换精确实现）
 image_token_estimate = 1024
-# 记忆文件（M 自己用 write_file 维护，全文注入【记忆】段）
+# 旧记忆文件：仅用于一次性迁移到 [recorder] memory_dir（新装无需配）
 memory_file = "data/MEMORY.md"
 # 身份文件（【它是谁】段全文；改它就改了 M 的人设与消息协议说明）
 identity_file = "IDENTITY.md"
 # 工作台：agent 的工作目录（exec 默认 cwd、相对路径基准、产出物落脚点）；
 # 自动并入 files/exec/media 允许范围，无需再配 roots
 workspace = "data/workspace"
+
+[recorder]
+# R（Recorder）——记忆整理模块：记忆的唯一写者 + 上下文退役的判断者。
+# 记忆库目录：memory.md（直接注入 M 的上下文）+ 子文件（R 自主开合）+ old/（归档区）
+memory_dir = "data/memory"
+# 对话停顿判定：末条消息静默这么久后跑一次快周期整理
+pause_debounce_seconds = 150
+# 慢周期整理节律（小时）：长期归纳、归档清理、合并重排
+slow_interval_hours = 24
+# 慢周期回看起点（天）
+slow_lookback_days = 7
+# 一次整理跑最多连续调用多少轮工具
+max_tool_rounds = 12
+# 整理用的思考档位（快慢同档；要省可降）
+reasoning_effort = "medium"
 
 [files]
 # read_file / write_file 允许访问的根目录（防越界）

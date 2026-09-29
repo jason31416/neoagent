@@ -31,9 +31,20 @@ class AgentConfig:
     max_tool_rounds: int = 12
     history_token_budget: int = 250_000  # 时间线 token 预算（成组抛弃，召回不计）
     image_token_estimate: int = 1024     # 每张图估算 token（计数器用）
-    memory_file: str = "data/MEMORY.md"  # 记忆文件（M 自己编辑，全文注入【记忆】段）
+    memory_file: str = "data/MEMORY.md"  # 旧记忆文件（仅用于一次性迁移到 recorder 的 memory_dir）
     identity_file: str = "IDENTITY.md"   # 身份文件（【它是谁】段，仓库根）
     workspace: str = "data/workspace"    # 工作台：exec 默认 cwd、相对路径基准、产出物落脚点
+
+
+@dataclass
+class RecorderConfig:
+    """R（Recorder）——记忆整理模块：记忆的唯一写者 + 上下文退役的判断者。"""
+    memory_dir: str = "data/memory"        # 记忆库：memory.md（注入 M）+ 子文件 + old/ 归档
+    pause_debounce_seconds: int = 150      # 停顿判定（末条用户消息后多久算对话停顿）
+    slow_interval_hours: int = 24          # 慢周期整理的节律
+    slow_lookback_days: int = 7            # 慢周期回看起点（天）
+    max_tool_rounds: int = 12              # 一次整理跑的工具轮上限
+    reasoning_effort: str = "medium"       # 整理用的思考档位（快慢同档）
 
 
 @dataclass
@@ -82,6 +93,7 @@ class FeishuConfig:
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
+    recorder: RecorderConfig = field(default_factory=RecorderConfig)
     media: MediaConfig = field(default_factory=MediaConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)
     files: FilesConfig = field(default_factory=FilesConfig)
@@ -126,6 +138,19 @@ def load_config(path: Path | None = None) -> Config:
         cfg.agent.identity_file = str(ag.get("identity_file", cfg.agent.identity_file))
         cfg.agent.workspace = str(ag.get("workspace", cfg.agent.workspace))
 
+        rc = raw.get("recorder", {})
+        cfg.recorder.memory_dir = str(rc.get("memory_dir", cfg.recorder.memory_dir))
+        cfg.recorder.pause_debounce_seconds = int(rc.get("pause_debounce_seconds",
+                                                         cfg.recorder.pause_debounce_seconds))
+        cfg.recorder.slow_interval_hours = int(rc.get("slow_interval_hours",
+                                                      cfg.recorder.slow_interval_hours))
+        cfg.recorder.slow_lookback_days = int(rc.get("slow_lookback_days",
+                                                     cfg.recorder.slow_lookback_days))
+        cfg.recorder.max_tool_rounds = int(rc.get("max_tool_rounds",
+                                                  cfg.recorder.max_tool_rounds))
+        cfg.recorder.reasoning_effort = str(rc.get("reasoning_effort",
+                                                   cfg.recorder.reasoning_effort))
+
         md = raw.get("media", {})
         cfg.media.max_bytes = int(md.get("max_bytes", cfg.media.max_bytes))
         cfg.media.max_images_per_message = int(md.get("max_images_per_message", cfg.media.max_images_per_message))
@@ -166,6 +191,8 @@ def load_config(path: Path | None = None) -> Config:
     cfg.llm.reasoning_effort = os.environ.get("NEOAGENT_LLM_REASONING_EFFORT",
                                              cfg.llm.reasoning_effort)
     cfg.asr.api_key = os.environ.get("NEOAGENT_ASR_API_KEY", cfg.asr.api_key)
+    cfg.recorder.reasoning_effort = os.environ.get("NEOAGENT_RECORDER_REASONING_EFFORT",
+                                                   cfg.recorder.reasoning_effort)
     cfg.feishu.app_id = os.environ.get("NEOAGENT_FEISHU_APP_ID", cfg.feishu.app_id)
     cfg.feishu.app_secret = os.environ.get("NEOAGENT_FEISHU_APP_SECRET", cfg.feishu.app_secret)
 

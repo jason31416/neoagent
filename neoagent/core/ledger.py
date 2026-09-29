@@ -35,7 +35,9 @@ TYPE_TOOL_RESULT = "tool_result"
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
   session_key TEXT PRIMARY KEY,
-  last_seq    INTEGER NOT NULL DEFAULT 0
+  last_seq    INTEGER NOT NULL DEFAULT 0,
+  r_seen_seq  INTEGER NOT NULL DEFAULT 0,   -- Recorder 增量游标：已整理到哪
+  cut_seq     INTEGER NOT NULL DEFAULT 0    -- 上下文切点：低于此的行不再渲染（单调）
 );
 CREATE TABLE IF NOT EXISTS messages (
   seq_id       INTEGER NOT NULL,
@@ -103,7 +105,16 @@ class MessageLedger:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """老库无损升级：补 sessions 的 Recorder 状态列。"""
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(sessions)")}
+        for col in ("r_seen_seq", "cut_seq"):
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} "
+                                   "INTEGER NOT NULL DEFAULT 0")
 
     # ------------------------------------------------------------------
     # 序号分配：每会话单调递增、永不回收
@@ -161,6 +172,37 @@ class MessageLedger:
         )
         self._conn.commit()
         return seq
+
+    # ------------------------------------------------------------------
+    # Recorder 状态：增量游标 r_seen_seq + 上下文切点 cut_seq
+    # ------------------------------------------------------------------
+    def get_recorder_state(self, session_key: str) -> tuple:
+        """(r_seen_seq, cut_seq)；会话不存在时 (0, 0)。"""
+        row = self._conn.execute(
+            "SELECT r_seen_seq, cut_seq FROM sessions WHERE session_key = ?",
+            (session_key,)).fetchone()
+        return (int(row[0]), int(row[1])) if row else (0, 0)
+
+    def set_recorder_state(self, session_key: str, *,
+                           r_seen_seq: int | None = None,
+                           cut_seq: int | None = None) -> None:
+        """更新 Recorder 状态。cut_seq 单调只进不退：传小了无视（机器不变量）。"""
+        self._conn.execute(
+            "INSERT INTO sessions(session_key, last_seq) VALUES(?, 0) "
+            "ON CONFLICT(session_key) DO NOTHING", (session_key,))
+        if r_seen_seq is not None:
+            self._conn.execute("UPDATE sessions SET r_seen_seq = ? WHERE session_key = ?",
+                               (int(r_seen_seq), session_key))
+        if cut_seq is not None:
+            self._conn.execute(
+                "UPDATE sessions SET cut_seq = MAX(cut_seq, ?) WHERE session_key = ?",
+                (int(cut_seq), session_key))
+        self._conn.commit()
+
+    def session_keys(self) -> List[str]:
+        """全部会话（慢周期遍历用）。"""
+        return [r[0] for r in self._conn.execute(
+            "SELECT session_key FROM sessions ORDER BY session_key")]
 
     def set_message_id(self, session_key: str, seq_id: int, message_id: str) -> None:
         """回填发出消息的平台 id（消息发出后才拿得到；供以后被引用）。"""
@@ -252,6 +294,15 @@ class MessageLedger:
             "SELECT seq_id, message_id, type, sender_name, timestamp, text, meta"
             " FROM messages WHERE session_key = ? AND seq_id > ? ORDER BY seq_id LIMIT ?",
             (session_key, after_seq, limit)).fetchall()
+        return [self._row_to_entry(r) for r in rows]
+
+    def since_time(self, session_key: str, ts_min: float, limit: int = 5000) -> List[Any]:
+        """某时刻之后的行（旧→新，不分类型），Recorder 慢周期回看用。"""
+        rows = self._conn.execute(
+            "SELECT seq_id, message_id, type, sender_name, timestamp, text, meta"
+            " FROM messages WHERE session_key = ? AND timestamp >= ?"
+            " ORDER BY seq_id LIMIT ?",
+            (session_key, ts_min, limit)).fetchall()
         return [self._row_to_entry(r) for r in rows]
 
     def tail(self, session_key: str, before_seq: Optional[int] = None,

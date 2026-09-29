@@ -132,7 +132,8 @@ class AgentLoop:
                  media_roots: Optional[List[str]] = None,
                  media_max_bytes: int = 20 * 1024 * 1024,
                  workspace: Optional[Path] = None,
-                 effort_provider: Optional[Callable[[], str]] = None) -> None:
+                 effort_provider: Optional[Callable[[], str]] = None,
+                 recorder=None) -> None:
         self.llm = llm
         self.registry = registry
         self.ledger = ledger
@@ -150,6 +151,7 @@ class AgentLoop:
         # 思考档位（reasoning_effort）：每轮请求前现取 → 改配置即生效，可随时切换
         # 思考/非思考混用；默认 "medium"（none=不思考）
         self.effort_provider = effort_provider or (lambda: "medium")
+        self.recorder = recorder                # R（Recorder）：紧急压缩钩子用（可空）
         self._states: Dict[str, SessionState] = {}
         self._caches: Dict[str, TimelineCache] = {}   # 每会话增量渲染缓存
         self._anchors: Dict[str, TokenAnchor] = {}    # 每会话真值锚定（token 预估）
@@ -263,6 +265,7 @@ class AgentLoop:
         bubbles_sent = 0
 
         gen_at_render = st.input_gen
+        compressed = False          # 紧急压缩一次 turn 最多试一次（R 没进展就走兜底）
         while rounds < self.max_tool_rounds:
             # 事实层现渲染（工具流水当轮已落库，渲染即含，不再另拼机器件——
             # 曾经的 turn_tool_msgs 暂存链会造成同一轮流水在请求里出现两次）。
@@ -270,6 +273,24 @@ class AgentLoop:
             gen_at_render = st.input_gen
             overhead, extra_est = self._request_overhead(session_key, tools)
             messages = self._render(session_key, overhead=overhead)
+
+            # 紧急压缩（harness 式，罕见）：渲染被迫砍最老 → 挂起 turn、同步跑 R 整理。
+            # "压缩上下文中/压缩完成"是系统播报，直发不过 M 的模型。
+            if self._caches[session_key].trimmed and self.recorder is not None \
+                    and not compressed:
+                compressed = True
+                _, cut_before = self.ledger.get_recorder_state(session_key)
+                if st.responder is not None:
+                    await st.responder("压缩上下文中")
+                logger.info("[turn] 预算吃紧，同步整理 session=%s", session_key)
+                await self.recorder.run(session_key, "fast")
+                _, cut_after = self.ledger.get_recorder_state(session_key)
+                if st.responder is not None:
+                    await st.responder("压缩完成")
+                if cut_after > cut_before:
+                    continue        # 切点推进 → 重渲染继续，不扣轮数
+                logger.warning("[turn] 整理未推进切点，走渲染端兜底截断（欠一次整理）")
+
             est_total = self._caches[session_key].last_cost + extra_est
             predicted = self._anchors[session_key].predict(est_total)
 
@@ -556,6 +577,7 @@ class AgentLoop:
         identity = self._identity_text()
         if self.workspace is not None:
             identity += f"\n\n（你的工作目录：{self.workspace}，产出物放这里；文件工具的相对路径以它为基准）"
+        _, cut_seq = self.ledger.get_recorder_state(session_key)   # R 的上下文切点
         return render_messages(
             self.ledger, session_key,
             identity=identity,
@@ -565,6 +587,7 @@ class AgentLoop:
             vision=self.vision,
             cache=cache,
             overhead=overhead,
+            cut_seq=cut_seq,
         )
 
     def _request_overhead(self, session_key: str, tools) -> tuple:

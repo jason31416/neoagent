@@ -4,18 +4,24 @@ CLI / 微信 / 飞书入口都走这里，保证"同一核心挂多通道"。
 
 from __future__ import annotations
 
+import logging
+import shutil
 from pathlib import Path
 
 from .config import Config, PROJECT_ROOT, ReasoningEffortSource
 from .core.agent_loop import AgentLoop
 from .core.ledger import MessageLedger
 from .core.llm import LLMClient
+from .core.recorder import Recorder, RecorderScheduler
 from .providers.asr import make_transcriber
 from .providers.tokens import HeuristicTokenCounter
 from .providers.vision import make_vision
 from .tools.exec_tool import ExecPolicy, register_exec_tool
 from .tools.file_tools import register_file_tools, set_workspace
+from .tools.memory_tools import register_record_memory
 from .tools.registry import ToolRegistry
+
+logger = logging.getLogger("neoagent.app")
 
 
 def build_agent(cfg: Config) -> AgentLoop:
@@ -43,6 +49,7 @@ def build_agent(cfg: Config) -> AgentLoop:
         deny_patterns=cfg.exec.deny_patterns,
         workspace=str(workspace),
     ))
+    register_record_memory(registry)     # M 的记忆提案通道（异步入账，R 定稿）
 
     # providers（供应商适配全部藏在 providers/ 后面）
     vision = make_vision()
@@ -50,26 +57,48 @@ def build_agent(cfg: Config) -> AgentLoop:
         cfg.asr.provider, cfg.asr.base_url, cfg.asr.api_key, cfg.asr.model,
         cfg.asr.language, cfg.asr.max_audio_seconds)
 
-    # 消息库（SQLite，全量落盘）+ 记忆文件 + 身份文件
+    # 消息库（SQLite，全量落盘）+ 记忆库（Recorder 维护，M 只读注入）+ 身份文件
     ledger = MessageLedger(cfg.data_dir / "neoagent.db")
-    memory_file = Path(cfg.agent.memory_file)
-    if not memory_file.is_absolute():
-        memory_file = PROJECT_ROOT / memory_file
+    memory_dir = Path(cfg.recorder.memory_dir)
+    if not memory_dir.is_absolute():
+        memory_dir = PROJECT_ROOT / memory_dir
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    memory_md = memory_dir / "memory.md"
+    legacy = Path(cfg.agent.memory_file)          # 旧记忆文件：一次性迁移，不动原件
+    if not legacy.is_absolute():
+        legacy = PROJECT_ROOT / legacy
+    if not memory_md.exists() and legacy.exists():
+        shutil.copy(legacy, memory_md)
+        logger.info("旧记忆文件已迁入 %s（原件保留在 %s）", memory_md, legacy)
     identity_file = Path(cfg.agent.identity_file)
     if not identity_file.is_absolute():
         identity_file = PROJECT_ROOT / identity_file
 
     llm = LLMClient(cfg.llm.base_url, cfg.llm.api_key, cfg.llm.model,
                     reasoning_effort=cfg.llm.reasoning_effort)
-    return AgentLoop(llm, registry, ledger, memory_file,
-                     identity_file=identity_file,
-                     vision=vision, transcriber=transcriber,
-                     effort_provider=ReasoningEffortSource(initial=cfg.llm.reasoning_effort),
-                     token_counter=HeuristicTokenCounter(
-                         image_tokens=cfg.agent.image_token_estimate),
-                     max_tool_rounds=cfg.agent.max_tool_rounds,
-                     token_budget=cfg.agent.history_token_budget,
-                     max_images=cfg.media.max_images_per_message,
-                     media_roots=file_roots,
-                     media_max_bytes=cfg.media.max_bytes,
-                     workspace=workspace)
+    token_counter = HeuristicTokenCounter(image_tokens=cfg.agent.image_token_estimate)
+    agent = AgentLoop(llm, registry, ledger, memory_md,
+                      identity_file=identity_file,
+                      vision=vision, transcriber=transcriber,
+                      effort_provider=ReasoningEffortSource(initial=cfg.llm.reasoning_effort),
+                      token_counter=token_counter,
+                      max_tool_rounds=cfg.agent.max_tool_rounds,
+                      token_budget=cfg.agent.history_token_budget,
+                      max_images=cfg.media.max_images_per_message,
+                      media_roots=file_roots,
+                      media_max_bytes=cfg.media.max_bytes,
+                      workspace=workspace)
+
+    # R（Recorder）：记忆整理 + 上下文退役。与 M 共用 LLM 与预算，快慢同档。
+    recorder = Recorder(llm, ledger, memory_dir,
+                        token_counter=token_counter,
+                        token_budget=cfg.agent.history_token_budget,
+                        max_tool_rounds=cfg.recorder.max_tool_rounds,
+                        effort_provider=lambda: cfg.recorder.reasoning_effort,
+                        slow_lookback_days=cfg.recorder.slow_lookback_days)
+    agent.recorder = recorder
+    agent.recorder_scheduler = RecorderScheduler(
+        recorder, ledger,
+        debounce_seconds=cfg.recorder.pause_debounce_seconds,
+        slow_interval_hours=cfg.recorder.slow_interval_hours)
+    return agent

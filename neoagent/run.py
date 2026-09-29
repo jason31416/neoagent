@@ -25,6 +25,11 @@ async def _run() -> None:
     agent = build_agent(cfg)
     adapters: list[ChannelAdapter] = []
 
+    # R（Recorder）调度：停顿快周期 / 低频慢周期，静默运行
+    scheduler = getattr(agent, "recorder_scheduler", None)
+    if scheduler is not None:
+        asyncio.get_event_loop().create_task(scheduler.run_forever())
+
     if cfg.weixin.enabled:
         from .channels.weixin.adapter import WeixinAdapter
         adapters.append(WeixinAdapter(cfg.data_dir, max_bytes=cfg.media.max_bytes))

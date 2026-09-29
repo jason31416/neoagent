@@ -184,12 +184,14 @@ async def main() -> None:
                                 resolved_from="db", seq_id=s1))
     msgs = render(ledger, sk, budget=600)     # 小预算：s0/s1 被裁出窗口
     flat = "\n".join(str(m) for m in msgs)
-    i0, i1, i_fill, i_q = (flat.find("最早的话"), flat.find("很早的原话"),
-                           flat.find("填充 4"), flat.find("回很早那句"))
-    check(i0 >= 0 and i1 >= 0, "被裁掉的引用目标被召回（引用链：连更早的一起）")
-    check(i0 < i1 < i_fill < i_q, "召回行按时间顺序归位（排在保留行之前）")
+    i_fill, i_q = flat.find("填充 4"), flat.find("回很早那句")
+    seg = flat[flat.rfind("<message", 0, i_q):i_q]
+    check(f'<recall id="msg#{s1}"' in seg and f'<recall id="msg#{s0}"' in seg,
+          "窗外引用内联 <recall>（全文；引用链内嵌展平）")
+    check(flat.find("最早的话") > i_fill and flat.find("很早的原话") > i_fill,
+          "不回插时间线（回补内联进引用方消息，保前缀缓存）")
     check(f'replyTo="msg#{s1}"' in flat and "已不可见" not in flat,
-          "召回后 replyTo 是纯指针、无正文补丁")
+          "回补后 replyTo 是纯指针、无降级补丁")
     # 库里没有的消息：退化为正文补丁
     ledger.add(session_key=sk, type=TYPE_ASSISTANT, sender_name="neoagent", text="回一条没库的",
                reply_to=ReplyRef(message_id="p9", sender_name="x",
@@ -541,6 +543,110 @@ async def main() -> None:
     check(res and res[0][1] == "k1" and res[0][2] == "image", f"post 内嵌图当图片资源：{res}")
     check(_pp({"zh_cn": {"title": "", "content": [[{"tag": "text", "text": "段"}]]}}, [])[0] == "段",
           "post 语言包裹形态兼容")
+
+    # ---- 20. R 记忆工具组（沙箱 / 切点单调） ----
+    print("=== 20. R（Recorder）记忆工具组 ===")
+    from neoagent.tools.memory_tools import (build_memory_registry,
+                                             register_record_memory, record_memory)
+    from neoagent.core.recorder import Recorder, RecorderScheduler
+    memdir = Path(tmp) / "memory"
+    (memdir / "old").mkdir(parents=True, exist_ok=True)
+    (memdir / "memory.md").write_text("# 记忆\n- wifi 是 123", encoding="utf-8")
+    (memdir / "old/旧.md").write_text("归档内容", encoding="utf-8")
+    regm = build_memory_registry(ledger, "cli:r", memdir)
+    check("wifi 是 123" in await regm.call("read_file", {"path": "memory.md"}),
+          "read_file 读记忆（相对路径以记忆库为基准）")
+    check("已更新" in await regm.call("patch_file",
+          {"path": "memory.md", "old": "123", "new": "456"})
+          and "456" in (memdir / "memory.md").read_text(), "patch_file 精确替换")
+    check("允许范围" in await regm.call("move_file", {"src": "memory.md", "dst": "/etc/x"}),
+          "move 越界拒绝（src/dst 都查）")
+    check("已移动" in await regm.call("move_file", {"src": "old/旧.md", "dst": "old/新.md"})
+          and (memdir / "old/新.md").exists(), "move 归档移动")
+    check("已删除" in await regm.call("delete_file", {"path": "old/新.md"})
+          and not (memdir / "old/新.md").exists(), "delete 真删")
+    check("已推进" in await regm.call("set_cut_point", {"msg_seq": 10})
+          and "未变" in await regm.call("set_cut_point", {"msg_seq": 5}),
+          "切点单调只进不退（工具层反馈 + 账本层强制）")
+    check(ledger.get_recorder_state("cli:r")[1] == 10, "切点落库")
+
+    # ---- 21. Recorder 上下文构造与整理跑 ----
+    print("=== 21. Recorder 上下文与整理跑 ===")
+    sk8 = "cli:rflow"
+    ledger.add(session_key=sk8, type=TYPE_USER, sender_name="jason31416",
+               text="记住 wifi 是 123")
+    ledger.add(session_key=sk8, type=TYPE_TOOL_CALL, sender_name="neoagent",
+               calls=[{"call_id": "rc1", "name": "record_memory",
+                       "arguments": '{"content": "wifi=123"}'},
+                      {"call_id": "rc2", "name": "exec", "arguments": '{"command":"ls"}'}])
+    ledger.add(session_key=sk8, type=TYPE_TOOL_RESULT, sender_name="neoagent",
+               call_id="rc2", name="exec", text="big output")
+    r_stub = StubLLM([SimpleNamespace(content="done", tool_calls=[], usage=None)])
+    rec = Recorder(r_stub, ledger, memdir)
+    ctx = rec._context(sk8, "fast", rec._window(sk8, "fast"))
+    check('<file src="memory.md">' in ctx and "旧.md" not in ctx,
+          "记忆文件全量喂入、old/ 不喂（索引在 memory.md 里可见）")
+    check('<record seq="msg#2"' in ctx and "wifi=123" in ctx,
+          "record_memory 委托内联 <record>（落在调用位置）")
+    check("big output" not in ctx and "exec" not in ctx.replace("已略", ""),
+          "工具调用与结果剥除（只留委托）")
+    check("# 切点" in ctx and "未处理委托 1 条" in ctx, "# 注释头带元数据")
+    r_stub2 = StubLLM([
+        SimpleNamespace(content="", tool_calls=[SimpleNamespace(
+            id="w1", name="patch_file",
+            arguments='{"path":"memory.md","old":"456","new":"789"}')], usage=None),
+        SimpleNamespace(content="", tool_calls=[SimpleNamespace(
+            id="c1", name="set_cut_point", arguments='{"msg_seq":2}')], usage=None),
+        SimpleNamespace(content="整理完毕", tool_calls=[], usage=None),
+    ])
+    rec2 = Recorder(r_stub2, ledger, memdir)
+    report = await rec2.run(sk8, "fast")
+    check("789" in (memdir / "memory.md").read_text(), "整理跑：工具循环改记忆")
+    check(ledger.get_recorder_state(sk8) == (3, 2), "整理跑：r_seen_seq 推进、切点生效")
+    check(report == "整理完毕", "工作简报返回（只进日志）")
+
+    # ---- 22. record_memory 回执 + 紧急压缩钩子 ----
+    print("=== 22. record_memory 与紧急压缩 ===")
+    check("已记下" in await record_memory({"content": "x"}), "record_memory 固定回执")
+    reg_m = ToolRegistry()
+    register_record_memory(reg_m)
+    check("record_memory" in [s["function"]["name"] for s in reg_m.schemas()],
+          "record_memory 进 M 的工具面")
+
+    class StubR:
+        """假 R：整理时推进/不推进切点两种模式。"""
+        def __init__(self, advance): self.runs = []; self.advance = advance
+        async def run(self, session_key, cycle="fast"):
+            self.runs.append((session_key, cycle))
+            if self.advance:
+                _, cut = ledger.get_recorder_state(session_key)
+                ledger.set_recorder_state(session_key, cut_seq=cut + 5)
+            return "ok"
+
+    async def _compress_case(advance: bool) -> tuple:
+        sk9 = f"cli:comp{int(advance)}"
+        for i in range(8):
+            ledger.add(session_key=sk9, type=TYPE_USER, sender_name="jason31416",
+                       text=f"压{i} " + "x" * 400)
+        stub_r = StubR(advance)
+        llm9 = StubLLM([SimpleNamespace(
+            content='<message sender="neoagent" id="msg#9">压缩后继续</message>',
+            tool_calls=[], reasoning=None)])
+        sent9 = Collector()
+        agent9 = AgentLoop(llm=llm9, registry=registry, ledger=ledger,
+                           memory_file=mem, token_budget=800)
+        agent9.recorder = stub_r
+        await agent9.submit(mk_event("压缩测试", conv=sk9.replace("cli:", "")), responder=sent9)
+        await agent9.wait_idle(sk9)
+        return sent9.texts, stub_r.runs
+
+    texts_adv, runs_adv = await _compress_case(True)
+    check(texts_adv[:2] == ["压缩上下文中", "压缩完成"]
+          and "压缩后继续" in texts_adv, f"紧急压缩：播报 + turn 续跑（实际 {texts_adv}）")
+    check(len(runs_adv) == 1, "R 同步跑一次（切点推进 → 重渲染继续）")
+    texts_fix, runs_fix = await _compress_case(False)
+    check(texts_fix[:2] == ["压缩上下文中", "压缩完成"]
+          and len(runs_fix) == 1, "R 未推进切点：不死循环，走渲染端兜底")
 
     ledger.close()
     print("=== 全部通过 ===")
