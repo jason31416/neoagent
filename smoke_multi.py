@@ -28,7 +28,7 @@ from neoagent.core.render import TimelineCache, render_messages
 from neoagent.providers.tokens import HeuristicTokenCounter, TokenAnchor, count_chat_payload
 from neoagent.tools.registry import ToolRegistry
 
-IDENTITY = (Path(__file__).parent / "IDENTITY.md").read_text(encoding="utf-8").strip()
+IDENTITY = (Path(__file__).parent / "prompts" / "messenger.md").read_text(encoding="utf-8").strip()
 COUNTER = HeuristicTokenCounter()
 
 

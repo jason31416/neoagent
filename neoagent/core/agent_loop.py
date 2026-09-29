@@ -40,7 +40,7 @@ from .render import TimelineCache, render_messages
 logger = logging.getLogger(__name__)
 
 # 【它是谁】：M 的身份与行为准则（产品文档上下文第 1 段）
-# ——内容在独立文件 IDENTITY.md（仓库根，可配置 agent.identity_file），这里不重复。
+# ——内容在独立文件 prompts/messenger.md（可配置 agent.identity_file），这里不重复。
 
 # 兜底：语音转写失败/不可用时正文的占位
 _VOICE_FALLBACK = "（语音消息，转写暂不可用）"
@@ -574,7 +574,7 @@ class AgentLoop:
             return ""
 
     def _identity_text(self) -> str:
-        """【它是谁】段：IDENTITY.md 全文（独立文件，可配置 agent.identity_file）。"""
+        """【它是谁】段：prompts/messenger.md 全文（可配置 agent.identity_file）。"""
         if self.identity_file is None:
             return ""
         try:
