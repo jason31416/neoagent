@@ -17,11 +17,15 @@ import logging
 import os
 import re
 import signal
+import time
 from typing import Any, Dict, List
 
+from .format import error, root
 from .registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+MAX_TIMEOUT_SECONDS = 600   # 模型自己申请也顶不过这个硬上限
 
 
 class ExecPolicy:
@@ -63,16 +67,22 @@ def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
 
 
 async def exec_command(args: Dict[str, Any]) -> str:
-    """exec 工具实现：在受限环境里跑一条 bash 命令。"""
+    """exec 工具实现：在受限环境里跑一条 bash 命令。timeout 由模型按需申请（封顶）。"""
     policy = _POLICY or ExecPolicy()
     command = str(args.get("command", "")).strip()
     if not command:
-        return "缺少 command 参数"
+        return error("bad_param", "缺少 command 参数")
+    raw_timeout = args.get("timeout")
+    try:
+        timeout_s = policy.timeout_seconds if raw_timeout is None else int(raw_timeout)
+    except (TypeError, ValueError):
+        return error("bad_param", "timeout 必须是整数秒")
+    timeout_s = max(1, min(timeout_s, MAX_TIMEOUT_SECONDS))
 
     # 1. 危险命令正则拦截
     for dre in policy.deny_res:
         if dre.search(command):
-            return f"命令被安全策略拒绝（命中禁止模式 {dre.pattern}）：{command}"
+            return error("denied", f"命令被安全策略拒绝（命中禁止模式 {dre.pattern}）：{command}")
 
     # 2. cwd 校验（默认落在工作台；显式 cwd 必须在允许范围内）
     cwd = str(args.get("cwd", "")) or policy.workspace \
@@ -82,9 +92,10 @@ async def exec_command(args: Dict[str, Any]) -> str:
     ok = any(cwd_p == Path(r).resolve() or Path(r).resolve() in cwd_p.parents
              for r in policy.allowed_roots)
     if not ok:
-        return f"cwd 超出允许范围（allowed_roots={policy.allowed_roots}）：{cwd_p}"
+        return error("out_of_scope", f"cwd 超出允许范围（allowed_roots={policy.allowed_roots}）：{cwd_p}")
 
     # 3. 跑命令（bash -c 支持管道/重定向；超时按进程组整棵强杀）
+    t0 = time.monotonic()
     try:
         proc = await asyncio.create_subprocess_exec(
             "bash", "-c", command,
@@ -95,7 +106,7 @@ async def exec_command(args: Dict[str, Any]) -> str:
         )
         try:
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=policy.timeout_seconds)
+                proc.communicate(), timeout=timeout_s)
         except asyncio.TimeoutError:
             # 为什么不能只 proc.kill()：bash 里生出的孙进程会继承 stdout/stderr 管道，
             # 而 asyncio 的 proc.wait() 要等**所有管道断开**才返回（CPython
@@ -107,26 +118,28 @@ async def exec_command(args: Dict[str, Any]) -> str:
             except asyncio.TimeoutError:
                 logger.warning("[exec] 杀进程组后 5s 仍未收尸（pgid=%s），放弃等待", proc.pid)
             logger.warning("[exec] 命令超时（>%ds），已杀进程组 pgid=%s：%s",
-                           policy.timeout_seconds, proc.pid, command[:200])
+                           timeout_s, proc.pid, command[:200])
             echo = command if len(command) <= 200 else command[:200] + "…（命令过长截断）"
-            return f"命令超时（>{policy.timeout_seconds}s），已终止：{echo}"
+            return error("timeout", f"命令跑到 {timeout_s}s 被终止：{echo}")
     except OSError as e:
-        return f"命令启动失败：{e}"
+        return error("exec_failed", f"命令启动失败：{e}")
 
-    # 4. 输出拼装 + 截断
+    # 4. 输出拼装（stdout/stderr 两个真实内容块）+ 截断标记
+    elapsed = time.monotonic() - t0
     out = stdout.decode("utf-8", errors="replace")
     err = stderr.decode("utf-8", errors="replace")
-    parts = []
+    body_parts = []
     if out:
-        parts.append(out)
+        body_parts.append(root("stdout", {}, out.rstrip("\n")))
     if err:
-        parts.append(f"[stderr]\n{err}")
-    parts.append(f"[exit code: {proc.returncode}]")
-    result = "\n".join(parts)
-
-    if len(result) > policy.max_output_bytes:
-        result = result[:policy.max_output_bytes] + "\n…（输出过长已截断）"
-    return result
+        body_parts.append(root("stderr", {}, err.rstrip("\n")))
+    body = "\n".join(body_parts)
+    truncated = "false"
+    if len(body) > policy.max_output_bytes:
+        body = body[:policy.max_output_bytes]
+        truncated = "true"
+    return root("exec", {"exit": proc.returncode, "elapsed": f"{elapsed:.1f}s",
+                         "truncated": truncated}, body)
 
 
 EXEC_SCHEMA = {
@@ -140,6 +153,8 @@ EXEC_SCHEMA = {
         "properties": {
             "command": {"type": "string", "description": "要执行的 bash 命令"},
             "cwd": {"type": "string", "description": "工作目录（可选，默认工作台；必须在允许范围内）"},
+            "timeout": {"type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_SECONDS,
+                        "description": f"本次允许的最长执行秒数（不传取配置默认，硬上限 {MAX_TIMEOUT_SECONDS}）"},
         },
         "required": ["command"],
     },

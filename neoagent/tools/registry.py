@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Union
 
 from ..log import bold_cyan, gray
+from .format import error
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,7 @@ class ToolRegistry:
         结果优先用工具自带的 stat（"+2 行 -1 行" 这类操作摘要），否则取首行前 20 字符。"""
         entry = self._tools.get(name)
         if entry is None:
-            return f"未知工具：{name}，可用工具：{', '.join(self._tools)}"
+            return error("bad_param", f"未知工具：{name}，可用工具：{', '.join(self._tools)}")
         logger.info("[%s] 调用工具 %s %s", self.part, bold_cyan(name), gray(_args_preview(args)))
         out = await entry.handler(args)
         text = out.text if isinstance(out, ToolOutput) else str(out)

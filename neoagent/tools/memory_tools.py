@@ -15,7 +15,8 @@ from typing import Any, Dict
 
 from ..log import green, red
 
-from .file_tools import _resolve_in_roots
+from .file_tools import _resolve_in_roots, apply_patch
+from .format import error, file_attrs, numbered, root
 from .registry import ToolOutput, ToolRegistry
 
 _RECORD_ACK = "已记下（将在下次整理时入档，近期以对话为准）"
@@ -36,93 +37,105 @@ def build_memory_registry(ledger, session_key: str, memory_dir: Path) -> ToolReg
         try:
             path = _p(str(args.get("path", "")))
         except PermissionError as e:
-            return str(e)
+            return error("out_of_scope", str(e))
+        display = str(args.get("path", "")) or path.name
         if not path.is_file():
-            return f"文件不存在：{args.get('path')}"
+            return error("not_found", f"文件不存在：{display}")
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError as e:
-            return f"读取失败：{e}"
-        return ToolOutput(text=text, stat=f"读 {len(text.splitlines())} 行")
+            return error("bad_param", f"读取失败：{e}")
+        lines = text.splitlines()
+        body = numbered(lines, 1) if lines else "（空文件）"
+        return ToolOutput(text=root("read_file", file_attrs(path, display, total_lines=len(lines)), body),
+                          stat=f"读 {len(lines)} 行")
 
     async def write_file(args: Dict[str, Any]):
+        # R 的写就是整文件覆盖（记忆文件是它的草稿纸），mode 固定 overwrite
         try:
             path = _p(str(args.get("path", "")))
         except PermissionError as e:
-            return str(e)
+            return error("out_of_scope", str(e))
+        display = str(args.get("path", "")) or path.name
         content = args.get("content")
         if content is None:
-            return "缺少 content 参数"
+            return error("bad_param", "缺少 content 参数")
         text = str(content)
+        old_lines = (len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+                     if path.is_file() else 0)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8")
         except OSError as e:
-            return f"写入失败：{e}"
-        return ToolOutput(text=f"已写入 {path.name}（{len(text)} 字符）",
-                          stat=f"{green('+' + str(len(text.splitlines()) or 1))} 行")
+            return error("bad_param", f"写入失败：{e}")
+        new_lines = len(text.splitlines()) or 1
+        attrs = file_attrs(path, display)
+        attrs.update({"mode": "overwrite", "old_lines": old_lines, "new_lines": new_lines})
+        return ToolOutput(text=root("write_file", attrs, "已写入"),
+                          stat=f"{green('+' + str(new_lines))} 行")
 
     async def patch_file(args: Dict[str, Any]):
         try:
             path = _p(str(args.get("path", "")))
         except PermissionError as e:
-            return str(e)
+            return error("out_of_scope", str(e))
+        display = str(args.get("path", "")) or path.name
         old, new = args.get("old"), args.get("new")
         if old is None or new is None:
-            return "缺少 old / new 参数"
+            return error("bad_param", "缺少 old / new 参数")
         if not path.is_file():
-            return f"文件不存在：{args.get('path')}"
+            return error("not_found", f"文件不存在：{display}")
         try:
             text = path.read_text(encoding="utf-8")
         except OSError as e:
-            return f"读取失败：{e}"
-        n = text.count(str(old))
-        if n == 0:
-            return "old 在文件里没有匹配（先 read_file 核对原文）"
-        if n > 1:
-            return f"old 匹配到 {n} 处，不唯一（请扩大 old 的范围使其唯一）"
-        path.write_text(text.replace(str(old), str(new), 1), encoding="utf-8")
-        return ToolOutput(text=f"已更新 {path.name}",
-                          stat=f"{green('+' + str(len(str(new).splitlines())))} "
-                               f"{red('-' + str(len(str(old).splitlines())))} 行")
+            return error("bad_param", f"读取失败：{e}")
+        new_text, err, info = apply_patch(text, old, new, display)   # 和 M 同一套匹配/报错
+        if err:
+            return err
+        path.write_text(new_text, encoding="utf-8")
+        return ToolOutput(text=root("patch_file", dict({"path": display}, **info), "已修改"),
+                          stat=f"{green('+' + str(info['added']))} "
+                               f"{red('-' + str(info['removed']))} 行")
 
     async def delete_file(args: Dict[str, Any]) -> str:
         try:
             path = _p(str(args.get("path", "")))
         except PermissionError as e:
-            return str(e)
+            return error("out_of_scope", str(e))
+        display = str(args.get("path", "")) or path.name
         if path.is_dir():
-            return "delete 只删文件；目录请用 move 归档"
+            return error("bad_param", "delete 只删文件；目录请用 move 归档")
         if not path.is_file():
-            return f"文件不存在：{args.get('path')}"
+            return error("not_found", f"文件不存在：{display}")
         path.unlink()
-        return f"已删除 {path.name}"
+        return root("delete_file", {"path": display}, "已删除")
 
     async def move_file(args: Dict[str, Any]) -> str:
         try:
             src = _p(str(args.get("src", "")))
             dst = _p(str(args.get("dst", "")))
         except PermissionError as e:
-            return str(e)
+            return error("out_of_scope", str(e))
         if not src.is_file():
-            return f"源文件不存在：{args.get('src')}"
+            return error("not_found", f"源文件不存在：{args.get('src')}")
         dst.parent.mkdir(parents=True, exist_ok=True)
         src.rename(dst)
-        return f"已移动 {src.name} → {dst.relative_to(memory_dir) if dst.is_relative_to(memory_dir) else dst}"
+        rel = dst.relative_to(memory_dir) if dst.is_relative_to(memory_dir) else dst
+        return root("move_file", {"src": args.get("src"), "dst": str(rel)}, "已移动")
 
     async def set_cut_point(args: Dict[str, Any]) -> str:
         """声明"msg_seq 之前的上下文可以退役"。单调只进不退（账本层强制）。"""
         try:
             seq = int(args.get("msg_seq", 0))
         except (TypeError, ValueError):
-            return "msg_seq 必须是消息序号（数字）"
+            return error("bad_param", "msg_seq 必须是消息序号（数字）")
         if seq <= 0:
-            return "msg_seq 无效"
+            return error("bad_param", "msg_seq 无效")
         _, cur = ledger.get_recorder_state(session_key)
         if seq <= cur:
-            return f"切点未变（只进不退）：当前 msg#{cur}"
+            return error("bad_param", f"切点未变（只进不退）：当前 msg#{cur}")
         ledger.set_recorder_state(session_key, cut_seq=seq)
-        return f"切点已推进到 msg#{seq}"
+        return root("set_cut_point", {"msg_seq": seq, "cut": seq}, f"切点已推进到 msg#{seq}")
 
     registry = ToolRegistry(part="recorder")   # R 的工具组，日志里标 [recorder]
     registry.register("read_file", "读取记忆文件全文（相对路径以记忆库为基准）",
