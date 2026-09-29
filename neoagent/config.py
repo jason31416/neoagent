@@ -32,7 +32,7 @@ class AgentConfig:
     history_token_budget: int = 250_000  # 时间线 token 预算（成组抛弃，召回不计）
     image_token_estimate: int = 1024     # 每张图估算 token（计数器用）
     memory_file: str = "data/MEMORY.md"  # 旧记忆文件（仅用于一次性迁移到 recorder 的 memory_dir）
-    identity_file: str = "prompts/messenger.md"   # 身份文件（【它是谁】段，仓库根 prompts/）
+    identity_file: str = "neoagent/prompts/messenger.md"   # 系统提示词（core/prompts/）
     workspace: str = "data/workspace"    # 工作台：exec 默认 cwd、相对路径基准、产出物落脚点
     # 模型请求上下文落盘（M/R 共用，调试用）：每会话一份 md、只留最新一次请求，
     # 置空关闭

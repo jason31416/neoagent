@@ -35,7 +35,7 @@ RECORD_NAME = "record_memory"      # M 的提案工具名（流水中唯一保�
 def _load_system() -> str:
     """R 的系统提示词：prompts/recorder.md（提示词集中在仓库根 prompts/ 下，
     M 的是同目录 messenger.md）。周期差异片段见 _CYCLE_NOTES，运行时拼接。"""
-    return (PROJECT_ROOT / "prompts" / "recorder.md").read_text(encoding="utf-8").strip()
+    return (PROJECT_ROOT / "neoagent" / "prompts" / "recorder.md").read_text(encoding="utf-8").strip()
 
 
 _SYSTEM = _load_system()
@@ -62,7 +62,7 @@ class Recorder:
     def __init__(self, llm: LLMClient, ledger: MessageLedger, memory_dir: Path, *,
                  token_counter: Optional[TokenCounter] = None,
                  token_budget: int = 250_000,
-                 max_tool_rounds: int = 12,
+                 max_tool_rounds: int = 90,
                  effort_provider: Optional[Callable[[], str]] = None,
                  slow_lookback_days: int = 7) -> None:
         self.llm = llm

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from ..log import green
 from .registry import ToolOutput, ToolRegistry
 
 DEFAULT_READ_LIMIT = 200  # 单次最多读多少行（IM 场景不需要长输出）
@@ -97,7 +98,7 @@ async def write_file(args: Dict[str, Any]):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return ToolOutput(text=f"已写入 {path}（{len(text)} 字符）",
-                      stat=f"+{len(text.splitlines()) or 1} 行")
+                      stat=f"{green('+' + str(len(text.splitlines()) or 1))} 行")
 
 
 def _allowed_roots() -> List[str]:

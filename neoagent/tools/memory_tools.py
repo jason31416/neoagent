@@ -13,6 +13,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
+from ..log import green, red
+
 from .file_tools import _resolve_in_roots
 from .registry import ToolOutput, ToolRegistry
 
@@ -58,7 +60,7 @@ def build_memory_registry(ledger, session_key: str, memory_dir: Path) -> ToolReg
         except OSError as e:
             return f"写入失败：{e}"
         return ToolOutput(text=f"已写入 {path.name}（{len(text)} 字符）",
-                          stat=f"+{len(text.splitlines()) or 1} 行")
+                          stat=f"{green('+' + str(len(text.splitlines()) or 1))} 行")
 
     async def patch_file(args: Dict[str, Any]):
         try:
@@ -81,7 +83,8 @@ def build_memory_registry(ledger, session_key: str, memory_dir: Path) -> ToolReg
             return f"old 匹配到 {n} 处，不唯一（请扩大 old 的范围使其唯一）"
         path.write_text(text.replace(str(old), str(new), 1), encoding="utf-8")
         return ToolOutput(text=f"已更新 {path.name}",
-                          stat=f"+{len(str(new).splitlines())} -{len(str(old).splitlines())} 行")
+                          stat=f"{green('+' + str(len(str(new).splitlines())))} "
+                               f"{red('-' + str(len(str(old).splitlines())))} 行")
 
     async def delete_file(args: Dict[str, Any]) -> str:
         try:

@@ -12,7 +12,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Union
 
-from ..log import bold, gray
+from ..log import bold_cyan, gray
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +23,8 @@ class ToolOutput:
     实测 DeepSeek 收；图片走"工具结果信封"进当轮上下文并落账）。"""
     text: str = ""
     images: List[str] = field(default_factory=list)   # 图片路径（核心读字节/落 blob）
-    stat: str = ""        # 日志摘要（"+2 行 -1 行" / "读 12 行"）；模型看不到，只进日志
+    stat: str = ""        # 日志摘要（"+2 行 -1 行" / "读 12 行"）；模型看不到，只进日志。
+                          # 增删数字由构造处显式着色（green(+N)/red(-N)，非 TTY 纯文本）
 
 
 def _args_preview(args: Dict[str, Any]) -> str:
@@ -81,17 +82,18 @@ class ToolRegistry:
     async def call(self, name: str, args: Dict[str, Any]) -> Union[str, ToolOutput]:
         """按名字执行工具。未知工具返回错误字符串（让模型自己纠正）。
 
-        调用与结果各打一行日志，写清部件与工具名（部件标签走通用 pattern 灰染；
-        工具名粗白、参数与结果摘要灰色，参数不加括号——括号里塞 JSON 太挤）：
+        调用与结果各打一行日志，写清部件与工具名（部件标签走通用 pattern 暗青；
+        工具名亮青粗、参数灰色且不加括号——括号里塞 JSON 太挤；结果统计原样打出，
+        工具构造 stat 时已自带 +/- 着色，无 stat 时用灰色首行预览兜底）：
         结果优先用工具自带的 stat（"+2 行 -1 行" 这类操作摘要），否则取首行前 20 字符。"""
         entry = self._tools.get(name)
         if entry is None:
             return f"未知工具：{name}，可用工具：{', '.join(self._tools)}"
-        logger.info("[%s] 调用工具 %s %s", self.part, bold(name), gray(_args_preview(args)))
+        logger.info("[%s] 调用工具 %s %s", self.part, bold_cyan(name), gray(_args_preview(args)))
         out = await entry.handler(args)
         text = out.text if isinstance(out, ToolOutput) else str(out)
-        stat = (out.stat if isinstance(out, ToolOutput) else "") or _result_preview(text)
-        logger.info("[%s] 工具 %s 结果 %s", self.part, bold(name), gray(stat))
-        logger.debug("[%s] 工具 %s 结果全文%s：%s", self.part, bold(name),
+        stat = (out.stat if isinstance(out, ToolOutput) else "") or gray(_result_preview(text))
+        logger.info("[%s] 工具 %s 结果 %s", self.part, bold_cyan(name), stat)
+        logger.debug("[%s] 工具 %s 结果全文%s：%s", self.part, bold_cyan(name),
                      gray(f"（{len(text)} 字符）"), gray(text[:500]))
         return out

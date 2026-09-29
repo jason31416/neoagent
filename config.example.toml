@@ -21,7 +21,7 @@ image_token_estimate = 1024
 # 旧记忆文件：仅用于一次性迁移到 [recorder] memory_dir（新装无需配）
 memory_file = "data/MEMORY.md"
 # 身份文件（【它是谁】段全文；改它就改了 M 的人设与消息协议说明）
-identity_file = "prompts/messenger.md"
+identity_file = "neoagent/prompts/messenger.md"
 # 工作台：agent 的工作目录（exec 默认 cwd、相对路径基准、产出物落脚点）；
 # 自动并入 files/exec/media 允许范围，无需再配 roots
 workspace = "data/workspace"
