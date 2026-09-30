@@ -23,8 +23,7 @@ from ..config import PROJECT_ROOT
 from ..tools.memory_tools import build_memory_registry, record_payload
 from ..tools.registry import ToolOutput
 from . import modellog
-from .ledger import (TYPE_ASSISTANT, TYPE_INTERNAL, TYPE_TOOL_CALL, TYPE_TOOL_RESULT,
-                     TYPE_USER, MessageLedger)
+from .ledger import TYPE_ASSISTANT, TYPE_TOOL_RESULT, MessageLedger
 from .llm import LLMClient
 from ..providers.tokens import HeuristicTokenCounter, TokenCounter
 
@@ -43,16 +42,14 @@ _SYSTEM = _load_system()
 _CYCLE_NOTES = {
     "fast": """## 本次是快周期整理
 侧重：修正记忆；
-一般以增加为主、删除为辅。上下文的丢弃判断可以在这次做（拿不准就先不动）。""",
+一般以增加为主、删除为辅。上下文的丢弃判断可以在这次做（拿不准就先不动）。
+快周期的常态是什么也不做，没有值得记或者只是“或许值得记”的就不要硬记。""",
     "slow": """## 本次是慢周期整理
 侧重：更大幅度的整理——用户习惯、neoagent 的经验这类需要长期推演的归纳；
 对过时或暂时用不到的记忆做归档/清理；对记忆内容做合并与重排。
 上下文切点一般不在这次判断。""",
 }
 
-# 流水视图里图片不附本体，只留存在标记（值得记的点一般已被 M 说出来）
-_IMG_NOTE = "（附图 {n} 张）"
-_FILE_NOTE = "（附文件 {names}）"
 _TIME_FMT = "%Y-%m-%d %H:%M"
 
 
@@ -145,8 +142,8 @@ class Recorder:
         if rows:
             self.ledger.set_recorder_state(session_key, r_seen_seq=rows[-1].seq_id)
         _, cut_after = self.ledger.get_recorder_state(session_key)
-        cut_note = (f"切点 msg#{cut_before}→msg#{cut_after}" if cut_after != cut_before
-                    else f"切点 msg#{cut_after} 未动")
+        cut_note = (f"切点 seq#{cut_before}→seq#{cut_after}" if cut_after != cut_before
+                    else f"切点 seq#{cut_after} 未动")
         logger.info("[recorder] %s整理完成 session=%s 流水 %s～%s %s%s",
                     "快" if cycle == "fast" else "慢", session_key,
                     f"msg#{rows[0].seq_id}" if rows else "（空）",
@@ -178,16 +175,16 @@ class Recorder:
         r_seen, cut = self.ledger.get_recorder_state(session_key)
         now = time.strftime(_TIME_FMT)
         records = [r for r in rows
-                   if r.type == TYPE_TOOL_CALL and r.seq_id > r_seen
+                   if r.type == TYPE_ASSISTANT and r.seq_id > r_seen
                    and any(getattr(c, "name", "") == RECORD_NAME for c in r.calls)]
         head = [
             f"# 记忆整理 · {'快' if cycle == 'fast' else '慢'}周期 · {now}",
-            f"# 切点 msg#{cut} · 已整理到 msg#{r_seen} · 未处理委托 {len(records)} 条"
-            + (f"（{', '.join(f'msg#{r.seq_id}' for r in records)}）" if records else ""),
+            f"# 切点 seq#{cut} · 已整理到 seq#{r_seen} · 未处理委托 {len(records)} 条"
+            + (f"（{', '.join(f'seq#{r.seq_id}' for r in records)}）" if records else ""),
         ]
         if rows:
-            head.append(f"# 流水 msg#{rows[0].seq_id}～msg#{rows[-1].seq_id}"
-                        "（工具调用与结果已略；图片不附本体）")
+            head.append(f"# 流水 seq#{rows[0].seq_id}～seq#{rows[-1].seq_id}"
+                        "（工具结果已略；图片不附本体）")
 
         parts = ["\n".join(head)]
         for rel, content in self._memory_files():
@@ -220,30 +217,19 @@ class Recorder:
         return out
 
     def _row_line(self, r) -> str:
-        """一行账 → 流水视图的一条（同 M 的消息协议；工具行只剩 record 委托）。"""
+        """一行 → 流水视图的一条（主表定稿原样，和 M 看到的完全一致）。"""
         if r.type == TYPE_TOOL_RESULT:
             return ""
-        ts = time.strftime(_TIME_FMT, time.localtime(r.timestamp))
-        if r.type == TYPE_TOOL_CALL:
-            lines = []
+        lines = []
+        if r.text:
+            lines.append(r.text)          # <message>/<recall> 等标签都已固化在文里
+        if r.type == TYPE_ASSISTANT:      # record_memory 委托随轮内联（工具行不进流水）
+            ts = time.strftime(_TIME_FMT, time.localtime(r.timestamp))
             for c in r.calls:
                 if getattr(c, "name", "") == RECORD_NAME:
                     payload = record_payload({"arguments": getattr(c, "arguments", "")})
-                    lines.append(f'<record seq="msg#{r.seq_id}" time="{ts}">'
-                                 f'{_esc(payload)}</record>')
-            return "\n".join(lines)
-        if r.type not in (TYPE_USER, TYPE_ASSISTANT, TYPE_INTERNAL):
-            return ""
-        body = r.text
-        imgs = sum(1 for a in r.attachments if a.kind == "image")
-        files = [a.filename for a in r.attachments if a.kind != "image" and a.kind != "audio"]
-        if imgs:
-            body += _IMG_NOTE.format(n=imgs)
-        if files:
-            body += _FILE_NOTE.format(names=", ".join(files))
-        reply = f' replyTo="msg#{r.reply_to.seq_id}"' if r.reply_to and r.reply_to.seq_id else ""
-        return (f'<message sender="{_esc(r.sender_name)}" id="msg#{r.seq_id}"'
-                f' time="{ts}"{reply}>{_esc(body)}</message>')
+                    lines.append(f'<record time="{ts}">{_esc(payload)}</record>')
+        return "\n".join(lines)
 
 
 def _esc(s: str) -> str:
@@ -260,12 +246,12 @@ class RecorderScheduler:
     """
 
     def __init__(self, recorder: Recorder, ledger: MessageLedger, *,
-                 debounce_seconds: int = 150, slow_interval_hours: int = 24,
+                 debounce_seconds: int = 150, slow_interval: int = 86400,
                  tick_seconds: float = 15.0) -> None:
         self.recorder = recorder
         self.ledger = ledger
         self.debounce = float(debounce_seconds)
-        self.slow_interval = float(slow_interval_hours) * 3600
+        self.slow_interval = float(slow_interval)
         self.tick = float(tick_seconds)
 
     async def run_forever(self) -> None:

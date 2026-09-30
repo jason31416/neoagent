@@ -19,7 +19,7 @@ from .file_tools import _resolve_in_roots, apply_patch
 from .format import error, file_attrs, numbered, root
 from .registry import ToolOutput, ToolRegistry
 
-_RECORD_ACK = "已记下（将在下次整理时入档，近期以对话为准）"
+_RECORD_ACK = "已记下（为保证缓存，将在下次整理时修正记忆，近期以对话为准）"
 
 
 # ----------------------------------------------------------------------
@@ -124,18 +124,25 @@ def build_memory_registry(ledger, session_key: str, memory_dir: Path) -> ToolReg
         return root("move_file", {"src": args.get("src"), "dst": str(rel)}, "已移动")
 
     async def set_cut_point(args: Dict[str, Any]) -> str:
-        """声明"msg_seq 之前的上下文可以退役"。单调只进不退（账本层强制）。"""
+        """声明"msg_seq 之前的上下文可以退役"。单调只进不退（账本层强制）。
+
+        msg_seq 是 <message> 标签上的气泡编号 msg#N；切点落点自动吸附到它所在
+        对话段（协议组）的边界——不会把 tool 链从中间截断。"""
         try:
             seq = int(args.get("msg_seq", 0))
         except (TypeError, ValueError):
-            return error("bad_param", "msg_seq 必须是消息序号（数字）")
+            return error("bad_param", "msg_seq 必须是消息编号（<message> 标签上的 msg#N）")
         if seq <= 0:
             return error("bad_param", "msg_seq 无效")
+        hit = ledger.get_bubble(session_key, seq)
+        if hit is None:
+            return error("bad_param", f"msg#{seq} 不存在（用 <message> 标签上的编号）")
         _, cur = ledger.get_recorder_state(session_key)
-        if seq <= cur:
-            return error("bad_param", f"切点未变（只进不退）：当前 msg#{cur}")
-        ledger.set_recorder_state(session_key, cut_seq=seq)
-        return root("set_cut_point", {"msg_seq": seq, "cut": seq}, f"切点已推进到 msg#{seq}")
+        if hit.seq_id <= cur:
+            return error("bad_param", f"切点未变（只进不退）：msg#{seq} 已在切点之前")
+        ledger.set_recorder_state(session_key, cut_seq=hit.seq_id)   # 自动吸附组边界
+        return root("set_cut_point", {"msg_seq": seq, "cut": hit.seq_id},
+                    f"切点已推进：msg#{seq} 保留，之前可退役（落点 seq#{hit.seq_id}）")
 
     registry = ToolRegistry(part="recorder")   # R 的工具组，日志里标 [recorder]
     registry.register("read_file", "读取记忆文件全文（相对路径以记忆库为基准）",
@@ -167,7 +174,7 @@ def build_memory_registry(ledger, session_key: str, memory_dir: Path) -> ToolReg
                       "声明 msg_seq 之前的上下文已无关、可以退役（只进不退；拿不准就先不调）",
                       {"type": "object",
                        "properties": {"msg_seq": {"type": "integer",
-                                                  "description": "保留起点：这条之前的不再进上下文"}},
+                                                  "description": "保留起点（<message> 标签上的 msg#N）：这条之前的不再进上下文"}},
                        "required": ["msg_seq"]}, set_cut_point)
     return registry
 
@@ -186,8 +193,7 @@ def register_record_memory(registry: ToolRegistry) -> None:
     """注册进 M 的工具面（提案通道：M 提案、Recorder 定稿）。"""
     registry.register(
         "record_memory",
-        "向记忆整理模块提案要记住的内容（事实、约定、结论）。异步生效：内容先入账，"
-        "对话停顿时由记忆整理模块写入长期记忆。适合'用户让我记住某事'或你确认值得长存的事实。",
+        "向记忆模块提出要记住的内容。",
         {"type": "object",
          "properties": {"content": {"type": "string",
                                     "description": "要记住的内容（一段话，说清事实即可）"}},

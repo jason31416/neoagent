@@ -19,12 +19,13 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
-from neoagent.core.agent_loop import AgentLoop, _extract_messages
+from neoagent.core.agent_loop import AgentLoop
 from neoagent.core.events import (Attachment, Conversation, MessageEvent, ReplyRef,
                                   SendResult, Sender)
-from neoagent.core.ledger import (MessageLedger, TYPE_ASSISTANT, TYPE_TOOL_CALL,
-                                  TYPE_TOOL_RESULT, TYPE_USER)
-from neoagent.core.render import TimelineCache, render_messages
+from neoagent.core.frames import finalize_assistant, finalize_user
+from neoagent.core.ledger import (MessageLedger, TYPE_ASSISTANT, TYPE_TOOL_RESULT,
+                                  TYPE_USER)
+from neoagent.core.render import render_messages
 from neoagent.providers.tokens import HeuristicTokenCounter, TokenAnchor, count_chat_payload
 from neoagent.tools.registry import ToolRegistry
 
@@ -90,9 +91,44 @@ class Collector:
                           message_id=f"m{len(self.texts) + len(self.media)}")
 
 
-def render(ledger, sk, budget=250_000, cache=None, overhead=0):
-    return render_messages(ledger, sk, identity=IDENTITY, memory_text="",
-                           budget=budget, counter=COUNTER, cache=cache, overhead=overhead)
+def render(ledger, sk, budget=250_000, overhead=0):
+    msgs, _cost, _trimmed = render_messages(
+        ledger, sk, identity=IDENTITY, memory_text="",
+        budget=budget, counter=COUNTER, overhead=overhead)
+    return msgs
+
+
+_TS = 1_760_000_000.0   # 定稿时间戳（固定值，断言好对）
+
+
+def add_user(ledger, sk, text, *, sender="jason31416", msg_id="", recall="",
+             attachments=None, ts=_TS):
+    """smoke 造数：用户消息入库定稿（一条协议行 + 一个气泡）。"""
+    bid = ledger.alloc_bubbles(sk, 1)[0]
+    final = finalize_user(text, sender=sender, bubble_id=bid, ts=ts, recall=recall)
+    seq = ledger.add_turn(session_key=sk, type=TYPE_USER, text=final,
+                          attachments=attachments, timestamp=ts)
+    ledger.add_bubble(session_key=sk, bubble_id=bid, seq_id=seq, direction="in",
+                      platform="cli", chat_id=sk, message_id=msg_id, kind="text",
+                      content=text, sender=sender, timestamp=ts)
+    return seq, bid
+
+
+def add_assistant(ledger, sk, content, *, calls=None, reasoning="",
+                  attachments=None, ts=_TS):
+    """smoke 造数：模型输出入库定稿（一条协议行 + 气泡行）。"""
+    final, bubbles = finalize_assistant(
+        content, ts=ts,
+        alloc=lambda: ledger.alloc_bubbles(sk, 1)[0],
+        lookup=lambda b: ledger.get_bubble(sk, b))
+    seq = ledger.add_turn(session_key=sk, type=TYPE_ASSISTANT, text=final,
+                          reasoning=reasoning, calls=calls,
+                          attachments=attachments, timestamp=ts)
+    for b in bubbles:
+        ledger.add_bubble(session_key=sk, bubble_id=b.bubble_id, seq_id=seq,
+                          direction="out", platform="cli", chat_id=sk, kind=b.kind,
+                          content=b.content, sender="neoagent", timestamp=ts)
+    return seq
 
 
 async def main() -> None:
@@ -102,22 +138,39 @@ async def main() -> None:
     mem = Path(tmp) / "MEMORY.md"
     sent = Collector()
 
-    # ── 1. 块抽取纯函数 ──
-    print("=== 1. 消息/媒体块抽取 ===")
-    got = _extract_messages('<message>甲</message>草稿'
-                            '<img src="a.png"/>'
-                            '<message sender="x" id="msg#9" replyTo="msg#3">乙</message>'
-                            '<file src="b.pdf" name="报告"/>')
-    check([(o.kind, o.text or o.path, o.quote_seq, o.name) for o in got]
+    # ── 1. 入库定稿（净化 / 气泡编号 / recall 固化）──
+    print("=== 1. 入库定稿 ===")
+    fake_hit = SimpleNamespace(bubble_id=3, sender="jason31416", timestamp=_TS,
+                               content="被引的话")
+    _ids = iter(range(100, 200))
+
+    def _fin(content, lookup=lambda b: fake_hit if b == 3 else None):
+        return finalize_assistant(content, ts=_TS,
+                                  alloc=lambda: next(_ids), lookup=lookup)
+
+    final, got = _fin('<message>甲</message>草稿'
+                      '<img src="a.png"/>'
+                      '<message sender="x" id="msg#9" replyTo="msg#3">乙</message>'
+                      '<file src="b.pdf" name="报告"/>')
+    check([(b.kind, b.content, b.reply_to, b.name) for b in got]
           == [("text", "甲", None, ""), ("image", "a.png", None, ""),
-              ("text", "乙", 3, ""), ("file", "b.pdf", None, "报告")],
-          f"属性丢弃、replyTo/src/name 提取、顺序保留（实际 {got}）")
-    check(_extract_messages('<message></message>\n<message>  </message>') == [], "空块丢弃")
-    check(_extract_messages('<message>没闭合') == [], "未闭合标签按草稿丢")
-    check(_extract_messages('纯草稿，没有标签') == [], "无块 = 静默")
-    check(_extract_messages('<img alt="没src"/>') == [], "没 src 的媒体标签按草稿丢")
-    inner = _extract_messages('<message>看这个 <img src="in.png"/></message>')
-    check(len(inner) == 1 and inner[0].kind == "text" and "<img" in inner[0].text,
+              ("text", "乙", 3, ""), ("file", "报告", None, "报告")],
+          f"气泡提取：顺序保留、replyTo 验真、src/name 归位（实际 {got}）")
+    check('id="msg#9"' not in final and "2020" not in final and 'sender="x"' not in final,
+          "模型自编 id/time/sender 入库前剥掉（不算数）")
+    check('<recall id="msg#3"' in final and "被引的话" in final
+          and 'replyTo="msg#3"' in final and "草稿" in final,
+          "合法 replyTo 保留 + recall 快照固化 + 碎碎念留存")
+    f2, g2 = _fin('<message></message>\n<message>  </message>')
+    check(not g2 and "<message></message>" in f2, "空块不编号不发送（按碎碎念留存）")
+    f3, g3 = _fin('<message>没闭合')
+    check(not g3 and "没闭合" in f3, "未闭合标签按碎碎念留存")
+    f4, g4 = _fin('纯草稿，没有标签')
+    check(not g4 and "纯草稿" in f4, "无块 = 不发送，碎碎念留存")
+    f5, g5 = _fin('<img alt="没src"/>')
+    check(not g5, "没 src 的媒体标签按碎碎念留存")
+    f6, g6 = _fin('<message>看这个 <img src="in.png"/></message>')
+    check(len(g6) == 1 and g6[0].kind == "text" and "<img" in g6[0].content,
           "message 正文里的 <img> 不另拆消息")
 
     # ── 2+3. 边干边说 + 工具流水行（stub 模型走完整 turn）──
@@ -138,16 +191,19 @@ async def main() -> None:
           f"气泡按序即时发出、属性丢弃（实际 {sent.texts}）")
     entries = ledger.visible("cli:smoke", 200)
     types = [e.type for e in entries]
-    check(types == [TYPE_USER, TYPE_ASSISTANT, TYPE_TOOL_CALL, TYPE_TOOL_RESULT,
-                    TYPE_TOOL_RESULT, TYPE_ASSISTANT, TYPE_ASSISTANT],
-          f"行类型时间线正确（实际 {types}）")
-    calls = entries[2].calls
-    check(len(calls) == 2 and entries[3].call_id == calls[0].call_id
-          and entries[4].call_id == calls[1].call_id, "tool_call 数组 / tool_result 配对")
-    check([e.text for e in entries if e.type == TYPE_ASSISTANT]
-          == ["稍等，我翻下文件。", "找到了。", "第二条"], "每气泡一条 assistant 账")
-    check([e.message_id for e in entries if e.type == TYPE_ASSISTANT] == ["m1", "m2", "m3"],
-          "发出消息 id 回填 assistant 行")
+    check(types == [TYPE_USER, TYPE_ASSISTANT, TYPE_TOOL_RESULT, TYPE_TOOL_RESULT,
+                    TYPE_ASSISTANT],
+          f"行类型时间线正确（一轮一条协议行，tool 结果独立行；实际 {types}）")
+    calls = entries[1].calls
+    check(len(calls) == 2 and entries[2].call_id == calls[0].call_id
+          and entries[3].call_id == calls[1].call_id, "tool_calls 数组 / tool_result 配对")
+    check('id="msg#2"' in entries[1].text and "草稿不要我" in entries[1].text
+          and 'id="msg#3"' in entries[4].text and 'id="msg#4"' in entries[4].text,
+          "一轮一条 assistant 行：气泡编号进标签、碎碎念留存")
+    check('id="msg#99"' not in entries[4].text and "2020-01-01" not in entries[4].text,
+          "模型自编属性入库前剥掉")
+    check([ledger.get_bubble("cli:smoke", n).message_id for n in (2, 3, 4)]
+          == ["m1", "m2", "m3"], "发出消息 id 回填气泡行（msg#2～4）")
 
     # 工具流水在请求里恰好一份（回归锚：曾有"落库渲染 + turn_tool_msgs 暂存"双份 bug）
     req2 = llm.seen[-1]
@@ -161,7 +217,7 @@ async def main() -> None:
     print("=== 3. 渲染 ===")
     flat = "\n".join(str(m) for m in render(ledger, "cli:smoke"))
     check('sender="jason31416"' in flat and 'id="msg#1"' in flat, "用户行元数据进标签属性")
-    check('<message sender="neoagent"' in flat, "assistant 行同语法")
+    check('<message id="msg#2"' in flat, "assistant 行同语法（生成形态原样回放）")
     check('id="msg#99"' not in flat and "time=\"2020-01-01\"" not in flat,
           "模型自编属性不出现在任何地方")
     msgs = render(ledger, "cli:smoke")
@@ -171,46 +227,26 @@ async def main() -> None:
           and [c["id"] for c in ai_tools[0]["tool_calls"]] ==
           [m["tool_call_id"] for m in tool_msgs], "协议机器件展开且配对")
 
-    # ── 5. 引用召回：出预算窗口的被引用消息 → 按时间顺序召回（不计预算）──
-    print("=== 4. 引用召回 ===")
+    # ── 5. 引用回补：快照入库固化（在不在上下文都带）──
+    print("=== 4. 引用回补（入库固化）===")
     sk = "cli:recall"
-    s0 = ledger.add(session_key=sk, type=TYPE_USER, message_id="p0",
-                    sender_name="jason31416", text="最早的话")
-    s1 = ledger.add(session_key=sk, type=TYPE_USER, message_id="p1",
-                    sender_name="jason31416", text="很早的原话",
-                    reply_to=ReplyRef(message_id="p0", sender_name="jason31416",
-                                     timestamp=0, text="最早的话", attachments=[],
-                                     resolved_from="db", seq_id=s0))
-    for i in range(5):
-        ledger.add(session_key=sk, type=TYPE_USER, sender_name="jason31416",
-                   text=f"填充 {i}" + "x" * 400)
-    ledger.add(session_key=sk, type=TYPE_ASSISTANT, sender_name="neoagent", text="回很早那句",
-               reply_to=ReplyRef(message_id="p1", sender_name="jason31416",
-                                timestamp=0, text="很早的原话", attachments=[],
-                                resolved_from="db", seq_id=s1))
-    msgs = render(ledger, sk, budget=600)     # 小预算：s0/s1 被裁出窗口
-    flat = "\n".join(str(m) for m in msgs)
-    i_fill, i_q = flat.find("填充 4"), flat.find("回很早那句")
-    seg = flat[flat.rfind("<message", 0, i_q):i_q]
-    check(f'<recall id="msg#{s1}"' in seg and f'<recall id="msg#{s0}"' in seg,
-          "窗外引用内联 <recall>（全文；引用链内嵌展平）")
-    check(flat.find("最早的话") > i_fill and flat.find("很早的原话") > i_fill,
-          "不回插时间线（回补内联进引用方消息，保前缀缓存）")
-    check(f'replyTo="msg#{s1}"' in flat and "已不可见" not in flat,
-          "回补后 replyTo 是纯指针、无降级补丁")
-    # 库里没有的消息：退化为正文补丁
-    ledger.add(session_key=sk, type=TYPE_ASSISTANT, sender_name="neoagent", text="回一条没库的",
-               reply_to=ReplyRef(message_id="p9", sender_name="x",
-                                timestamp=0, text="很早的原话2", attachments=[],
-                                resolved_from="db", seq_id=999))
+    s0, b0 = add_user(ledger, sk, "最早的话", msg_id="p0")
+    s1, b1 = add_user(ledger, sk, "很早的原话", msg_id="p1")
+    add_assistant(ledger, sk, f'<message replyTo="msg#{b1}">回很早那句</message>')
     msgs = render(ledger, sk, budget=600)
     flat = "\n".join(str(m) for m in msgs)
-    check('replyTo="msg#999"' in flat and "（#999 已不可见" in flat,
-          "库里没有 → 指针 + 正文补丁兜底")
+    check(f'<recall id="msg#{b1}"' in flat and f'replyTo="msg#{b1}"' in flat
+          and flat.find(f'<recall id="msg#{b1}"') < flat.find("回很早那句"),
+          "引用快照固化在行里（recall 贴在被引消息标签前，不管在不在上下文窗口）")
+    check(flat.count("很早的原话") == 2,
+          "快照与原文并存（消息很短，冗余换字节稳定）")
+    f2, g2 = _fin('<message replyTo="msg#404">回一条编造的</message>',
+                  lookup=lambda b: None)
+    check('replyTo' not in f2 and "<recall" not in f2 and g2[0].reply_to is None,
+          "编造/失效的 replyTo 不算数（入库前剥掉）")
 
     # </message> 转义
-    ledger.add(session_key="cli:smoke", type=TYPE_USER, sender_name="jason31416",
-               text="我偏要打</message>")
+    add_user(ledger, "cli:smoke", "我偏要打</message>")
     flat = "\n".join(str(m) for m in render(ledger, "cli:smoke"))
     check("＜/message＞" in flat, "正文 </message> 字面量被转义")
 
@@ -228,8 +264,7 @@ async def main() -> None:
     qsent = Collector()
     sk2 = "cli:quote"
     u_row_id = "pm-777"
-    ledger.add(session_key=sk2, type=TYPE_USER, message_id=u_row_id,
-               sender_name="jason31416", text="被引用的原话")
+    add_user(ledger, sk2, "被引用的原话", msg_id=u_row_id)
     llm3 = StubLLM([SimpleNamespace(
         content='<message replyTo="msg#1">回你这句</message>'
                 '<message replyTo="msg#404">回一条编造的</message>',
@@ -240,11 +275,14 @@ async def main() -> None:
     check(qsent.quotes == [u_row_id, None],
           f"quote_to 透传通道 / 编造 seq 降级纯文本（实际 {qsent.quotes}）")
     q_rows = [e for e in ledger.visible("cli:quote", 20) if e.type == TYPE_ASSISTANT]
-    check(q_rows[0].reply_to is not None and q_rows[0].reply_to.seq_id == 1
-          and q_rows[0].reply_to.text == "被引用的原话",
-          "落账 meta.reply_to 带指针与原文（上下文 replyTo 属性靠它）")
-    check(q_rows[1].reply_to is None, "解析失败的引用不落 reply_to")
-    check([e.message_id for e in q_rows] == ["m1", "m2"], "引用气泡同样回填发出 id")
+    check('replyTo="msg#1"' in q_rows[0].text and '<recall id="msg#1"' in q_rows[0].text
+          and "被引用的原话" in q_rows[0].text,
+          "引用定稿进正文：replyTo 指针 + recall 快照")
+    check('replyTo="msg#404"' not in q_rows[0].text
+          and q_rows[0].text.count("<message") == 2,
+          "解析失败的引用入库前剥掉（同轮另一气泡不受影响）")
+    check([ledger.get_bubble("cli:quote", n).message_id for n in (3, 4)] == ["m1", "m2"],
+          "引用气泡同样回填发出 id（msg#2 是触发消息）")
 
     # ── 8. token 预算：抛弃 / 原子 / 截断 / 对拍 ──
     print("=== 7. token 计数与裁剪 ===")
@@ -253,8 +291,7 @@ async def main() -> None:
 
     sk3 = "cli:trim"
     for i in range(30):
-        ledger.add(session_key=sk3, type=TYPE_USER, sender_name="jason31416",
-                   text=f"重{i} " + "x" * 400)
+        add_user(ledger, sk3, f"重{i} " + "x" * 400)
     flat = "\n".join(str(m) for m in render(ledger, sk3, budget=1_000))
     check("重29 " in flat and "重0 " not in flat and "重20 " not in flat,
           "从最老端抛弃：最新的在、最老的不在")
@@ -263,17 +300,16 @@ async def main() -> None:
 
     print("=== 8. tool 组原子性 ===")
     sk4 = "cli:toolgroup"
-    ledger.add(session_key=sk4, type=TYPE_TOOL_CALL, sender_name="neoagent",
-               calls=[{"call_id": "c1", "name": "exec", "arguments": "{}"},
-                      {"call_id": "c2", "name": "exec", "arguments": "{}"}])
-    ledger.add(session_key=sk4, type=TYPE_TOOL_RESULT, sender_name="neoagent",
-               call_id="c1", name="exec", text="r1 " + "x" * 400)
-    ledger.add(session_key=sk4, type=TYPE_USER, sender_name="jason31416", text="插话")
-    ledger.add(session_key=sk4, type=TYPE_TOOL_RESULT, sender_name="neoagent",
-               call_id="c2", name="exec", text="r2 " + "x" * 400)
+    seq_g = add_assistant(ledger, sk4, "", calls=[
+        {"call_id": "c1", "name": "exec", "arguments": "{}"},
+        {"call_id": "c2", "name": "exec", "arguments": "{}"}])
+    ledger.add_turn(session_key=sk4, type=TYPE_TOOL_RESULT, call_id="c1",
+                    tool_name="exec", text="r1 " + "x" * 400, group_id=seq_g)
+    add_user(ledger, sk4, "插话")
+    ledger.add_turn(session_key=sk4, type=TYPE_TOOL_RESULT, call_id="c2",
+                    tool_name="exec", text="r2 " + "x" * 400, group_id=seq_g)
     for i in range(10):
-        ledger.add(session_key=sk4, type=TYPE_USER, sender_name="jason31416",
-                   text=f"新{i} " + "x" * 400)
+        add_user(ledger, sk4, f"新{i} " + "x" * 400)
 
     def tool_state(msgs):
         has_call = any(m.get("tool_calls") for m in msgs)
@@ -287,27 +323,23 @@ async def main() -> None:
 
     print("=== 9. 最新块保底截断 ===")
     sk5 = "cli:overflow"
-    ledger.add(session_key=sk5, type=TYPE_USER, sender_name="jason31416",
-               text="超长 " + "x" * 5000)
+    add_user(ledger, sk5, "超长 " + "x" * 5000)
     flat = "\n".join(str(m) for m in render(ledger, sk5, budget=300))
     check("超长截断" in flat and "超长 " in flat, "单块超预算：最新块保底并截断（保头尾）")
 
-    print("=== 10. 增量渲染 == 全量渲染 ===")
+    print("=== 10. 装配确定性 ===")
     sk6 = "cli:inc"
-    cache = TimelineCache()
-    ledger.add(session_key=sk6, type=TYPE_USER, sender_name="jason31416",
-               text="第一段 " + "x" * 300)
-    render(ledger, sk6, cache=cache)
-    ledger.add(session_key=sk6, type=TYPE_USER, sender_name="jason31416",
-               text="第二段 " + "x" * 300)
-    ledger.add(session_key=sk6, type=TYPE_TOOL_CALL, sender_name="neoagent",
-               calls=[{"call_id": "ic1", "name": "exec", "arguments": "{}"}])
-    ledger.add(session_key=sk6, type=TYPE_TOOL_RESULT, sender_name="neoagent",
-               call_id="ic1", name="exec", text="ir " + "x" * 200)
-    inc = render(ledger, sk6, cache=cache)
-    full = render(ledger, sk6)
-    check(inc == full, "增量缓存渲染与全量渲染结果一致")
-    check(cache.last_cost > 0, f"本地 token 估算有值（{cache.last_cost}）")
+    add_user(ledger, sk6, "第一段 " + "x" * 300)
+    seq_i = add_assistant(ledger, sk6, "",
+                          calls=[{"call_id": "ic1", "name": "exec", "arguments": "{}"}])
+    ledger.add_turn(session_key=sk6, type=TYPE_TOOL_RESULT, call_id="ic1",
+                    tool_name="exec", text="ir " + "x" * 200, group_id=seq_i)
+    add_user(ledger, sk6, "第二段 " + "x" * 300)
+    check(render(ledger, sk6) == render(ledger, sk6),
+          "定稿字节稳定：两次装配逐字一致（前缀缓存友好）")
+    _m, _cost, _t = render_messages(ledger, sk6, identity=IDENTITY, memory_text="",
+                                    budget=250_000, counter=COUNTER)
+    check(_cost > 0, f"本地 token 估算有值（{_cost}）")
 
     print("=== 11. 媒体消息（<img>/<file> 独立消息）===")
     img_path = Path(tmp) / "pic.png"
@@ -326,11 +358,11 @@ async def main() -> None:
           f"图片走 send_media 且带 quote_to（实际 {msent.media}）")
     check(any("发不出去" in t for t in msent.texts), "越界路径降级为文字说明")
     m_rows = ledger.visible("cli:media", 20)
-    att_rows = [e for e in m_rows if e.type == TYPE_ASSISTANT and e.attachments]
-    check(len(att_rows) == 1 and att_rows[0].attachments[0].kind == "image"
-          and att_rows[0].text == "", "媒体消息独立成行（不是附件，自己一个 msg#）")
+    m_asst = [e for e in m_rows if e.type == TYPE_ASSISTANT]
+    check("<img " in m_asst[0].text and 'replyTo="msg#1"' in m_asst[0].text,
+          "媒体以 <img> 标签定稿（含 replyTo），不拆行、不换括号皮")
     flat = "\n".join(str(m) for m in render(ledger, "cli:media"))
-    check('kind="image"' in flat, "媒体行渲染带 kind/file 属性")
+    check("<img " in flat, "媒体标签原样回放")
 
     # 通道不支持 → 发送失败降级文字
     fsent = Collector(ok=False)
@@ -414,19 +446,21 @@ async def main() -> None:
     check(think_llm.efforts == ["low", "low"],
           f"每轮按 effort_provider 取档位（实际 {think_llm.efforts}）")
     t_rows = ledger.visible("cli:think", 20)
-    check(t_rows[1].reasoning == "我先想想" and t_rows[2].reasoning == "我先想想",
-          "思考草稿挂气泡行 + tool 行（同轮两行同一份）")
-    check(t_rows[4].reasoning == "收尾思考", "纯气泡轮草稿挂轮首行")
+    check(t_rows[1].reasoning == "我先想想",
+          "思考草稿随 assistant 行入库（一份/轮）")
+    check(t_rows[2].type == TYPE_TOOL_RESULT and not t_rows[2].reasoning
+          and t_rows[3].reasoning == "收尾思考",
+          "tool 行不挂草稿；纯气泡轮草稿在自己行上")
     flat = "\n".join(str(m) for m in think_llm.seen[-1])
     check("reasoning_content" in flat and "我先想想" in flat, "渲染回传 reasoning_content")
     tool_renders = [m for m in think_llm.seen[-1] if m.get("tool_calls")]
     check(tool_renders and tool_renders[0].get("reasoning_content") == "我先想想",
           "tool_calls 消息必带 reasoning_content（DeepSeek 工具续传必查）")
-    msgs = render_messages(ledger, "cli:think", identity=IDENTITY, memory_text="",
-                           budget=250_000, counter=COUNTER, include_reasoning=False)
+    msgs, _c, _t = render_messages(ledger, "cli:think", identity=IDENTITY, memory_text="",
+                                   budget=250_000, counter=COUNTER, include_reasoning=False)
     check("reasoning_content" not in str(msgs), "include_reasoning=False 逃生门生效")
-    check("想好了" in flat and all("草稿不要我" not in (r.text or "") for r in t_rows),
-          "标签外草稿不进账（当轮协议原始输出除外）")
+    check("想好了" in flat and any("草稿不要我" in (r.text or "") for r in t_rows),
+          "标签外碎碎念随行留存、原样回放（不再当草稿丢）")
 
     # 无草稿轮：assistant 消息一律垫 " "（缺字段 400、空串 V4 拒收）
     pad_llm = StubLLM([
@@ -458,22 +492,24 @@ async def main() -> None:
     ov = OpenAIImageVision()
     png = b"\x89PNG\r\n\x1a\n" + b"fake bytes for blob"
     sk7 = "cli:imgrole"
-    ledger.add(session_key=sk7, type=TYPE_USER, sender_name="jason31416", text="用户发的图",
-               attachments=[Attachment(kind="image", filename="u.png", mime="image/png",
-                                       size=len(png), local_path="/tmp/不存在的路径/u.png",
-                                       data=png)])
-    img_seq = ledger.add(session_key=sk7, type=TYPE_ASSISTANT, sender_name="neoagent", text="",
-                         attachments=[Attachment(kind="image", filename="m.png", mime="image/png",
-                                                 size=10, local_path="/tmp/m.png")])
-    ledger.attach_reasoning(sk7, img_seq, "发图前的思考")
-    ledger.add(session_key=sk7, type=TYPE_TOOL_CALL, sender_name="neoagent",
-               calls=[{"call_id": "ig1", "name": "read_file", "arguments": "{}"}])
-    ledger.add(session_key=sk7, type=TYPE_TOOL_RESULT, sender_name="neoagent", call_id="ig1",
-               name="read_file", text="（图片 r.png 的图像内容如下）",
-               attachments=[Attachment(kind="image", filename="r.png", mime="image/png",
-                                       size=len(png), local_path="/tmp/r.png", data=png)])
-    msgs = render_messages(ledger, sk7, identity=IDENTITY, memory_text="",
-                           budget=250_000, counter=COUNTER, vision=ov)
+    add_user(ledger, sk7, "用户发的图",
+             attachments=[Attachment(kind="image", filename="u.png", mime="image/png",
+                                     size=len(png), local_path="/tmp/不存在的路径/u.png",
+                                     data=png)])
+    img_seq = add_assistant(ledger, sk7, "", reasoning="发图前的思考",
+                            calls=[{"call_id": "ig1", "name": "read_file",
+                                    "arguments": "{}"}],
+                            attachments=[Attachment(kind="image", filename="m.png",
+                                                    mime="image/png", size=10,
+                                                    local_path="/tmp/m.png")])
+    ledger.add_turn(session_key=sk7, type=TYPE_TOOL_RESULT, call_id="ig1",
+                    tool_name="read_file", text="（图片 r.png 的图像内容如下）",
+                    attachments=[Attachment(kind="image", filename="r.png",
+                                            mime="image/png", size=len(png),
+                                            local_path="/tmp/r.png", data=png)],
+                    group_id=img_seq)
+    msgs, _c, _t = render_messages(ledger, sk7, identity=IDENTITY, memory_text="",
+                                   budget=250_000, counter=COUNTER, vision=ov)
     parts_msgs = [m for m in msgs if isinstance(m.get("content"), list)]
     user_imgs = [m for m in parts_msgs if m.get("role") == "user"]
     tool_imgs = [m for m in parts_msgs if m.get("role") == "tool"]
@@ -546,11 +582,11 @@ async def main() -> None:
     ok_bad = normalize_image(b"NOTANIMAGE\x00\x01\x02")
     check(ok_bad is None or sniff_image_mime(ok_bad[0]) != "",
           f"异类格式：转 png 或拒绝（实际 {'转换' if ok_bad else '拒绝'}）")
-    ledger.add(session_key="cli:poison", type=TYPE_USER, sender_name="x", text="坏图",
-               attachments=[Attachment(kind="image", filename="bad.img", mime="image/*",
-                                       size=9, local_path="", data=b"NOTANIMAGE\x00")])
-    msgs = render_messages(ledger, "cli:poison", identity=IDENTITY, memory_text="",
-                           budget=250_000, counter=COUNTER, vision=ov)
+    add_user(ledger, "cli:poison", "坏图", sender="x",
+             attachments=[Attachment(kind="image", filename="bad.img", mime="image/*",
+                                     size=9, local_path="", data=b"NOTANIMAGE\x00")])
+    msgs, _c, _t = render_messages(ledger, "cli:poison", identity=IDENTITY, memory_text="",
+                                   budget=250_000, counter=COUNTER, vision=ov)
     check(not any(isinstance(m.get("content"), list) for m in msgs),
           "历史残留坏图自动降级（渲染保险丝，救活中毒历史）")
 
@@ -591,28 +627,30 @@ async def main() -> None:
           and (memdir / "old/新.md").exists(), "move 归档移动")
     check("已删除" in await regm.call("delete_file", {"path": "old/新.md"})
           and not (memdir / "old/新.md").exists(), "delete 真删")
-    check("已推进" in await regm.call("set_cut_point", {"msg_seq": 10})
-          and "未变" in await regm.call("set_cut_point", {"msg_seq": 5}),
-          "切点单调只进不退（工具层反馈 + 账本层强制）")
-    check(ledger.get_recorder_state("cli:r")[1] == 10, "切点落库")
+    for i in range(3):
+        add_user(ledger, "cli:r", f"第 {i} 句")
+    check("已推进" in await regm.call("set_cut_point", {"msg_seq": 3})
+          and "未变" in await regm.call("set_cut_point", {"msg_seq": 1})
+          and "不存在" in await regm.call("set_cut_point", {"msg_seq": 99}),
+          "切点单调只进不退、msg# 验真（工具层反馈 + 账本层强制）")
+    check(ledger.get_recorder_state("cli:r")[1] == 3, "切点落库（吸附协议组边界）")
 
     # ---- 21. Recorder 上下文构造与整理跑 ----
     print("=== 21. Recorder 上下文与整理跑 ===")
     sk8 = "cli:rflow"
-    ledger.add(session_key=sk8, type=TYPE_USER, sender_name="jason31416",
-               text="记住 wifi 是 123")
-    ledger.add(session_key=sk8, type=TYPE_TOOL_CALL, sender_name="neoagent",
-               calls=[{"call_id": "rc1", "name": "record_memory",
-                       "arguments": '{"content": "wifi=123"}'},
-                      {"call_id": "rc2", "name": "exec", "arguments": '{"command":"ls"}'}])
-    ledger.add(session_key=sk8, type=TYPE_TOOL_RESULT, sender_name="neoagent",
-               call_id="rc2", name="exec", text="big output")
+    add_user(ledger, sk8, "记住 wifi 是 123")
+    seq_r = add_assistant(ledger, sk8, "", calls=[
+        {"call_id": "rc1", "name": "record_memory",
+         "arguments": '{"content": "wifi=123"}'},
+        {"call_id": "rc2", "name": "exec", "arguments": '{"command":"ls"}'}])
+    ledger.add_turn(session_key=sk8, type=TYPE_TOOL_RESULT, call_id="rc2",
+                    tool_name="exec", text="big output", group_id=seq_r)
     r_stub = StubLLM([SimpleNamespace(content="done", tool_calls=[], usage=None)])
     rec = Recorder(r_stub, ledger, memdir)
     ctx = rec._context(sk8, "fast", rec._window(sk8, "fast"))
     check('<file src="memory.md">' in ctx and "旧.md" not in ctx,
           "记忆文件全量喂入、old/ 不喂（索引在 memory.md 里可见）")
-    check('<record seq="msg#2"' in ctx and "wifi=123" in ctx,
+    check('<record time=' in ctx and "wifi=123" in ctx,
           "record_memory 委托内联 <record>（落在调用位置）")
     check("big output" not in ctx and "exec" not in ctx.replace("已略", ""),
           "工具调用与结果剥除（只留委托）")
@@ -622,13 +660,13 @@ async def main() -> None:
             id="w1", name="patch_file",
             arguments='{"path":"memory.md","old":"456","new":"789"}')], usage=None),
         SimpleNamespace(content="", tool_calls=[SimpleNamespace(
-            id="c1", name="set_cut_point", arguments='{"msg_seq":2}')], usage=None),
+            id="c1", name="set_cut_point", arguments='{"msg_seq":1}')], usage=None),
         SimpleNamespace(content="整理完毕", tool_calls=[], usage=None),
     ])
     rec2 = Recorder(r_stub2, ledger, memdir)
     report = await rec2.run(sk8, "fast")
     check("789" in (memdir / "memory.md").read_text(), "整理跑：工具循环改记忆")
-    check(ledger.get_recorder_state(sk8) == (3, 2), "整理跑：r_seen_seq 推进、切点生效")
+    check(ledger.get_recorder_state(sk8) == (3, 1), "整理跑：r_seen_seq 推进、切点生效")
     check(report == "整理完毕", "工作简报返回（只进日志）")
     rec_calls = [m for m in r_stub2.seen[-1]
                  if m.get("role") == "assistant" and m.get("tool_calls")]
@@ -656,8 +694,7 @@ async def main() -> None:
     async def _compress_case(advance: bool) -> tuple:
         sk9 = f"cli:comp{int(advance)}"
         for i in range(8):
-            ledger.add(session_key=sk9, type=TYPE_USER, sender_name="jason31416",
-                       text=f"压{i} " + "x" * 400)
+            add_user(ledger, sk9, f"压{i} " + "x" * 400)
         stub_r = StubR(advance)
         llm9 = StubLLM([SimpleNamespace(
             content='<message sender="neoagent" id="msg#9">压缩后继续</message>',
