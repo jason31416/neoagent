@@ -412,14 +412,12 @@ async def main() -> None:
           "overhead（schema/机器件/锚定残差）挤占时间线预算")
 
     print("=== 13. 工作台（workspace）===")
-    from neoagent.tools.file_tools import _resolve_in_roots, set_workspace
+    from neoagent.tools.file_tools import _resolve_in_roots
     ws = Path(tmp) / "ws"
     ws.mkdir()
     (ws / "rel.png").write_bytes(b"\x89PNG fake")
-    set_workspace(ws)
-    check(_resolve_in_roots("rel.png", [tmp]) == (ws / "rel.png").resolve(),
+    check(_resolve_in_roots("rel.png", [tmp], base=ws) == (ws / "rel.png").resolve(),
           "read/write 相对路径基准 = 工作台")
-    set_workspace(None)
     wsent = Collector()
     llm6 = StubLLM([SimpleNamespace(content='<img src="rel.png"/>', tool_calls=None)])
     agent6 = AgentLoop(llm=llm6, registry=registry, ledger=ledger, memory_file=mem,
@@ -528,7 +526,7 @@ async def main() -> None:
     check(n_blobs == 1, f"同图只存一份 blob（内容寻址去重，实际 {n_blobs}）")
 
     print("=== 17. read_file 读图（工具结果信封）===")
-    from neoagent.tools.file_tools import read_file, set_allowed_roots
+    from neoagent.tools.file_tools import FileKit, FileScope
     from neoagent.tools.registry import ToolOutput
     rf_dir = Path(tmp) / "rf"
     rf_dir.mkdir()
@@ -536,17 +534,17 @@ async def main() -> None:
     img.write_bytes(png)
     (rf_dir / "blob.bin").write_bytes(b"\x00\x01\x02binary")
     (rf_dir / "t.txt").write_text("hello 文本", encoding="utf-8")
-    set_allowed_roots([tmp])
-    out = await read_file({"path": str(img)})
+    kit = FileKit(FileScope(roots=[tmp], base=rf_dir))
+    out = await kit.read_file({"path": str(img)})
     check(isinstance(out, ToolOutput) and out.images == [str(img.resolve())]
           and "图像内容如下" in out.text, "read_file 图片 → ToolOutput（图像随工具结果进上下文）")
-    out2 = await read_file({"path": str(rf_dir / "blob.bin")})
+    out2 = await kit.read_file({"path": str(rf_dir / "blob.bin")})
     check(isinstance(out2, str) and "二进制文件读不出文本" in out2, "非图二进制明确拒绝，不吐乱码")
-    out3 = await read_file({"path": str(rf_dir / "t.txt")})
+    out3 = await kit.read_file({"path": str(rf_dir / "t.txt")})
     check(isinstance(out3, ToolOutput) and "hello 文本" in out3.text
           and out3.stat == "读 1 行", "文本文件照常读（stat=读 N 行）")
     (rf_dir / "x.svg").write_text("<svg><!-- 矢量图是文本 --></svg>", encoding="utf-8")
-    out4 = await read_file({"path": str(rf_dir / "x.svg")})
+    out4 = await kit.read_file({"path": str(rf_dir / "x.svg")})
     check(isinstance(out4, ToolOutput) and "<svg>" in out4.text,
           "svg 按文本读源码（不塞视觉接口）")
 
@@ -572,7 +570,6 @@ async def main() -> None:
     check(len(look_rows) == 2 and look_rows[0].attachments and not look_rows[1].attachments
           and "不重复" in look_rows[1].text,
           "同轮同图去重（第二条只留说明不重复嵌）")
-    set_allowed_roots([])
 
     print("=== 18. 图片格式保险丝（坏图绝不进上下文）===")
     from neoagent.providers.vision import normalize_image, sniff_image_mime

@@ -36,7 +36,7 @@ bubble_gap_max = 2.5
 # R（Recorder）——记忆整理模块：记忆的唯一写者 + 上下文退役的判断者。
 # 记忆库目录：memory.md（直接注入 M 的上下文）+ 子文件（R 自主开合）+ old/（归档区）
 memory_dir = "data/memory"
-# 对话停顿判定：末条消息静默这么久后跑一次快周期整理
+# 快整理延迟：任务执行收工后静默这么久才跑一次快周期整理（任务进行中绝不插队）
 pause_debounce_seconds = 150
 # 慢周期整理节律（秒）：长期归纳、归档清理、合并重排
 slow_interval = 86400

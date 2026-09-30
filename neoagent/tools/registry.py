@@ -17,6 +17,14 @@ from .format import error
 
 logger = logging.getLogger(__name__)
 
+TOOL_RESULT_MAX = 20000   # 工具结果给模型的字符上限（M/R 同一上限）
+
+
+def clip_tool_result(text: str) -> str:
+    """工具结果截断（超长截尾）：M/R 共用同一上限、同一形状。"""
+    return text if len(text) <= TOOL_RESULT_MAX \
+        else text[:TOOL_RESULT_MAX] + "\n…（输出过长已截断）"
+
 
 @dataclass
 class ToolOutput:

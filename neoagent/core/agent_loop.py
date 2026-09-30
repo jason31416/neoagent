@@ -29,7 +29,7 @@ from uuid import uuid4
 from ..providers.tokens import HeuristicTokenCounter, TokenAnchor, TokenCounter, count_chat_payload
 from ..providers.vision import normalize_image
 from ..tools.file_tools import _resolve_in_roots
-from ..tools.registry import ToolOutput, ToolRegistry
+from ..tools.registry import ToolOutput, ToolRegistry, clip_tool_result
 from . import modellog
 from .events import Attachment, MessageEvent
 from .frames import (Bubble, attachment_notes, finalize_assistant, finalize_user,
@@ -68,6 +68,8 @@ class SessionState:
         self.task: Optional[asyncio.Task] = None        # 当前活跃 turn
         self.model_task: Optional[asyncio.Task] = None  # 在飞的模型请求（redirect 的取消对象）
         self.tool_running: bool = False                 # 正在执行工具（steer 的判定）
+        self.busy: bool = False                         # turn 进行中（含入库/插话窗口）
+        self.done_at: Optional[float] = None            # 上次 turn 收工时刻（R 快整理锚点）
         self.input_gen: int = 0                          # 输入代数（单调递增）
         self.responder: Optional[Callable] = None       # 回复出口（绑定通道适配器）：
         #   调用 responder(text, quote_to=平台消息id|None) → SendResult（message_id 回填账）
@@ -125,15 +127,17 @@ class AgentLoop:
         """
         session_key = event.session_key()
 
+        # 先置忙：从入库到 turn 收工的整段都算"任务执行中"（R 快整理不插队）
+        st = self._states.setdefault(session_key, SessionState())
+        st.busy = True
+        if responder is not None:
+            st.responder = responder
+
         # 1) 预处理：语音转写 → 普通文本；图片上传 vision
         text, attachments = await self._preprocess(event)
 
         # 2) 入库定稿：引用解析（平台 id → 气泡）+ 净化/气泡编号/recall 固化
         await self._ingest_user(event, session_key, text, attachments, quote_fetcher)
-
-        st = self._states.setdefault(session_key, SessionState())
-        if responder is not None:
-            st.responder = responder
 
         st.input_gen += 1    # 新输入代数：turn 循环据此判断要不要再跑一轮
 
@@ -190,6 +194,18 @@ class AgentLoop:
         finally:
             st.model_task = None
             st.tool_running = False
+            st.busy = False
+            st.done_at = time.time()      # 任务收工：R 快整理从这一刻起算静默
+
+    def turn_state(self, session_key: str) -> tuple:
+        """(是否正忙, 上次 turn 收工时刻)——R 快周期调度的判据。
+
+        本进程没碰过该会话 → (False, None)：调度端退回"末条行静默"
+        （重启后欠的整理还得有人管）。"""
+        st = self._states.get(session_key)
+        if st is None:
+            return False, None
+        return st.busy, st.done_at
 
     async def _run_turn(self, session_key: str, st: SessionState) -> int:
         """一轮：渲染 → 模型调用/工具循环，返回最终渲染时的输入代数。
@@ -283,8 +299,9 @@ class AgentLoop:
         nudge = {"role": "user",
                  "content": "（系统提示：工具调用轮数已达上限，请立即基于已有结果用 <message> 给用户一句总结。）"}
         overhead, extra_est = self._request_overhead(session_key, tools)
-        messages = self._render(session_key, overhead=overhead) + [nudge]
-        est_total = self._caches[session_key].last_cost + extra_est \
+        messages, timeline_cost, _trimmed = self._render(session_key, overhead=overhead)
+        messages = messages + [nudge]
+        est_total = timeline_cost + extra_est \
             + count_chat_payload(self.token_counter, [nudge])
         predicted = self._anchors[session_key].predict(est_total)
         effort = self.effort_provider()
@@ -292,9 +309,7 @@ class AgentLoop:
             "round": rounds, "phase": "max_tool_rounds", "messages": messages})
         result = await self.llm.chat(messages, reasoning_effort=effort)
         self._anchor_and_log(session_key, result, est_total, predicted)
-        sent, first_seq = await self._emit_bubbles(session_key, st, result.content, bubbles_sent)
-        if result.reasoning and first_seq:
-            self.ledger.attach_reasoning(session_key, first_seq, result.reasoning)
+        await self._emit_round(session_key, st, result, None, bubbles_sent)
         return gen_at_render
 
     # ------------------------------------------------------------------
@@ -530,7 +545,8 @@ class AgentLoop:
     # 渲染 / 工具执行
     # ------------------------------------------------------------------
     def _memory_text(self) -> str:
-        """【记忆】段：记忆文件全文（M 自己用 write_file 维护，空文件整段省略）。"""
+        """【记忆】段：记忆文件全文（R 维护、M 只读；子文件按需经 read_file 的
+        memory:// 口读，空文件整段省略）。"""
         try:
             return self.memory_file.read_text(encoding="utf-8") if self.memory_file.exists() else ""
         except OSError as exc:
@@ -604,8 +620,7 @@ class AgentLoop:
             images = list(output.images or [])
             output = output.text
 
-        if len(output) > 20000:
-            output = output[:20000] + "\n…（输出过长已截断）"
+        output = clip_tool_result(output)   # 超长截尾（M/R 同一上限）
 
         return output, images
 

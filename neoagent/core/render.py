@@ -42,6 +42,8 @@ def render_messages(ledger, session_key: str, *, identity: str, memory_text: str
     system = identity
     if memory_text.strip():
         system += (f"\n\n【neoagent 的记忆】（记忆与最近对话冲突时，以对话为准）"
+                   f"\n（指针/归档里的子文件按需用 read_file 读，路径写 memory://文件名，"
+                   f"如 memory://项目A-接口细节.md）"
                    f"\n{memory_text.strip()}")
     usable = max(int(budget * _BUDGET_SAFETY) - max(overhead, 0), 1)
 

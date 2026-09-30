@@ -21,7 +21,7 @@ from typing import Callable, List, Optional
 
 from ..config import PROJECT_ROOT
 from ..tools.memory_tools import build_memory_registry, record_payload
-from ..tools.registry import ToolOutput
+from ..tools.registry import ToolOutput, clip_tool_result
 from . import modellog
 from .ledger import TYPE_ASSISTANT, TYPE_TOOL_RESULT, MessageLedger
 from .llm import LLMClient
@@ -32,7 +32,7 @@ logger = logging.getLogger("neoagent.recorder")
 RECORD_NAME = "record_memory"      # M 的提案工具名（流水中唯一保留的工具痕迹）
 
 def _load_system() -> str:
-    """R 的系统提示词：prompts/recorder.md（提示词集中在仓库根 prompts/ 下，
+    """R 的系统提示词：neoagent/prompts/recorder.md（提示词集中在 neoagent/prompts/ 下，
     M 的是同目录 messenger.md）。周期差异片段见 _CYCLE_NOTES，运行时拼接。"""
     return (PROJECT_ROOT / "neoagent" / "prompts" / "recorder.md").read_text(encoding="utf-8").strip()
 
@@ -133,7 +133,7 @@ class Recorder:
                 out = await registry.call(tc.name, args)
                 text = out.text if isinstance(out, ToolOutput) else str(out)
                 msgs.append({"role": "tool", "tool_call_id": tc.id,
-                             "content": text[:2000]})
+                             "content": clip_tool_result(text)})
         else:
             logger.warning("[recorder] 整理达到工具轮上限 %d，提前收束 session=%s",
                            self.max_tool_rounds, session_key)
@@ -241,15 +241,18 @@ def _esc(s: str) -> str:
 class RecorderScheduler:
     """停顿（快周期）/ 低频（慢周期）调度。全程静默，不打扰用户。
 
-    停顿判定无状态：游标后有新增、且最新一行已静默超过 debounce → 对话停顿了。
+    快周期锚点 = **任务执行收工时刻**（turn 结束）：收工后静默超过 debounce 才整理，
+    任务跑着绝不插队（锚"末条消息"会被长任务的间隙误触发，活干一半就整理）。
+    本进程没跑过 turn 的会话退回"末条行静默"（重启后欠的整理也有人管）。
     慢周期到点也给无新增的会话跑（重推/归档/合并是它的活，不依赖新增）。
     """
 
     def __init__(self, recorder: Recorder, ledger: MessageLedger, *,
                  debounce_seconds: int = 150, slow_interval: int = 86400,
-                 tick_seconds: float = 15.0) -> None:
+                 tick_seconds: float = 15.0, turn_state=None) -> None:
         self.recorder = recorder
         self.ledger = ledger
+        self.turn_state = turn_state      # AgentLoop.turn_state：(是否正忙, 收工时刻)
         self.debounce = float(debounce_seconds)
         self.slow_interval = float(slow_interval)
         self.tick = float(tick_seconds)
@@ -262,7 +265,7 @@ class RecorderScheduler:
                 now = time.time()
                 slow_due = now - last_slow >= self.slow_interval
                 for key in self.ledger.session_keys():
-                    if self._quiet(key, now) and self.recorder.pending(key):
+                    if self._settled(key, now) and self.recorder.pending(key):
                         await self.recorder.run(key, "fast")
                     if slow_due:
                         await self.recorder.run(key, "slow")
@@ -273,6 +276,15 @@ class RecorderScheduler:
             except Exception:
                 logger.exception("[recorder] 调度循环异常（继续）")
 
-    def _quiet(self, session_key: str, now: float) -> bool:
+    def _settled(self, session_key: str, now: float) -> bool:
+        """任务收工后静默够久 → 该整理了。正忙绝不动。
+
+        没有 turn_state（或本进程没跑过 turn）→ 退回"末条行静默"。"""
+        if self.turn_state is not None:
+            busy, done_at = self.turn_state(session_key)
+            if busy:
+                return False
+            if done_at is not None:
+                return done_at <= now - self.debounce
         recent = self.ledger.tail(session_key, limit=1)
         return bool(recent) and recent[0].timestamp < now - self.debounce

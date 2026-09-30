@@ -60,7 +60,7 @@ data/memory/
   - 不写"下次复核 xxx"之类审计元数据；
   - 不做出处标注（无【用户明示】之类的机械区分——用户说的话也可能变）；
   - 日期只在本身是事实的一部分时自然出现（"去年的报销流程"）。
-- **指针节**：每行 = 子文件路径 + 一句话说明，M 据此按需 `read_file`。
+- **指针节**：每行 = 子文件路径 + 一句话说明，M 据此按需 `read_file`（`memory://` 路径口，只读）。
 - **归档节**：old/ 文件的索引行——防重复归档、防遗忘。
 
 ### 2.3 子文件
@@ -82,15 +82,19 @@ data/memory/
 ## 三、工具面与输出契约
 
 ```
-read_file(path)              # 限定 data/memory/；改前复核、按指针取细节
-write_file(path, content)    # 整文件写（新建/重写）
-patch_file(path, old, new)   # 外科替换（首选，保护手改痕迹）
-delete_file(path)            # 真删（垃圾才用）
-move_file(src, dst)          # 归档/重组（old/ 的正规动作）
-set_cut_point(msg_seq)       # 声明"这条之前的上下文可以退役"
+read_file(path)                    # 限定 data/memory/；改前复核、按指针取细节
+write_file(path, content, mode)    # 整文件写（mode=overwrite/new，与 M 同一实现）
+patch_file(path, old, new)         # 外科替换（首选，保护手改痕迹）
+delete_file(path)                  # 真删（垃圾才用）
+move_file(src, dst)                # 归档/重组（old/ 的正规动作）
+set_cut_point(msg_seq)             # 声明"这条之前的上下文可以退役"
 ```
 
 - 全部工具**路径沙箱** = `data/memory/`（能力边界，硬线所在；move 的 src/dst 都查）。
+- 文件工具与 M **共用同一个实现**（`file_tools.py`，M 的形态为基准：read 分页/读图、
+  write 的 mode 必填），只有沙箱绑定不同；delete/move 只注册给 R（M 的删改走 exec）。
+- M 读记忆走同一实现的 `read_file` **`memory://` 只读口**（如 `memory://old/x.md`）；
+  M 的工具面没有记忆写入口（URI/绝对路径都拒——硬线落在工具注册表上）。
 - **改记忆只通过工具**；R 的最终回复是给人看的简报，只进日志，不承载记忆内容。
 - 切点走工具而不是解析正文（机器可校验）。
 
@@ -164,7 +168,7 @@ set_cut_point(msg_seq)       # 声明"这条之前的上下文可以退役"
 
 ## 六、触发与压缩
 
-**快周期触发**：① 停顿（末条用户消息后 debounce 约 2–3 分钟）；② 紧急压缩（见下）。
+**快周期触发**：① 停顿（**任务执行收工后**静默 debounce 约 2–3 分钟——任务跑着绝不插队）；② 紧急压缩（见下）。
 **慢周期触发**：低频 cron（默认每日）。
 **`record_memory` 不触发任何东西**——只入账，搭下一次整理的车。
 
@@ -264,7 +268,7 @@ history_token_budget = 250_000    # M 与 R 共用这一个预算
 
 [recorder]                        # R（Recorder）记忆整理模块
 memory_dir = "data/memory"
-pause_debounce_seconds = 150      # 停顿判定
+pause_debounce_seconds = 150      # 快整理延迟（任务收工后静默多久算停顿）
 slow_interval_hours = 24          # 慢周期节律
 slow_lookback_days = 7            # 慢周期回看起点
 max_tool_rounds = 12

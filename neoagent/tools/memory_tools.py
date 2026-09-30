@@ -1,8 +1,10 @@
-"""记忆工具（R / Recorder 专用）+ M 的 record_memory 提案工具。
+"""记忆工具：R 的工具组 + M 的 record_memory 提案工具。
 
-- R 的工具组（read_file/write_file/patch_file/delete_file/move_file/set_cut_point）
-  注册在**独立的 ToolRegistry** 上，路径沙箱 = memory_dir（"R 只写记忆"硬线的落点）；
-- M 的 record_memory 只入账（tool_call 行由 agent_loop 落），无逻辑体。
+- R 的工具组 = file_tools 的**同一套文件实现**（沙箱 = memory_dir，"R 只写记忆"
+  硬线的落点；相对路径以记忆库为基准）+ delete/move（只给 R——它没法执行命令）
+  + set_cut_point（R 专属）；
+- M 的 record_memory 只入账（tool_call 行由 agent_loop 落），无逻辑体；
+  M 读记忆走 read_file 的 memory:// 只读口（见 file_tools）。
 
 设计见 设计-R记忆海马体.md 第三/八节。
 """
@@ -13,11 +15,9 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
-from ..log import green, red
-
-from .file_tools import _resolve_in_roots, apply_patch
-from .format import error, file_attrs, numbered, root
-from .registry import ToolOutput, ToolRegistry
+from .file_tools import FileScope, FileKit
+from .format import error, root
+from .registry import ToolRegistry
 
 _RECORD_ACK = "已记下（为保证缓存，将在下次整理时修正记忆，近期以对话为准）"
 
@@ -27,101 +27,9 @@ _RECORD_ACK = "已记下（为保证缓存，将在下次整理时修正记忆�
 # ----------------------------------------------------------------------
 def build_memory_registry(ledger, session_key: str, memory_dir: Path) -> ToolRegistry:
     """一次整理跑一套（cut_point 绑定会话）；memory_dir 是沙箱根。"""
-    roots = [str(memory_dir)]
-
-    def _p(path_str: str) -> Path:
-        # 相对路径以 memory_dir 为基准（R 说 memory.md / old/x.md 就是这里）
-        return _resolve_in_roots(path_str, roots, base=memory_dir)
-
-    async def read_file(args: Dict[str, Any]):
-        try:
-            path = _p(str(args.get("path", "")))
-        except PermissionError as e:
-            return error("out_of_scope", str(e))
-        display = str(args.get("path", "")) or path.name
-        if not path.is_file():
-            return error("not_found", f"文件不存在：{display}")
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            return error("bad_param", f"读取失败：{e}")
-        lines = text.splitlines()
-        body = numbered(lines, 1) if lines else "（空文件）"
-        return ToolOutput(text=root("read_file", file_attrs(path, display, total_lines=len(lines)), body),
-                          stat=f"读 {len(lines)} 行")
-
-    async def write_file(args: Dict[str, Any]):
-        # R 的写就是整文件覆盖（记忆文件是它的草稿纸），mode 固定 overwrite
-        try:
-            path = _p(str(args.get("path", "")))
-        except PermissionError as e:
-            return error("out_of_scope", str(e))
-        display = str(args.get("path", "")) or path.name
-        content = args.get("content")
-        if content is None:
-            return error("bad_param", "缺少 content 参数")
-        text = str(content)
-        old_lines = (len(path.read_text(encoding="utf-8", errors="replace").splitlines())
-                     if path.is_file() else 0)
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text, encoding="utf-8")
-        except OSError as e:
-            return error("bad_param", f"写入失败：{e}")
-        new_lines = len(text.splitlines()) or 1
-        attrs = file_attrs(path, display)
-        attrs.update({"mode": "overwrite", "old_lines": old_lines, "new_lines": new_lines})
-        return ToolOutput(text=root("write_file", attrs, "已写入"),
-                          stat=f"{green('+' + str(new_lines))} 行")
-
-    async def patch_file(args: Dict[str, Any]):
-        try:
-            path = _p(str(args.get("path", "")))
-        except PermissionError as e:
-            return error("out_of_scope", str(e))
-        display = str(args.get("path", "")) or path.name
-        old, new = args.get("old"), args.get("new")
-        if old is None or new is None:
-            return error("bad_param", "缺少 old / new 参数")
-        if not path.is_file():
-            return error("not_found", f"文件不存在：{display}")
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError as e:
-            return error("bad_param", f"读取失败：{e}")
-        new_text, err, info = apply_patch(text, old, new, display)   # 和 M 同一套匹配/报错
-        if err:
-            return err
-        path.write_text(new_text, encoding="utf-8")
-        return ToolOutput(text=root("patch_file", dict({"path": display}, **info), "已修改"),
-                          stat=f"{green('+' + str(info['added']))} "
-                               f"{red('-' + str(info['removed']))} 行")
-
-    async def delete_file(args: Dict[str, Any]) -> str:
-        try:
-            path = _p(str(args.get("path", "")))
-        except PermissionError as e:
-            return error("out_of_scope", str(e))
-        display = str(args.get("path", "")) or path.name
-        if path.is_dir():
-            return error("bad_param", "delete 只删文件；目录请用 move 归档")
-        if not path.is_file():
-            return error("not_found", f"文件不存在：{display}")
-        path.unlink()
-        return root("delete_file", {"path": display}, "已删除")
-
-    async def move_file(args: Dict[str, Any]) -> str:
-        try:
-            src = _p(str(args.get("src", "")))
-            dst = _p(str(args.get("dst", "")))
-        except PermissionError as e:
-            return error("out_of_scope", str(e))
-        if not src.is_file():
-            return error("not_found", f"源文件不存在：{args.get('src')}")
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        src.rename(dst)
-        rel = dst.relative_to(memory_dir) if dst.is_relative_to(memory_dir) else dst
-        return root("move_file", {"src": args.get("src"), "dst": str(rel)}, "已移动")
+    registry = ToolRegistry(part="recorder")   # R 的工具组，日志里标 [recorder]
+    FileKit(FileScope(roots=[str(memory_dir)], base=memory_dir, images=False,
+                      base_label="记忆库")).register(registry, delete_move=True)
 
     async def set_cut_point(args: Dict[str, Any]) -> str:
         """声明"msg_seq 之前的上下文可以退役"。单调只进不退（账本层强制）。
@@ -144,32 +52,6 @@ def build_memory_registry(ledger, session_key: str, memory_dir: Path) -> ToolReg
         return root("set_cut_point", {"msg_seq": seq, "cut": hit.seq_id},
                     f"切点已推进：msg#{seq} 保留，之前可退役（落点 seq#{hit.seq_id}）")
 
-    registry = ToolRegistry(part="recorder")   # R 的工具组，日志里标 [recorder]
-    registry.register("read_file", "读取记忆文件全文（相对路径以记忆库为基准）",
-                      {"type": "object",
-                       "properties": {"path": {"type": "string",
-                                               "description": "文件路径（如 memory.md、old/x.md）"}},
-                       "required": ["path"]}, read_file)
-    registry.register("write_file", "整文件写入/新建记忆文件（会覆盖原内容）",
-                      {"type": "object",
-                       "properties": {"path": {"type": "string"},
-                                      "content": {"type": "string", "description": "完整文件内容"}},
-                       "required": ["path", "content"]}, write_file)
-    registry.register("patch_file", "精确替换文件中的一段文本（old 必须唯一匹配；改条目的首选）",
-                      {"type": "object",
-                       "properties": {"path": {"type": "string"},
-                                      "old": {"type": "string", "description": "原文（须唯一）"},
-                                      "new": {"type": "string", "description": "替换后"}},
-                       "required": ["path", "old", "new"]}, patch_file)
-    registry.register("delete_file", "删除文件（真删；长时间用不到的一般用 move 移进 old/）",
-                      {"type": "object",
-                       "properties": {"path": {"type": "string"}},
-                       "required": ["path"]}, delete_file)
-    registry.register("move_file", "移动/归档文件（如移进 old/）；src/dst 都在记忆库内",
-                      {"type": "object",
-                       "properties": {"src": {"type": "string"},
-                                      "dst": {"type": "string"}},
-                       "required": ["src", "dst"]}, move_file)
     registry.register("set_cut_point",
                       "声明 msg_seq 之前的上下文已无关、可以退役（只进不退；拿不准就先不调）",
                       {"type": "object",

@@ -18,7 +18,7 @@ from .providers.asr import make_transcriber
 from .providers.tokens import HeuristicTokenCounter
 from .providers.vision import make_vision
 from .tools.exec_tool import ExecPolicy, register_exec_tool
-from .tools.file_tools import register_file_tools, set_workspace
+from .tools.file_tools import FileScope, register_file_tools
 from .tools.memory_tools import register_record_memory
 from .tools.registry import ToolRegistry
 
@@ -46,10 +46,25 @@ def build_agent(cfg: Config) -> AgentLoop:
             ml_dir = PROJECT_ROOT / ml_dir
         modellog.setup(ml_dir)
 
-    # 工具（本期变体：M 直接持有工具——产品文档里这些是 E 的活）
+    # 记忆库（Recorder 维护，M 只读）：先算出来，M 的文件工具要开 memory:// 只读口
+    memory_dir = Path(cfg.recorder.memory_dir)
+    if not memory_dir.is_absolute():
+        memory_dir = PROJECT_ROOT / memory_dir
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    memory_md = memory_dir / "memory.md"
+    legacy = Path(cfg.agent.memory_file)          # 旧记忆文件：一次性迁移，不动原件
+    if not legacy.is_absolute():
+        legacy = PROJECT_ROOT / legacy
+    if not memory_md.exists() and legacy.exists():
+        shutil.copy(legacy, memory_md)
+        logger.info("旧记忆文件已迁入 %s（原件保留在 %s）", memory_md, legacy)
+
+    # 工具（本期变体：M 直接持有工具——产品文档里这些是 E 的活）。
+    # 文件工具与 R 共用同一实现（file_tools），沙箱按 scope 绑定：
+    # 记忆区只读（read_file 的 memory:// 口 + 写拒——"M 只读记忆"硬线）
     registry = ToolRegistry(part="messenger")
-    set_workspace(workspace)
-    register_file_tools(registry, file_roots)
+    register_file_tools(registry, FileScope(
+        roots=file_roots, base=workspace, images=True, memory_root=memory_dir))
     register_exec_tool(registry, ExecPolicy(
         timeout_seconds=cfg.exec.timeout_seconds,
         max_output_bytes=cfg.exec.max_output_bytes,
@@ -65,19 +80,8 @@ def build_agent(cfg: Config) -> AgentLoop:
         cfg.asr.provider, cfg.asr.base_url, cfg.asr.api_key, cfg.asr.model,
         cfg.asr.language, cfg.asr.max_audio_seconds)
 
-    # 消息库（SQLite，全量落盘）+ 记忆库（Recorder 维护，M 只读注入）+ 身份文件
+    # 消息库（SQLite，全量落盘）+ 身份文件
     ledger = MessageLedger(cfg.data_dir / "neoagent.db")
-    memory_dir = Path(cfg.recorder.memory_dir)
-    if not memory_dir.is_absolute():
-        memory_dir = PROJECT_ROOT / memory_dir
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    memory_md = memory_dir / "memory.md"
-    legacy = Path(cfg.agent.memory_file)          # 旧记忆文件：一次性迁移，不动原件
-    if not legacy.is_absolute():
-        legacy = PROJECT_ROOT / legacy
-    if not memory_md.exists() and legacy.exists():
-        shutil.copy(legacy, memory_md)
-        logger.info("旧记忆文件已迁入 %s（原件保留在 %s）", memory_md, legacy)
     identity_file = Path(cfg.agent.identity_file)
     if not identity_file.is_absolute():
         identity_file = PROJECT_ROOT / identity_file
@@ -110,5 +114,6 @@ def build_agent(cfg: Config) -> AgentLoop:
     agent.recorder_scheduler = RecorderScheduler(
         recorder, ledger,
         debounce_seconds=cfg.recorder.pause_debounce_seconds,
-        slow_interval=cfg.recorder.slow_interval)
+        slow_interval=cfg.recorder.slow_interval,
+        turn_state=agent.turn_state)   # 快整理锚点 = 任务收工时刻（见 RecorderScheduler）
     return agent

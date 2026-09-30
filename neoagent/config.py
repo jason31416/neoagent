@@ -46,7 +46,7 @@ class AgentConfig:
 class RecorderConfig:
     """R（Recorder）——记忆整理模块：记忆的唯一写者 + 上下文退役的判断者。"""
     memory_dir: str = "data/memory"        # 记忆库：memory.md（注入 M）+ 子文件 + old/ 归档
-    pause_debounce_seconds: int = 150      # 停顿判定（末条用户消息后多久算对话停顿）
+    pause_debounce_seconds: int = 150      # 快整理延迟：任务执行收工后静默这么久才整理
     slow_interval: int = 86400          # 慢周期整理的节律
     slow_lookback_days: int = 7            # 慢周期回看起点（天）
     max_tool_rounds: int = 12              # 一次整理跑的工具轮上限
