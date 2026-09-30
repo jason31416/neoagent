@@ -8,8 +8,10 @@
   因为**每轮模型调用前都从消息库现渲染**，插话（独立用户消息）自动进上下文；
 - 回复只从这里出（M 是唯一的声音）；
 - **消息协议**：模型每条要说的话用 <message>…</message> 包起来
-  （replyTo="msg#N" 落到通道真引用，其余属性是元数据、一律丢弃），
-  可连发多条、可干活中途先发一条；无块 = 静默；标签外文字 = 草稿，丢弃不入账；
+  （replyTo="msg#N" 落到通道真引用，channel="feishu" 强制发某频道、不写发到
+  用户最后说话的频道，其余属性是元数据、一律丢弃），
+  可连发多条、可干活中途先发一条；无块 = 静默；标签外文字 = 碎碎念，原样留存但不发送；
+- **/ 指令不进模型**：照常入账，指令解析器直接回 system 消息（见 core/commands.py）；
 - 工具流水（tool_call/tool_result）当轮即落消息库——事实层 = 完整上下文快照；
 - 内部消息（E/cron/jev）走 inject_internal() 注入时间线，本期恒空。
 """
@@ -30,7 +32,7 @@ from ..providers.tokens import HeuristicTokenCounter, TokenAnchor, TokenCounter,
 from ..providers.vision import normalize_image
 from ..tools.file_tools import _resolve_in_roots
 from ..tools.registry import ToolOutput, ToolRegistry, clip_tool_result
-from . import modellog
+from . import commands, modellog
 from .events import Attachment, MessageEvent
 from .frames import (Bubble, attachment_notes, finalize_assistant, finalize_user,
                      recall_tag)
@@ -88,6 +90,8 @@ class AgentLoop:
                  bubble_gap_min: float = 0.0, bubble_gap_max: float = 0.0,
                  workspace: Optional[Path] = None,
                  effort_provider: Optional[Callable[[], str]] = None,
+                 known_channels: Optional[List[str]] = None,
+                 timeline_bucket: str = "",
                  recorder=None) -> None:
         self.llm = llm
         self.registry = registry
@@ -109,6 +113,11 @@ class AgentLoop:
         # 思考档位（reasoning_effort）：每轮请求前现取 → 改配置即生效，可随时切换
         # 思考/非思考混用；默认 "medium"（none=不思考）
         self.effort_provider = effort_provider or (lambda: "medium")
+        # 已知频道 id（= 适配器 name）：模型 channel 属性的白名单
+        self.known_channels = tuple(known_channels or ())
+        # 时间线桶名：非空时所有事件归同一条连续记录（session 语义退役，
+        # 账本的分区列只当机制桶——多用户/群聊将来就是换分桶规则）
+        self.timeline_bucket = timeline_bucket
         self.recorder = recorder                # R（Recorder）：紧急压缩钩子用（可空）
         self._states: Dict[str, SessionState] = {}
         self._anchors: Dict[str, TokenAnchor] = {}    # 每会话真值锚定（token 预估）
@@ -117,6 +126,10 @@ class AgentLoop:
     # ------------------------------------------------------------------
     # 对外入口
     # ------------------------------------------------------------------
+    def bucket_of(self, event: MessageEvent) -> str:
+        """事件归哪条时间线：产品层一条连续记录（timeline_bucket）时全归它。"""
+        return self.timeline_bucket or event.session_key()
+
     async def submit(self, event: MessageEvent,
                      *, quote_fetcher: Optional[Callable[[str], Awaitable[Optional[str]]]] = None,
                      responder: Optional[Callable[..., Awaitable[Any]]] = None) -> None:
@@ -124,17 +137,27 @@ class AgentLoop:
 
         空闲 → 开新 turn；忙 → steer/redirect 注入当前 turn（不起并行任务）。
         quote_fetcher：通道的"按 id 取消息文本"兜底（飞书 message.get）。
+        / 开头是指令：照常入账，执行后回系统消息，不触发模型回合。
         """
-        session_key = event.session_key()
+        session_key = self.bucket_of(event)
+        raw_text = (event.text or "").strip()
+        is_command = raw_text.startswith("/")
 
-        # 先置忙：从入库到 turn 收工的整段都算"任务执行中"（R 快整理不插队）
         st = self._states.setdefault(session_key, SessionState())
-        st.busy = True
         if responder is not None:
             st.responder = responder
+        if not is_command:
+            # 置忙：从入库到 turn 收工的整段都算"任务执行中"（R 快整理不插队）
+            st.busy = True
 
         # 1) 预处理：语音转写 → 普通文本；图片上传 vision
         text, attachments = await self._preprocess(event)
+
+        # 指令分流：不进模型——照常入账（用户气泡），执行后回 system 消息
+        if is_command:
+            await self._ingest_user(event, session_key, raw_text, attachments, quote_fetcher)
+            await self._handle_command(event, session_key, raw_text, responder)
+            return
 
         # 2) 入库定稿：引用解析（平台 id → 气泡）+ 净化/气泡编号/recall 固化
         await self._ingest_user(event, session_key, text, attachments, quote_fetcher)
@@ -165,8 +188,35 @@ class AgentLoop:
     def inject_internal(self, session_key: str, text: str) -> None:
         """内部消息注入（E 的输出 / cron / jev 的提醒）。本期无人调用，接口留好。"""
         bid = self.ledger.alloc_bubbles(session_key, 1)[0]
-        final = finalize_user(text, sender="internal", bubble_id=bid, ts=time.time())
+        final = finalize_user(text, sender="system", bubble_id=bid, ts=time.time())
         self.ledger.add_turn(session_key=session_key, type=TYPE_INTERNAL, text=final)
+
+    async def _handle_command(self, event: MessageEvent, session_key: str,
+                              text: str, responder) -> None:
+        """指令执行 + 系统回执：回执是 internal 行 + **真气泡**（可被引用），
+        发到指令来的频道，不触发模型回合。"""
+        receipt = commands.execute(
+            text, channel=event.channel, home=self.ledger.get_setting("home"),
+            known_channels=self.known_channels,
+            set_home=lambda ch: self.ledger.set_setting("home", ch))
+        logger.info("[command] %s → %s", text, receipt)
+        ts = time.time()
+        bid = self.ledger.alloc_bubbles(session_key, 1)[0]
+        final = finalize_user(receipt, sender="system", bubble_id=bid, ts=ts,
+                              channel=event.channel)
+        seq = self.ledger.add_turn(session_key=session_key, type=TYPE_INTERNAL,
+                                   text=final, timestamp=ts)
+        self.ledger.add_bubble(
+            session_key=session_key, bubble_id=bid, seq_id=seq, direction="out",
+            platform=event.channel, chat_id=event.conversation.id,
+            kind="text", content=receipt, sender="system", timestamp=ts)
+        result = None
+        if responder is not None:
+            try:
+                result = await responder(receipt, channel=event.channel)
+            except Exception:
+                logger.exception("系统回执发送失败")
+        self._backfill_bubble(session_key, bid, result)
 
     # ------------------------------------------------------------------
     # turn 循环：一条消息或一批插话共用一轮；气泡在 _run_turn 内即时发出
@@ -315,10 +365,25 @@ class AgentLoop:
     # ------------------------------------------------------------------
     # 入库定稿 / 气泡投递
     # ------------------------------------------------------------------
-    @staticmethod
-    def _key_parts(session_key: str) -> tuple:
-        channel, _, chat = session_key.partition(":")
-        return channel, chat
+    def _default_channel(self, session_key: str) -> str:
+        """出口路由兜底频道：上一个用户说话的频道；查不到 → home。"""
+        hit = self.ledger.last_inbound(session_key)
+        if hit and hit.platform:
+            return hit.platform
+        return self._home_channel(session_key)
+
+    def _home_channel(self, session_key: str) -> str:
+        """home 频道：/home 设置的优先；没设置默认第一条用户消息的频道。"""
+        home = self.ledger.get_setting("home")
+        if home:
+            return home
+        first = self.ledger.first_inbound(session_key)
+        return first.platform if first else ""
+
+    def _outbound_chat(self, session_key: str, channel: str) -> str:
+        """出站气泡的 chat 归属：该频道最近一次入站消息的 chat。"""
+        hit = self.ledger.last_inbound(session_key, channel=channel)
+        return hit.chat_id if hit else ""
 
     def _alloc_bubble(self, session_key: str) -> Callable[[], int]:
         """定稿器用的气泡编号分配口（连续、持久化）。"""
@@ -335,10 +400,12 @@ class AgentLoop:
         recall = ""
         ref = event.reply_to
         if ref is not None:
-            hit = self.ledger.find_bubble(session_key, ref.message_id)
+            # 引用只在同频道内成立（平台消息 id 是平台局部的）
+            hit = self.ledger.find_bubble(session_key, ref.message_id,
+                                          channel=event.channel)
             if hit is not None:
                 recall = recall_tag(hit.bubble_id, hit.sender, hit.timestamp,
-                                    hit.content)
+                                    hit.content, channel=hit.platform)
             else:
                 # 库没有：通道内联文本 / 通道 API 兜底（飞书 message.get）
                 if not ref.text and quote_fetcher is not None:
@@ -350,21 +417,22 @@ class AgentLoop:
                         logger.warning("引用消息拉取失败 %s：%s", ref.message_id, exc)
                 if ref.text:
                     recall = recall_tag(None, ref.sender_name or "未知",
-                                        ref.timestamp or event.timestamp, ref.text)
+                                        ref.timestamp or event.timestamp, ref.text,
+                                        channel=event.channel)
         body = (text or "") + attachment_notes(attachments)
         sender = event.sender.name or event.sender.id
         bid = self.ledger.alloc_bubbles(session_key, 1)[0]
         final = finalize_user(body, sender=sender, bubble_id=bid,
-                              ts=event.timestamp, recall=recall)
+                              ts=event.timestamp, recall=recall,
+                              channel=event.channel)
         seq = self.ledger.add_turn(session_key=session_key, type=TYPE_USER,
                                    text=final, attachments=atts,
                                    timestamp=event.timestamp)
         kind = ("text" if text.strip()
                 else "image" if any(a.kind == "image" for a in atts) else "file")
-        channel, chat = self._key_parts(session_key)
         self.ledger.add_bubble(
             session_key=session_key, bubble_id=bid, seq_id=seq, direction="in",
-            platform=channel, chat_id=chat, message_id=event.id,
+            platform=event.channel, chat_id=event.conversation.id, message_id=event.id,
             kind=kind, content=text or "", sender=sender, timestamp=event.timestamp)
 
     async def _emit_round(self, session_key: str, st: SessionState, result,
@@ -377,18 +445,20 @@ class AgentLoop:
         final, bubbles = finalize_assistant(
             result.content, ts=ts,
             alloc=self._alloc_bubble(session_key),
-            lookup=self._bubble_lookup(session_key))
+            lookup=self._bubble_lookup(session_key),
+            default_channel=self._default_channel(session_key),
+            known_channels=self.known_channels)
         if not final.strip() and not calls:
             return None, 0
         seq = self.ledger.add_turn(
             session_key=session_key, type=TYPE_ASSISTANT, text=final,
             reasoning=result.reasoning or "", calls=calls, timestamp=ts)
-        channel, chat = self._key_parts(session_key)
         for b in bubbles:
             self.ledger.add_bubble(
                 session_key=session_key, bubble_id=b.bubble_id, seq_id=seq,
-                direction="out", platform=channel, chat_id=chat, kind=b.kind,
-                content=b.content, sender="neoagent", timestamp=ts)
+                direction="out", platform=b.channel,
+                chat_id=self._outbound_chat(session_key, b.channel),
+                kind=b.kind, content=b.content, sender="neoagent", timestamp=ts)
         sent = await self._deliver_bubbles(session_key, st, bubbles, already)
         return seq, sent
 
@@ -403,12 +473,13 @@ class AgentLoop:
                 self.ledger.set_bubble_meta(session_key, b.bubble_id,
                                             {"skipped": "over cap"})
                 continue
-            quote_to = self._bubble_platform_id(session_key, b.reply_to)
+            quote_to = self._bubble_platform_id(session_key, b.reply_to, b.channel)
             if b.kind == "text":
                 result = None
                 if st.responder is not None:
                     try:
-                        result = await st.responder(b.content, quote_to=quote_to)
+                        result = await st.responder(b.content, quote_to=quote_to,
+                                                    channel=b.channel)
                     except Exception:
                         logger.exception("回复发送失败")
                 self._backfill_bubble(session_key, b.bubble_id, result)
@@ -431,13 +502,20 @@ class AgentLoop:
             self.ledger.set_bubble_meta(session_key, bubble_id, {"error": str(err)})
 
     def _bubble_platform_id(self, session_key: str,
-                            bubble_id: Optional[int]) -> Optional[str]:
-        """replyTo 气泡 → 平台消息 id（通道真引用）；拿不到就降级纯文本。"""
+                            bubble_id: Optional[int],
+                            channel: str = "") -> Optional[str]:
+        """replyTo 气泡 → 平台消息 id（通道真引用）；拿不到就降级纯文本。
+
+        引用不跨平台：目标气泡不在投递频道上时同样降级（平台 id 是平台局部的）。"""
         if bubble_id is None:
             return None
         hit = self.ledger.get_bubble(session_key, int(bubble_id))
         if hit is None or not hit.message_id:
             logger.warning("replyTo=msg#%s 没有平台消息 id，降级纯文本", bubble_id)
+            return None
+        if channel and hit.platform and hit.platform != channel:
+            logger.info("replyTo=msg#%s 在 %s 上、发往 %s，跨频道引用不成立，降级纯文本",
+                        bubble_id, hit.platform, channel)
             return None
         return hit.message_id
 
@@ -449,35 +527,40 @@ class AgentLoop:
             _kind, _mime, p = self._validate_media(b.src)
         except Exception as exc:
             logger.warning("媒体消息被拒 %s：%s", b.src, exc)
-            await self._say(session_key, st, f"（{display} 发不出去：{exc}）")
+            await self._say(session_key, st, f"（{display} 发不出去：{exc}）",
+                            channel=b.channel)
             return
         result = None
         if st.responder is not None:
             try:
-                result = await st.responder("", quote_to=quote_to, media=str(p))
+                result = await st.responder("", quote_to=quote_to, media=str(p),
+                                            channel=b.channel)
             except Exception:
                 logger.exception("媒体发送失败")
         self._backfill_bubble(session_key, b.bubble_id, result)
         if not (result is not None and getattr(result, "ok", False)):
             err = getattr(result, "error", None) or "通道不支持"
-            await self._say(session_key, st, f"（{display} 发不出去：{err}）")
+            await self._say(session_key, st, f"（{display} 发不出去：{err}）",
+                            channel=b.channel)
 
-    async def _say(self, session_key: str, st: SessionState, text: str) -> int:
+    async def _say(self, session_key: str, st: SessionState, text: str,
+                   channel: str = "") -> int:
         """发一条系统生成的文本消息并定稿入库（降级说明用），返回气泡编号。"""
         ts = time.time()
         bid = self.ledger.alloc_bubbles(session_key, 1)[0]
-        final = finalize_user(text, sender="neoagent", bubble_id=bid, ts=ts)
+        final = finalize_user(text, sender="neoagent", bubble_id=bid, ts=ts,
+                              channel=channel)
         seq = self.ledger.add_turn(session_key=session_key, type=TYPE_ASSISTANT,
                                    text=final, timestamp=ts)
-        channel, chat = self._key_parts(session_key)
-        self.ledger.add_bubble(session_key=session_key, bubble_id=bid, seq_id=seq,
-                               direction="out", platform=channel, chat_id=chat,
-                               kind="text", content=text, sender="neoagent",
-                               timestamp=ts)
+        self.ledger.add_bubble(
+            session_key=session_key, bubble_id=bid, seq_id=seq,
+            direction="out", platform=channel,
+            chat_id=self._outbound_chat(session_key, channel),
+            kind="text", content=text, sender="neoagent", timestamp=ts)
         result = None
         if st.responder is not None:
             try:
-                result = await st.responder(text)
+                result = await st.responder(text, channel=channel)
             except Exception:
                 logger.exception("回复发送失败")
         self._backfill_bubble(session_key, bid, result)

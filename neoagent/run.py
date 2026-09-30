@@ -3,7 +3,7 @@
     uv run python -m neoagent.run
 
 配置里 channels.weixin.enabled / channels.feishu.enabled 决定起哪些通道。
-两个通道共用同一个 agent 核心（同一段对话历史、同一套工具）。
+所有频道共用同一个 agent 核心、同一条连续记录（每条消息标 channel）。
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import logging
 from .app import build_agent
 from .config import load_config
 from .core.channel import ChannelAdapter
+from .core.events import SendResult
 from .log import bold_cyan, bold_green, gray, setup_logging
 
 setup_logging()
@@ -42,26 +43,37 @@ async def _run() -> None:
     if not adapters:
         raise SystemExit("没有启用任何通道：请在 config.toml 的 [channels.*] 里打开 enabled")
 
-    # 核心入口：submit 即返回；回复经 responder 由原通道发回
+    # 每频道最近一条入站消息：跨频道投递时当该频道的回复上下文（chat/引用载体）
+    last_events: dict[str, object] = {}
+
+    # 核心入口：submit 即返回；回复经 responder 按气泡的 channel 路由到对应频道
     async def on_message(event) -> None:
         logger.info("[%s] %s %s", event.channel, bold_cyan("<<"), event.text[:80])
         adapter = event_adapter(event.channel)
+        last_events[event.channel] = event
 
-        async def responder(text: str, quote_to: str | None = None, media: str | None = None,
+        async def responder(text: str, quote_to: str | None = None,
+                            media: str | None = None, channel: str | None = None,
                             _event=event, _adapter=adapter):
-            """回复出口：M 的话经原通道发回（忙时回执也走这里）。
+            """回复出口：按气泡的 channel 路由（不写 = 来的频道）。
             quote_to：M 的 replyTo → 通道级引用；media：媒体消息（<img>/<file>，独立消息）。
             返回 SendResult（message_id 回填账用）。"""
+            target = channel or _event.channel
+            ad = by_name.get(target)
+            ev = last_events.get(target)
+            if ad is None or ev is None:
+                logger.warning("[%s] 频道还没有对话上下文，发不出去", target)
+                return SendResult(ok=False, error=f"频道 {target} 还没有对话，发不出去")
             note = gray(f"（引用 {quote_to}）") if quote_to else ""
             if media:
-                logger.info("[%s] %s %s%s", _event.channel, bold_green(">>"),
+                logger.info("[%s] %s %s%s", target, bold_green(">>"),
                             gray(f"（媒体 {media}）"), note)
-                result = await _adapter.send_media(_event, media, quote_to=quote_to)
+                result = await ad.send_media(ev, media, quote_to=quote_to)
             else:
-                logger.info("[%s] %s %s%s", _event.channel, bold_green(">>"), note, text)
-                result = await _adapter.send_reply(_event, text, quote_to=quote_to)
+                logger.info("[%s] %s %s%s", target, bold_green(">>"), note, text)
+                result = await ad.send_reply(ev, text, quote_to=quote_to)
             if not result.ok:
-                logger.error("[%s] 回复失败：%s", _event.channel, result.error)
+                logger.error("[%s] 回复失败：%s", target, result.error)
             return result
 
         # 空闲开 turn，忙则 steer/redirect 注入当前 turn（不起并行任务）

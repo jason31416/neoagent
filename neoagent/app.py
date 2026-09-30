@@ -24,6 +24,8 @@ from .tools.registry import ToolRegistry
 
 logger = logging.getLogger("neoagent.app")
 
+TIMELINE_BUCKET = "main"   # 产品层一条连续记录的桶名（session 语义退役后只剩它）
+
 
 def build_agent(cfg: Config) -> AgentLoop:
     """按配置组装 M（agent 核心）：LLM + 工具 + providers + 消息库。"""
@@ -101,6 +103,11 @@ def build_agent(cfg: Config) -> AgentLoop:
                       media_max_bytes=cfg.media.max_bytes,
                       bubble_gap_min=cfg.agent.bubble_gap_min,
                       bubble_gap_max=cfg.agent.bubble_gap_max,
+                      # 模型 channel 属性的白名单（= 适配器 name）
+                      known_channels=[name for name, on in
+                                      (("weixin", cfg.weixin.enabled),
+                                       ("feishu", cfg.feishu.enabled)) if on],
+                      timeline_bucket=TIMELINE_BUCKET,   # 一条连续记录
                       workspace=workspace)
 
     # R（Recorder）：记忆整理 + 上下文退役。与 M 共用 LLM 与预算，快慢同档。

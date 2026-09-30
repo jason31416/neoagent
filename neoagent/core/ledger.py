@@ -81,6 +81,10 @@ CREATE TABLE IF NOT EXISTS blobs (
   mime         TEXT,
   bytes        BLOB
 );
+CREATE TABLE IF NOT EXISTS kv (
+  key   TEXT PRIMARY KEY,              -- 运行时设置（home 频道等），重启不丢
+  value TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_bubbles_msgid ON bubbles(session_key, message_id);
 CREATE INDEX IF NOT EXISTS idx_turns_group ON turns(session_key, group_id);
 """
@@ -234,14 +238,45 @@ class MessageLedger:
             (session_key, int(bubble_id))).fetchone()
         return self._bubble(row) if row else None
 
-    def find_bubble(self, session_key: str, message_id: str) -> Optional[Any]:
-        """按平台消息 id 反查气泡（入站引用解析主路径）。"""
+    def find_bubble(self, session_key: str, message_id: str,
+                    channel: str = "") -> Optional[Any]:
+        """按平台消息 id 反查气泡（入站引用解析主路径）。
+
+        平台消息 id 是**平台局部**的（两平台可能撞 id），channel 非空时
+        只在该频道的气泡里找——跨频道的引用本来就不成立。"""
         if not message_id:
             return None
+        sql = (f"SELECT {self._BCOLS} FROM bubbles"
+               " WHERE session_key = ? AND message_id = ?")
+        args: list = [session_key, message_id]
+        if channel:
+            sql += " AND platform = ?"
+            args.append(channel)
+        row = self._conn.execute(
+            sql + " ORDER BY bubble_id DESC LIMIT 1", args).fetchone()
+        return self._bubble(row) if row else None
+
+    def last_inbound(self, session_key: str,
+                     channel: str = "") -> Optional[Any]:
+        """最新一条入站气泡（direction=in）；channel 非空时限定该频道。
+
+        用途：出口路由的默认频道（"用户最后说话的频道"）、出站气泡的 chat 归属。"""
+        sql = (f"SELECT {self._BCOLS} FROM bubbles"
+               " WHERE session_key = ? AND direction = 'in'")
+        args: list = [session_key]
+        if channel:
+            sql += " AND platform = ?"
+            args.append(channel)
+        row = self._conn.execute(
+            sql + " ORDER BY bubble_id DESC LIMIT 1", args).fetchone()
+        return self._bubble(row) if row else None
+
+    def first_inbound(self, session_key: str) -> Optional[Any]:
+        """最早一条入站气泡（home 未设置时的默认 = 第一条用户消息的频道）。"""
         row = self._conn.execute(
             f"SELECT {self._BCOLS} FROM bubbles"
-            " WHERE session_key = ? AND message_id = ? ORDER BY bubble_id DESC LIMIT 1",
-            (session_key, message_id)).fetchone()
+            " WHERE session_key = ? AND direction = 'in'"
+            " ORDER BY bubble_id ASC LIMIT 1", (session_key,)).fetchone()
         return self._bubble(row) if row else None
 
     @staticmethod
@@ -293,6 +328,21 @@ class MessageLedger:
         """全部会话（慢周期遍历用）。"""
         return [r[0] for r in self._conn.execute(
             "SELECT session_key FROM sessions ORDER BY session_key")]
+
+    # ------------------------------------------------------------------
+    # kv 运行时设置（home 频道等；指令层写、路由层读，重启不丢）
+    # ------------------------------------------------------------------
+    def get_setting(self, key: str, default: str = "") -> str:
+        row = self._conn.execute(
+            "SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT INTO kv(key, value) VALUES(?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value)))
+        self._conn.commit()
 
     # ------------------------------------------------------------------
     # 主表读取

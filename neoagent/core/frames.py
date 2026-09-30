@@ -2,8 +2,9 @@
 
 定稿做三件事（都是一次性固化，之后永不改写——这也是前缀缓存一致性的来源）：
 
-1. **属性净化**：标签属性分两类——模型可用（replyTo/src/name）与系统专属
-   （id/time/sender…）。模型自己写的 id/time 一律剥掉不算数，防伪造；
+1. **属性净化**：标签属性分三类——模型可用（replyTo/src/name/channel）与
+   系统专属（id/time/sender…）。模型自己写的 id/time 一律剥掉不算数，防伪造；
+   channel 写了但不是已知频道 id 的也剥掉（走默认出口）；
 2. **气泡编号**：每遇到一个真气泡（<message>/<img>/<file>）分配一个 msg#N
    写进标签（编号由调用方预分配，连续、持久化）；
 3. **recall 快照**：replyTo 指向的气泡**不管在不在上下文**，快照一律固化在
@@ -25,6 +26,7 @@ from typing import Callable, List, Optional, Tuple
 _ITEM_RE = re.compile(
     r"<message([^>]*)>(.*?)</message>|<(img|file)\b([^>]*?)/?>", re.S)
 _REPLYTO_RE = re.compile(r'replyTo\s*=\s*"msg#(\d+)"')
+_CHANNEL_RE = re.compile(r'channel\s*=\s*"([^"]*)"')
 _SRC_RE = re.compile(r'src\s*=\s*"([^"]*)"')
 _NAME_RE = re.compile(r'name\s*=\s*"([^"]*)"')
 
@@ -38,6 +40,7 @@ class Bubble:
     src: str = ""                        # 媒体路径
     name: str = ""                       # 媒体显示名
     reply_to: Optional[int] = None       # 引用的气泡编号（平台挂真引用用）
+    channel: str = ""                    # 落地频道（模型指定/默认解析后的最终值）
 
 
 def esc_body(text: str) -> str:
@@ -76,29 +79,37 @@ def attachment_notes(atts) -> str:
     return ("\n" + "\n".join(lines)) if lines else ""
 
 
-def recall_tag(bubble_id: Optional[int], sender: str, ts: float, text: str) -> str:
+def recall_tag(bubble_id: Optional[int], sender: str, ts: float, text: str,
+               channel: str = "") -> str:
     """引用快照：<recall> 独立标签，贴在被引消息自己标签的前面。"""
     id_attr = f' id="msg#{bubble_id}"' if bubble_id else ""
+    ch_attr = f' channel="{esc_attr(channel)}"' if channel else ""
     return (f'<recall{id_attr} sender="{esc_attr(sender)}"'
-            f' time="{fmt_ts(ts)}">{esc_body((text or "").strip())}</recall>')
+            f'{ch_attr} time="{fmt_ts(ts)}">{esc_body((text or "").strip())}</recall>')
 
 
 def finalize_user(text: str, *, sender: str, bubble_id: int, ts: float,
-                  recall: str = "") -> str:
-    """用户消息定稿：<message sender id time>正文</message>（recall 快照贴前面）。"""
+                  recall: str = "", channel: str = "") -> str:
+    """用户/系统消息定稿：<message sender channel id time>正文</message>
+    （recall 快照贴前面）。channel = 这条消息所在/落地的频道（系统填）。"""
     body = esc_body(text or "")
-    return (f'{recall}<message sender="{esc_attr(sender)}" id="msg#{bubble_id}"'
-            f' time="{fmt_ts(ts)}">{body}</message>')
+    ch_attr = f' channel="{esc_attr(channel)}"' if channel else ""
+    return (f'{recall}<message sender="{esc_attr(sender)}"{ch_attr}'
+            f' id="msg#{bubble_id}" time="{fmt_ts(ts)}">{body}</message>')
 
 
 def finalize_assistant(content: Optional[str], *, ts: float,
                        alloc: Callable[[], int],
                        lookup: Callable[[int], Optional[object]],
+                       default_channel: str = "",
+                       known_channels: Tuple[str, ...] = (),
                        ) -> Tuple[str, List[Bubble]]:
     """模型输出定稿 → (定稿文本, 气泡列表)。
 
     alloc：拿一个新气泡编号；lookup：按气泡编号查历史气泡（验真 replyTo +
     取 recall 快照），查不到的 replyTo 直接剥掉（模型伪造的不算数）。
+    channel：模型可写（channel="feishu" 强制发该频道）；不在 known_channels
+    里的剥掉走 default_channel。最终落地值回填进标签——发到哪入库那刻已定。
     """
     src_text = content or ""
     out: List[str] = []
@@ -110,7 +121,13 @@ def finalize_assistant(content: Optional[str], *, ts: float,
         if target is None:
             return ""
         hit = lookup(target)
-        return recall_tag(target, hit.sender, hit.timestamp, hit.content) if hit else ""
+        return recall_tag(target, hit.sender, hit.timestamp, hit.content,
+                          channel=getattr(hit, "platform", "")) if hit else ""
+
+    def _channel_of(raw_attrs: str) -> str:
+        c = _CHANNEL_RE.search(raw_attrs)
+        val = c.group(1).strip() if c else ""
+        return val if val and val in known_channels else default_channel
 
     for m in _ITEM_RE.finditer(src_text):
         stray = src_text[pos:m.start()]
@@ -129,11 +146,14 @@ def finalize_assistant(content: Optional[str], *, ts: float,
             if target is not None and lookup(target) is None:
                 target = None                     # 伪造/失效引用剥掉
             bid = alloc()
+            channel = _channel_of(raw_attrs)
             reply_attr = f' replyTo="msg#{target}"' if target is not None else ""
+            ch_attr = f' channel="{esc_attr(channel)}"' if channel else ""
             out.append(_recall_for(target))
-            out.append(f'<message id="msg#{bid}" time="{ts_str}"{reply_attr}>'
+            out.append(f'<message id="msg#{bid}"{ch_attr} time="{ts_str}"{reply_attr}>'
                        f'{body}</message>')
-            bubbles.append(Bubble(bid, "text", content=body.strip(), reply_to=target))
+            bubbles.append(Bubble(bid, "text", content=body.strip(), reply_to=target,
+                                  channel=channel))
         else:                                     # ---- <img>/<file> ----
             raw_attrs = m.group(4) or ""
             s = _SRC_RE.search(raw_attrs)
@@ -150,13 +170,15 @@ def finalize_assistant(content: Optional[str], *, ts: float,
             kind = "image" if tag == "img" else "file"
             src = s.group(1).strip()
             name = n.group(1).strip() if n else ""
+            channel = _channel_of(raw_attrs)
             reply_attr = f' replyTo="msg#{target}"' if target is not None else ""
             name_attr = f' name="{esc_attr(name)}"' if name else ""
+            ch_attr = f' channel="{esc_attr(channel)}"' if channel else ""
             out.append(_recall_for(target))
-            out.append(f'<{tag} src="{esc_attr(src)}"{name_attr}{reply_attr}'
+            out.append(f'<{tag} src="{esc_attr(src)}"{name_attr}{ch_attr}{reply_attr}'
                        f' id="msg#{bid}" time="{ts_str}"/>')
             bubbles.append(Bubble(bid, kind, content=name or src, src=src,
-                                  name=name, reply_to=target))
+                                  name=name, reply_to=target, channel=channel))
 
     if pos < len(src_text):
         out.append(esc_body(src_text[pos:]))     # 结尾碎碎念
