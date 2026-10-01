@@ -93,6 +93,8 @@ class WeixinAdapter(ChannelAdapter):
         self._dedup = _Dedup()                       # message_id 去重（300s，拦上游重发）
         self._content_dedup = _Dedup(ttl_seconds=10.0)  # 内容去重（10s：人类重复发要放行）
         self._tokens = ilink.ContextTokenStore(data_dir)
+        # 输出口：扫码/登录提示（默认 print；服务形态接成控制台通知流）
+        self.notice = print
 
         # 登录后拿到的凭据
         self._account_id = ""
@@ -104,9 +106,10 @@ class WeixinAdapter(ChannelAdapter):
     # ------------------------------------------------------------------
     async def connect(self) -> None:
         """加载已有登录态（没有就引导扫码），然后开长轮询。"""
+        ilink.set_output(self.notice)     # 扫码提示走输出口（服务形态进控制台）
         saved = ilink.latest_account(self._data_dir)
         if saved is None:
-            print("未找到微信登录态，进入扫码登录：")
+            self.notice("未找到微信登录态，进入扫码登录：")
             creds = await ilink.qr_login(self._data_dir)
             if creds is None:
                 raise RuntimeError("微信扫码登录失败，无法启动 weixin 通道")

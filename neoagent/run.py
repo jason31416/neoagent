@@ -21,7 +21,7 @@ import uuid
 from pathlib import Path
 
 from .app import build_agent
-from .config import ChannelConfig, Config, load_config, save_config_value
+from .config import ChannelConfig, Config, load_config, save_channel, save_config_value
 from .console.client import run_client
 from .console.transcript import ConsoleTranscript
 from .control import ClientConn, ControlServer, control_alive
@@ -93,21 +93,13 @@ async def _run(mode: str, verbose: bool) -> None:
     agent = build_agent(cfg)
     transcript = ConsoleTranscript(cfg.data_dir / "neoagent.db")
     stop_event = asyncio.Event()
-    adapters: list[ChannelAdapter] = []
 
     scheduler = getattr(agent, "recorder_scheduler", None)
     if scheduler is not None:
         asyncio.get_event_loop().create_task(scheduler.run_forever())
 
-    for ch in cfg.channels:
-        if not ch.enabled:
-            continue
-        adapter = _make_adapter(ch, cfg)
-        if adapter is not None:
-            adapter.name = ch.name        # 频道名 = channels/<name>.yml 的文件名
-            adapters.append(adapter)
-
-    by_name = {a.name: a for a in adapters}
+    by_name: dict[str, ChannelAdapter] = {}    # 在跑的频道
+    conn_tasks: dict[str, asyncio.Task] = {}   # 连接在飞的（扫码等待也算）
     last_events: dict[str, MessageEvent] = {}
 
     # ---- 控制台转录：工具工作行（M 的工具才有；R 的整理细节进日志不进控制台）
@@ -186,6 +178,85 @@ async def _run(mode: str, verbose: bool) -> None:
                            quote_fetcher=(adapter.fetch_message_text if adapter else None),
                            responder=responder)
 
+    # ---- 频道管理：/connect //disconnect 热插拔（写回 enabled = 自启开关）
+    async def start_channel(ch: ChannelConfig) -> None:
+        adapter = _make_adapter(ch, cfg)
+        if adapter is None:
+            server.broadcast({"kind": "notice",
+                              "text": f"{ch.name} 不认识的频道类型 {ch.kind}"})
+            return
+        adapter.name = ch.name            # 频道名 = channels/<name>.yml 的文件名
+        adapter.set_message_handler(on_message)
+        if hasattr(adapter, "notice"):    # 扫码等提示 → 控制台通知流
+            adapter.notice = (lambda s, _n=ch.name: server.broadcast(
+                {"kind": "notice", "text": f"{_n} {s}"}))
+        by_name[ch.name] = adapter
+        try:
+            await adapter.connect()
+            server.broadcast({"kind": "notice", "text": f"{ch.name} 已连接"})
+        except Exception as exc:
+            logger.exception("[%s] 连接失败", ch.name)
+            server.broadcast({"kind": "notice", "text": f"{ch.name} 连接失败：{exc}"})
+            by_name.pop(ch.name, None)
+
+    def _connecting(name: str) -> bool:
+        t = conn_tasks.get(name)
+        return t is not None and not t.done()
+
+    def op_connect(name: str) -> str:
+        ch = next((c for c in cfg.channels if c.name == name), None)
+        if ch is None:
+            if name not in ("weixin", "feishu"):
+                return f"未知频道类型：{name}（可用：weixin、feishu）"
+            ch = ChannelConfig(name=name, kind=name, enabled=True, params={"owner": ""})
+            save_channel(ch)              # /connect 顺手生成配置
+            cfg.channels.append(ch)
+        if name in by_name or _connecting(name):
+            return f"{name} 已经在跑了"
+        if ch.kind == "feishu" and not (ch.params.get("app_id") and ch.params.get("app_secret")):
+            return f"飞书要先填凭据：编辑 {ch.path} 的 app_id/app_secret，再来 /connect {name}"
+        ch.enabled = True
+        save_channel(ch)                  # 写入自启
+        conn_tasks[name] = asyncio.get_event_loop().create_task(start_channel(ch))
+        return f"{name} 连接中（要扫码的话二维码马上来）"
+
+    def op_disconnect(name: str) -> str:
+        ch = next((c for c in cfg.channels if c.name == name), None)
+        ad = by_name.pop(name, None)
+        task = conn_tasks.pop(name, None)
+        if ad is None and (task is None or task.done()):
+            return f"{name} 没在跑"
+        if task is not None:
+            task.cancel()
+        if ch is not None:
+            ch.enabled = False
+            save_channel(ch)              # 取消自启；登录态保留，再 /connect 免扫码
+
+        async def _down() -> None:
+            if ad is not None:
+                try:
+                    await asyncio.wait_for(ad.disconnect(), timeout=5)
+                except Exception:
+                    logger.exception("[%s] 断开出错", name)
+            server.broadcast({"kind": "notice", "text": f"{name} 已断开（登录态保留）"})
+
+        asyncio.get_event_loop().create_task(_down())
+        return f"{name} 停用中（登录态保留，再 /connect 不用扫码）"
+
+    def op_channels() -> list:
+        out = []
+        for ch in cfg.channels:
+            if ch.name in by_name:
+                state = "已连接"
+            elif _connecting(ch.name):
+                state = "连接中"
+            elif ch.enabled:
+                state = "已启用（还没连上）"
+            else:
+                state = "已停用"
+            out.append(f"{ch.name}（{ch.kind}）{state}")
+        return out
+
     # ---- 控制台输入：/ 指令（回执两形态）或裸输入（channel=cli 聊天）
     def console_ctx(conn: ClientConn) -> commands.CommandContext:
         def tail_logs(n: int):
@@ -196,14 +267,6 @@ async def _run(mode: str, verbose: bool) -> None:
                 return []
             return lines[-n:]
 
-        def status_extra():
-            out = []
-            for ch in cfg.channels:
-                state = "已启用" if ch.enabled else "已停用"
-                live = "（在跑）" if ch.name in by_name else ""
-                out.append(f"频道 {ch.name}（{ch.kind}）{state}{live}")
-            return out
-
         return commands.CommandContext(
             surface="console", channel="cli",
             home=agent.ledger.get_setting("home"),
@@ -211,7 +274,10 @@ async def _run(mode: str, verbose: bool) -> None:
             set_home=lambda c: agent.ledger.set_setting("home", c),
             thinking=agent.effort_provider(),
             set_thinking=lambda v: save_config_value("model.thinking", v, home=cfg.home),
-            status_extra=status_extra,
+            status_extra=op_channels,
+            connect_channel=op_connect,
+            disconnect_channel=op_disconnect,
+            channels_info=op_channels,
             tail_logs=tail_logs,
             tail_history=transcript.recent,
             reply_rows=lambda rows: server.reply_rows(conn, list(rows)),
@@ -244,16 +310,23 @@ async def _run(mode: str, verbose: bool) -> None:
     server = ControlServer(sock, transcript, on_input=on_input)
     await server.start()
 
-    for a in adapters:
-        a.set_message_handler(on_message)
+    # run_command 工具也能碰频道管理（agent 几乎全放开；审计工作行可见）
+    agent.channel_ops = {"connect": op_connect, "disconnect": op_disconnect,
+                         "info": op_channels}
 
-    if not adapters:
-        server.broadcast({"kind": "notice",
-                          "text": f"没有启用任何频道：{cfg.home / 'channels'} 里建个 yml"
-                                  "（enabled: true），或在聊天里 /connect"})
+    if cfg.fresh_install or not cfg.llm.api_key:
+        print(f"neoagent 首启：配置在 {cfg.home / 'config.yml'}")
+        print("三步：1) model.api_key 填进 config.yml  2) /connect weixin 扫码  3) 回来说话")
+
+    for ch in cfg.channels:
+        if ch.enabled and ch.name not in by_name and not _connecting(ch.name):
+            conn_tasks[ch.name] = asyncio.get_event_loop().create_task(start_channel(ch))
+    if conn_tasks:
+        await asyncio.gather(*conn_tasks.values())
+        logger.info("neoagent 已启动，频道：%s", ", ".join(by_name) or "（无）")
     else:
-        await asyncio.gather(*(a.connect() for a in adapters))
-        logger.info("neoagent 已启动，频道：%s", ", ".join(by_name))
+        server.broadcast({"kind": "notice",
+                          "text": "没有启用任何频道：/connect weixin 之类接一个就能聊"})
 
     # ---- 控制台：一体化且有终端才内嵌（attach 形态自己起客户端）
     async def embedded_console() -> None:
@@ -270,11 +343,14 @@ async def _run(mode: str, verbose: bool) -> None:
     finally:
         if console_task is not None and not console_task.done():
             console_task.cancel()
+        for t in list(conn_tasks.values()):
+            t.cancel()
         await server.stop()
         # 收尾限时：哪个频道断得慢都别拖住退出
         try:
             await asyncio.wait_for(
-                asyncio.gather(*(a.disconnect() for a in adapters), return_exceptions=True),
+                asyncio.gather(*(a.disconnect() for a in list(by_name.values())),
+                               return_exceptions=True),
                 timeout=5)
         except Exception:
             logger.exception("断开频道超时/出错，直接退出")

@@ -28,6 +28,10 @@ class CommandContext:
     set_thinking: Optional[Callable[[str], bool]] = None     # 落盘改档（保注释写 config.yml）
     status_extra: Optional[Callable[[], Sequence[str]]] = None   # /status 追加行（后端接状态）
     agent_run: bool = False                                 # run_command 工具跑的：走权限档
+    # 频道管理钩子（/connect //disconnect //channels；没有就降级说明）
+    connect_channel: Optional[Callable[[str], str]] = None
+    disconnect_channel: Optional[Callable[[str], str]] = None
+    channels_info: Optional[Callable[[], Sequence[str]]] = None
     # 控制台视图钩子（view 指令用；agent/聊天上下文里没有 → 降级说明）
     tail_logs: Optional[Callable[[int], Sequence[str]]] = None
     tail_history: Optional[Callable[[int], Sequence[dict]]] = None
@@ -176,11 +180,37 @@ def _stop(args: List[str], ctx: CommandContext) -> str:
     return "正在停：等这一轮收完、频道断开，就退了"
 
 
+def _channels(args: List[str], ctx: CommandContext) -> str:
+    if ctx.channels_info is None:
+        return "这个指令只能在控制台用"
+    lines = list(ctx.channels_info())
+    return "\n".join(lines) if lines else "（还没有频道：/connect weixin 之类建一个）"
+
+
+def _connect(args: List[str], ctx: CommandContext) -> str:
+    if not args:
+        return _channels(args, ctx)      # 无参 = 列出可接的频道和状态
+    if ctx.connect_channel is None:
+        return "这个指令只能在控制台用"
+    return ctx.connect_channel(args[0])
+
+
+def _disconnect(args: List[str], ctx: CommandContext) -> str:
+    if not args:
+        return "用法：/disconnect <频道>"
+    if ctx.disconnect_channel is None:
+        return "这个指令只能在控制台用"
+    return ctx.disconnect_channel(args[0])
+
+
 def _install_defaults() -> None:
     register("help", "列出可用指令", _help)
     register("home", "home [channel]  设置 home 频道（主动消息默认发这里；无参 = 设为当前频道）", _home)
     register("status", "看看状态（思考档位 / home / 频道）", _status)
     register("effort", "effort [档位]  看/调思考档位（none/low/medium/high/…）", _effort)
+    register("connect", "connect [频道]  连上频道（扫码/写自启；无参 = 列出频道）", _connect)
+    register("disconnect", "disconnect <频道>  停用频道（登录态保留，再连免扫码）", _disconnect)
+    register("channels", "列出频道与状态", _channels)
     # 控制台视图/管理指令（输出不落转录；agent 拿不到视图钩子会得到一句说明）
     register("logs", "logs [行数]  看最近的技术日志", _logs, surfaces=("console",), view=True)
     register("history", "history [行数]  翻控制台的旧账", _history, surfaces=("console",), view=True)

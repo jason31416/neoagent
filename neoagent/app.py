@@ -64,19 +64,8 @@ def build_agent(cfg: Config) -> AgentLoop:
     ))
     register_record_memory(registry)     # M 的记忆提案通道（异步入账，R 定稿）
 
-    # 指令工具：neoagent 自己也能跑指令（同一注册表、同一权限档；/stop 类不放行）
+    # 思考档位热源（/effort 改的就是它的配置文件）
     effort = ReasoningEffortSource(home=cfg.home, initial=cfg.llm.reasoning_effort)
-
-    def _cmd_ctx() -> CommandContext:
-        return CommandContext(
-            surface="chat",
-            home=ledger.get_setting("home"),
-            known_channels=cfg.channel_names(),
-            set_home=lambda ch: ledger.set_setting("home", ch),
-            thinking=effort(),
-            set_thinking=lambda v: save_config_value("model.thinking", v, home=cfg.home))
-
-    register_run_command(registry, ctx_factory=_cmd_ctx)
 
     # providers（供应商适配全部藏在 providers/ 后面）
     vision = make_vision()
@@ -109,6 +98,23 @@ def build_agent(cfg: Config) -> AgentLoop:
                       known_channels=cfg.channel_names(),
                       timeline_bucket=TIMELINE_BUCKET,   # 一条连续记录
                       workspace=workspace)
+
+    # 指令工具：neoagent 自己也能跑指令（同一注册表、同一权限档；/stop 类不放行）。
+    # 频道管理等钩子由入口（run.py）经 agent.channel_ops 注入，没有就降级说明。
+    def _cmd_ctx() -> CommandContext:
+        ops = getattr(agent, "channel_ops", None) or {}
+        return CommandContext(
+            surface="chat",
+            home=ledger.get_setting("home"),
+            known_channels=cfg.channel_names(),
+            set_home=lambda ch: ledger.set_setting("home", ch),
+            thinking=effort(),
+            set_thinking=lambda v: save_config_value("model.thinking", v, home=cfg.home),
+            connect_channel=ops.get("connect"),
+            disconnect_channel=ops.get("disconnect"),
+            channels_info=ops.get("info"))
+
+    register_run_command(registry, ctx_factory=_cmd_ctx)
 
     # R（Recorder）：记忆整理 + 上下文退役。与 M 共用 LLM 与预算，快慢同档。
     recorder = Recorder(llm, ledger, memory_dir,

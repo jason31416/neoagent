@@ -8,16 +8,34 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import secrets
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
 
 logger = logging.getLogger(__name__)
+
+# ----------------------------------------------------------------------
+# 输出口：扫码流程的提示（二维码/进度）。默认 print（终端直用）；
+# 服务形态 set_output 成"推进控制台转录"的函数，二维码就流进控制台。
+# ----------------------------------------------------------------------
+_out: Callable[..., None] = print
+
+
+def set_output(fn: Optional[Callable[..., None]]) -> None:
+    global _out
+    _out = fn or print
+
+
+def _dot() -> None:
+    """等待扫码的小数点（只在终端直用模式打；推控制台时静默不刷屏）。"""
+    if _out is print:
+        print(".", end="", flush=True)
 
 # ----------------------------------------------------------------------
 # 协议常量（来自 hermes 对 iLink 的逆向实现，腾讯无公开文档）
@@ -276,17 +294,19 @@ async def fetch_qr(session: aiohttp.ClientSession, bot_type: str = "3") -> Tuple
 
 
 def print_qr(qrcode_value: str, qrcode_url: str) -> None:
-    """终端打印二维码：优先 ASCII 渲染，渲染不了就给链接。"""
+    """输出二维码：优先 ASCII 渲染，渲染不了就给链接（走输出口，服务形态进控制台）。"""
     if qrcode_url:
-        print(f"二维码链接（打不开就直接用微信扫它）：\n{qrcode_url}\n")
+        _out(f"二维码链接（打不开就直接用微信扫它）：\n{qrcode_url}")
     try:
         import qrcode  # 可选依赖，没装就只给链接
         qr = qrcode.QRCode()
         qr.add_data(qrcode_url or qrcode_value)
         qr.make(fit=True)
-        qr.print_ascii(invert=True)
+        buf = io.StringIO()
+        qr.print_ascii(invert=True, out=buf)
+        _out(buf.getvalue().rstrip("\n"))
     except Exception as exc:
-        print(f"（终端二维码渲染失败：{exc}）")
+        _out(f"（终端二维码渲染失败：{exc}）")
 
 
 async def qr_login(data_dir: Path, *, bot_type: str = "3", timeout_seconds: int = 480) -> Optional[Dict[str, str]]:
@@ -302,7 +322,7 @@ async def qr_login(data_dir: Path, *, bot_type: str = "3", timeout_seconds: int 
             logger.error("二维码响应缺少 qrcode 字段")
             return None
 
-        print("\n请使用微信扫描以下二维码：")
+        _out("请使用微信扫描以下二维码：")
         print_qr(qrcode_value, qrcode_url)
 
         deadline = time.monotonic() + timeout_seconds
@@ -321,18 +341,18 @@ async def qr_login(data_dir: Path, *, bot_type: str = "3", timeout_seconds: int 
 
             status = str(resp.get("status") or "wait")
             if status == "wait":
-                print(".", end="", flush=True)
+                _dot()
             elif status == "scaned":
-                print("\n已扫码，请在微信里确认登录...")
+                _out("已扫码，请在微信里确认登录...")
             elif status == "scaned_but_redirect" and resp.get("redirect_host"):
                 # 集群重定向：换 base_url 继续轮询
                 current_base_url = f"https://{resp['redirect_host']}"
             elif status == "expired":
                 refresh_count += 1
                 if refresh_count > 3:
-                    print("\n二维码多次过期，请重新执行登录。")
+                    _out("二维码多次过期，请重新执行登录。")
                     return None
-                print(f"\n二维码已过期，正在刷新... ({refresh_count}/3)")
+                _out(f"二维码已过期，正在刷新... ({refresh_count}/3)")
                 qrcode_value, qrcode_url = await fetch_qr(session, bot_type)
                 print_qr(qrcode_value, qrcode_url)
             elif status == "confirmed":
@@ -346,11 +366,11 @@ async def qr_login(data_dir: Path, *, bot_type: str = "3", timeout_seconds: int 
                     logger.error("扫码确认但凭据不完整：%s", resp)
                     return None
                 save_account(data_dir, **creds)
-                print(f"\n微信连接成功，account_id={creds['account_id']}")
+                _out(f"微信连接成功，account_id={creds['account_id']}")
                 return creds
             await asyncio.sleep(1)
 
-        print("\n微信登录超时。")
+        _out("微信登录超时。")
         return None
 
 
