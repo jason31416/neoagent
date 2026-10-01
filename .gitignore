@@ -19,3 +19,4 @@ dist/
 
 # 临时便签
 tmp-todo.txt
+.DS_Store
