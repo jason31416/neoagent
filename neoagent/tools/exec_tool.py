@@ -20,7 +20,7 @@ import signal
 import time
 from typing import Any, Dict, List
 
-from .format import error, root
+from .format import ToolOutput, error, root
 from .registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -138,8 +138,12 @@ async def exec_command(args: Dict[str, Any]) -> str:
     if len(body) > policy.max_output_bytes:
         body = body[:policy.max_output_bytes]
         truncated = "true"
-    return root("exec", {"exit": proc.returncode, "elapsed": f"{elapsed:.1f}s",
-                         "truncated": truncated}, body)
+    t = f"{elapsed * 1000:.0f}ms" if elapsed < 0.1 else f"{elapsed:.1f}s"
+    return ToolOutput(
+        text=root("exec", {"exit": proc.returncode, "elapsed": f"{elapsed:.1f}s",
+                           "truncated": truncated}, body),
+        stat=f"exit {proc.returncode} {t}",
+        fields=[("time", t), ("exit", str(proc.returncode))])
 
 
 EXEC_SCHEMA = {

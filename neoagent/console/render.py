@@ -5,39 +5,38 @@
 - 不用装饰字符：无分割线、无图标、不用 · 分隔、不用 ›；箭头 → 可用；
 - 颜色只承担语义（复用 log.py 那套）：频道=青、neoagent=绿、说话人=粗白、
   时间/工具行=灰、正文=白（不着色）、系统=青、异常=黄/红；
-- 工具行：`时间 工具名 参数 → 结果摘要`，`+N` 绿 / `-N` 红（与日志同语义）；
+- 工具行：`时间 工具名 参数  数据字段…`——无箭头、无结果摘要；字段是结构化数据，
+  数字直接表述不带量词：`0.4s exit 0`（exit 0 绿/非 0 红）、`+38 -2`（+绿-红）、
+  `err denied`（红）；没有字段就光秃秃一行；
 - 同一渲染器出两版：转录存纯文本，TTY 客户端要色。
 """
 
 from __future__ import annotations
 
-import re
 import time
 from typing import Dict, List
 
 from ..log import bold, bold_cyan, bold_green, cyan, gray, green, red
-
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def strip_ansi(s: str) -> str:
-    return _ANSI_RE.sub("", s)
 
 
 def _hhmm(ts: float) -> str:
     return time.strftime("%H:%M", time.localtime(ts or time.time()))
 
 
-def _paint_stat(digest: str) -> str:
-    """结果摘要里的 +N/-N 带色（其余灰）——与日志的增减语义一致。"""
+def _fields(fields) -> str:
+    """数据字段 → 文本：语义定色（exit 0 绿/非0红、time 灰、+绿-红、err 红）。"""
     out = []
-    for tok in (digest or "").split(" "):
-        if re.match(r"\+\d", tok):
-            out.append(green(tok))
-        elif re.match(r"-\d", tok):
-            out.append(red(tok))
+    for tag, value in fields:
+        if tag == "exit":
+            out.append(gray("exit ") + (green(value) if str(value) == "0" else red(value)))
+        elif tag == "time":
+            out.append(gray(value))
+        elif tag == "delta":
+            out.append(green(value) if str(value).startswith("+") else red(value))
+        elif tag == "err":
+            out.append(red(f"err {value}"))
         else:
-            out.append(gray(tok))
+            out.append(gray(value))
     return " ".join(out)
 
 
@@ -61,10 +60,9 @@ def render(ev: Dict, color: bool = True) -> str:
         if kind == "tool":
             name = bold_cyan(ev.get("tool", ""))
             args = gray(ev.get("args", ""))
-            digest = _paint_stat(strip_ansi(ev.get("digest", "")))
+            fields = _fields(ev.get("fields") or [])
             mid = f"{name} {args}".strip()
-            tail = f" → {digest}" if digest else ""
-            return f"{ts} {mid}{tail}"
+            return f"{ts} {mid}" + (f"  {fields}" if fields else "")
         if kind == "notice":
             return f"{ts} {gray(ev.get('text', ''))}"
         # msg（对话与指令回执）

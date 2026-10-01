@@ -18,8 +18,26 @@ kind 名单（固定，不随意添）：
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+
+@dataclass
+class ToolOutput:
+    """工具结果：给模型的文字 + 可选图片 + 面向日志/控制台的元数据。
+
+    - text：给模型看的 XML 骨架；
+    - images：图片路径（核心读字节/落 blob；read_file 读图用）；
+    - stat：日志摘要（"+2 行 -1 行"），模型看不到，只进日志；
+    - fields：控制台工作行的**结构化字段** [(语义, 值)]——数据在构造处就是字段，
+      渲染端不做任何文本解析。语义与样式：("exit","0") 绿/非0红、("time","0.4s") 灰、
+      ("delta","+38") +绿-红、("err","denied") 红。
+    """
+    text: str = ""
+    images: List[str] = field(default_factory=list)
+    stat: str = ""
+    fields: List[Tuple[str, str]] = field(default_factory=list)
 
 
 def _attrs_str(attrs: Dict[str, Any]) -> str:
@@ -37,10 +55,14 @@ def root(name: str, attrs: Dict[str, Any], body: str = "") -> str:
     return f"<{name}{a}>\n{body}\n</{name}>" if body else f"<{name}{a}/>"
 
 
-def error(kind: str, message: str, body: str = "") -> str:
-    """统一错误形状：kind + 一句话（建议揉在话里）+ 数据块（如有）。"""
-    return (f'<error kind="{kind}">{message}\n{body}\n</error>'
+def error(kind: str, message: str, body: str = "") -> ToolOutput:
+    """统一错误形状：kind + 一句话 + 数据块（如有）。
+
+    控制台工作行按字段画 `err <kind>`；正文原因只进日志/模型。
+    """
+    text = (f'<error kind="{kind}">{message}\n{body}\n</error>'
             if body else f'<error kind="{kind}">{message}</error>')
+    return ToolOutput(text=text, fields=[("err", kind)])
 
 
 def numbered(lines: List[str], start: int) -> str:

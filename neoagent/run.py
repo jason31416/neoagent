@@ -28,7 +28,7 @@ from .control import ClientConn, ControlServer, control_alive
 from .core import commands
 from .core.channel import ChannelAdapter
 from .core.events import Conversation, MessageEvent, SendResult, Sender
-from .log import bold_cyan, bold_green, gray, setup_logging, strip_ansi
+from .log import bold_cyan, bold_green, gray, setup_logging
 
 logger = logging.getLogger("neoagent")
 
@@ -102,20 +102,32 @@ async def _run(mode: str, verbose: bool) -> None:
     conn_tasks: dict[str, asyncio.Task] = {}   # 连接在飞的（扫码等待也算）
     last_events: dict[str, MessageEvent] = {}
 
-    # ---- 控制台转录：工具工作行（M 的工具才有；R 的整理细节进日志不进控制台）
-    def tool_observer(part: str, name: str, args: dict, stat: str, result: str) -> None:
+    # ---- 控制台转录：工具工作行（M 的工具才有；R 的整理细节进日志不进控制台）。
+    # 行形：时间 工具名 参数  数据字段…——无箭头无结果摘要，字段是结构化数据
+    # （exec: 0.4s exit 0；写类: +38 -2；失败: err denied），数字直接表述不带量词。
+    def _args_line(args: dict) -> str:
+        items = list((args or {}).items())
+        if len(items) == 1:
+            s = str(items[0][1])
+        else:
+            s = " ".join(f"{k}={v}" for k, v in items)
+        return s if len(s) <= 60 else s[:57] + "…"
+
+    def tool_observer(part: str, name: str, args: dict, output) -> None:
         if part != "messenger":
             return
         if name == "run_command":
-            label = str(args.get("command") or "").strip()
-            args_s = ""
-        else:
-            label = name
-            args_s = " ".join(f"{k}={v}" for k, v in (args or {}).items())
-            if len(args_s) > 60:
-                args_s = args_s[:57] + "…"
-        digest = strip_ansi(stat) or ((result or "").splitlines() or [""])[0][:30]
-        server.broadcast({"kind": "tool", "tool": label, "args": args_s, "digest": digest})
+            # agent 自调指令：指令行 + 完整工具返回（与用户敲指令的回执同形）
+            server.broadcast({"kind": "tool",
+                              "tool": str(args.get("command") or "").strip(),
+                              "args": "", "fields": []})
+            text = (getattr(output, "text", "") or "").strip()
+            if text:
+                server.broadcast({"kind": "msg", "channel": "", "speaker": "系统",
+                                  "text": text})
+            return
+        server.broadcast({"kind": "tool", "tool": name, "args": _args_line(args),
+                          "fields": [[k, v] for k, v in (getattr(output, "fields", None) or [])]})
 
     agent.registry.observer = tool_observer
 

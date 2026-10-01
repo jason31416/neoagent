@@ -236,7 +236,8 @@ class FileKit:
         if mode == "overwrite":
             attrs["old_lines"] = old_lines
         return ToolOutput(text=root("write_file", attrs, "已写入"),
-                          stat=f"{green('+' + str(new_lines))} 行")
+                          stat=f"{green('+' + str(new_lines))} 行",
+                          fields=[("delta", f"+{new_lines}")])
 
     # ------------------------------------------------------------------
     # patch_file
@@ -266,7 +267,9 @@ class FileKit:
         path.write_text(new_text, encoding="utf-8")
         return ToolOutput(text=root("patch_file", dict({"path": display}, **info), "已修改"),
                           stat=f"{green('+' + str(info['added']))} "
-                               f"{red('-' + str(info['removed']))} 行")
+                               f"{red('-' + str(info['removed']))} 行",
+                          fields=[("delta", f"+{info['added']}"),
+                                  ("delta", f"-{info['removed']}")])
 
     # ------------------------------------------------------------------
     # delete_file / move_file（只给 R 注册：M 的删改走 exec）

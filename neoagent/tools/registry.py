@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Union
 
 from ..log import bold_cyan, gray
-from .format import error
+from .format import ToolOutput, error   # ToolOutput 从 format 再导出（老 import 路径不变）
 
 logger = logging.getLogger(__name__)
 
@@ -24,16 +24,6 @@ def clip_tool_result(text: str) -> str:
     """工具结果截断（超长截尾）：M/R 共用同一上限、同一形状。"""
     return text if len(text) <= TOOL_RESULT_MAX \
         else text[:TOOL_RESULT_MAX] + "\n…（输出过长已截断）"
-
-
-@dataclass
-class ToolOutput:
-    """工具结果：文字 + 可选图片（read_file 读图——OpenAI 协议下 tool 消息可带图，
-    实测 DeepSeek 收；图片走"工具结果信封"进当轮上下文并落账）。"""
-    text: str = ""
-    images: List[str] = field(default_factory=list)   # 图片路径（核心读字节/落 blob）
-    stat: str = ""        # 日志摘要（"+2 行 -1 行" / "读 12 行"）；模型看不到，只进日志。
-                          # 增删数字由构造处显式着色（green(+N)/red(-N)，非 TTY 纯文本）
 
 
 def _args_preview(args: Dict[str, Any]) -> str:
@@ -65,7 +55,8 @@ class ToolRegistry:
         日志里标全称。"""
         self.part = part
         self._tools: Dict[str, ToolEntry] = {}
-        # 工具观察者（控制台工作行用）：(part, name, args, stat, result_text)；
+        # 工具观察者（控制台工作行用）：(part, name, args, ToolOutput)——
+        # fields 是结构化字段（格式见 format.ToolOutput），渲染端不解析文本；
         # 内部消化异常，绝不影响工具执行
         self.observer = None
 
@@ -110,8 +101,8 @@ class ToolRegistry:
                      gray(f"（{len(text)} 字符）"), gray(text[:500]))
         if self.observer is not None:
             try:
-                self.observer(self.part, name, args,
-                              (out.stat if isinstance(out, ToolOutput) else "") or "", text)
+                norm = out if isinstance(out, ToolOutput) else ToolOutput(text=text)
+                self.observer(self.part, name, args, norm)
             except Exception:
                 logger.exception("工具观察者出错")
         return out
