@@ -327,7 +327,6 @@ async def qr_login(data_dir: Path, *, bot_type: str = "3", timeout_seconds: int 
 
         deadline = time.monotonic() + timeout_seconds
         current_base_url = ILINK_BASE_URL
-        refresh_count = 0
         while time.monotonic() < deadline:
             try:
                 resp = await _api_get(session, base_url=current_base_url,
@@ -348,13 +347,9 @@ async def qr_login(data_dir: Path, *, bot_type: str = "3", timeout_seconds: int 
                 # 集群重定向：换 base_url 继续轮询
                 current_base_url = f"https://{resp['redirect_host']}"
             elif status == "expired":
-                refresh_count += 1
-                if refresh_count > 3:
-                    _out("二维码多次过期，请重新执行登录。")
-                    return None
-                _out(f"二维码已过期，正在刷新... ({refresh_count}/3)")
-                qrcode_value, qrcode_url = await fetch_qr(session, bot_type)
-                print_qr(qrcode_value, qrcode_url)
+                # 不自动刷新：过期就停，由用户重新发起登录取新码
+                _out("二维码已过期。重新 /connect weixin 取个新的。")
+                return None
             elif status == "confirmed":
                 creds = {
                     "account_id": str(resp.get("ilink_bot_id") or ""),
