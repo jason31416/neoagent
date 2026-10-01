@@ -21,7 +21,8 @@ import uuid
 from pathlib import Path
 
 from .app import build_agent
-from .config import ChannelConfig, Config, load_config, save_channel, save_config_value
+from .config import (ChannelConfig, Config, load_channels, load_config,
+                     save_channel, save_config_value)
 from .console.client import run_client
 from .console.transcript import ConsoleTranscript
 from .control import ClientConn, ControlServer, control_alive
@@ -215,7 +216,14 @@ async def _run(mode: str, verbose: bool) -> None:
         t = conn_tasks.get(name)
         return t is not None and not t.done()
 
+    def _reload_channels() -> None:
+        """频道配置以文件为准：手改 yml 后 /connect //disconnect //status 立刻认新值
+        （"编辑 yml 再 /connect" 的指引要真的生效）。"""
+        cfg.channels = load_channels(cfg.home)
+        agent.known_channels = tuple(cfg.channel_names())
+
     def op_connect(name: str) -> str:
+        _reload_channels()
         ch = next((c for c in cfg.channels if c.name == name), None)
         if ch is None:
             if name not in ("weixin", "feishu"):
@@ -233,6 +241,7 @@ async def _run(mode: str, verbose: bool) -> None:
         return f"{name} 连接中（要扫码的话二维码马上来）"
 
     def op_disconnect(name: str) -> str:
+        _reload_channels()
         ch = next((c for c in cfg.channels if c.name == name), None)
         ad = by_name.pop(name, None)
         task = conn_tasks.pop(name, None)
@@ -256,6 +265,7 @@ async def _run(mode: str, verbose: bool) -> None:
         return f"{name} 停用中（登录态保留，再 /connect 不用扫码）"
 
     def op_channels() -> list:
+        _reload_channels()
         out = []
         for ch in cfg.channels:
             if ch.name in by_name:
