@@ -1,75 +1,104 @@
 # neoagent · 最简样例
 
-技术栈可行性 demo：**接入微信 / 飞书，能收消息、调工具、回消息**。
-产品文档中的 M/E/R、记忆、cron/proactive 等均不在本样例范围内（见 `docs/最简样例-实施计划.md`）。
+技术栈可行性 demo：**接入微信 / 飞书，能收消息、调工具、回消息**，外加一个 MC 服务器式的控制台。
+产品文档中的 M/E/R、cron/proactive 等均不在本样例范围内（见 `docs/最简样例-实施计划.md`）。
 
 ## 它能做什么
 
 - 在**微信**里和它说话（腾讯官方 iLink Bot API，扫码登录，无封号风险）
 - 在**飞书**里和它说话（官方 lark-oapi SDK，WebSocket 长连接）
+- 在**控制台**里和它说话、看它干活（全频道对话 + 每次工具调用一行，转录持久化）
 - 它能调用工具干活：`read_file`（读文件）/ `write_file`（写文件）/ `exec`（跑命令）
+  / `run_command`（跑 neoagent 自己的指令）
 - 干完把结果用聊天消息回给你（OpenAI 兼容 tool calling 循环，当前接 DeepSeek）
 
 ## 快速开始
 
 ```bash
-uv sync                        # 装依赖（飞书另需 uv sync --extra feishu）
-cp config.example.toml config.toml   # 填 LLM api_key 等
+uv sync                 # 装依赖（飞书另需 uv sync --extra feishu）
 
-# 1. 微信扫码登录（凭据落在 data/weixin/，之后不用再扫）
-uv run python -m neoagent.channels.weixin.login
-
-# 2. 启动服务（按 config.toml 里 channels.*.enabled 起通道）
+# 启动：一体化（服务 + 控制台）。第一次自动生成 ~/.neoagent/ 配置骨架
 uv run python -m neoagent.run
+#   然后三步：1) ~/.neoagent/config.yml 填 model.api_key
+#             2) 控制台里 /connect weixin 扫码（飞书手写 channels/feishu.yml）
+#             3) 回来说话（聊天里说，或控制台裸输入 = channel=cli）
 
-# 也可以先在终端里试（不接 IM）
-uv run python -m neoagent.cli
+# 服务挂后台（launchd/systemd 收日志），控制台随时连上
+uv run python -m neoagent.run serve      # 无头服务
+uv run python -m neoagent.run console    # 只开控制台（别名 tui），多终端可同时连
+
+# 老仓库（config.toml + data/）一次迁移进 ~/.neoagent/
+uv run python -m neoagent.convert
 ```
+
+控制台里 `/` 开头 = 指令（和聊天里同语法：`/help /home /status /effort /connect …`），
+裸输入 = 跟它说话；`/stop` 停服务，Ctrl-C 在 attach 的控制台里只是断开自己。
 
 ## 架构
 
 ```
 微信用户 ──iLink Bot API(官方)──► weixin-adapter ─┐
 飞书用户 ──lark-oapi SDK(WS)───► feishu-adapter ─┼─► MessageEvent 归一化
-CLI      ───────────────────────────────────────┘        │
+控制台   ──control.sock（转录/实时流，可 attach）─┘        │
                                                           ▼
                                                    agent 循环（DeepSeek / OpenAI 兼容）
                                                           │
-                                                   工具：read_file / write_file / exec
+                                       工具：read_file / write_file / exec / run_command
                                                           ▼
-                                                   回复按原通道返回
+                                            回复按气泡的 channel 路由回原频道/控制台
 ```
 
-- **通道与核心解耦**：适配器只做"消息 ↔ MessageEvent"，agent 核心不知道自己挂在哪个 IM 上（同一核心、多通道）。将来产品文档里的 M（唯一的声音）就落在核心层。
+- **通道与核心解耦**：适配器只做"消息 ↔ MessageEvent"，agent 核心不知道自己挂在哪个 IM 上（同一核心、多通道、同一条连续记录）。将来产品文档里的 M（唯一的声音）就落在核心层。
+- **前端无关内核**：账本（模型上下文真值）/ 控制台转录（用户看到过什么）/ 日志（排障全量）三层分开；控制台只是第一个客户端，网页将来可作第二客户端接同一转录流。
+- **指令一套注册表两个前端**：聊天回执是 system 真气泡（可引用、不进模型回合），控制台回执是打印行；agent 也能跑指令（`run_command` 工具，权限档 + 审计工作行）。
 - **工具是注册制**：JSON Schema + handler，加新工具不需要动 agent 循环。
 - **消息库 = 完整上下文存储**（SQLite 全量落盘）：对话、工具流水、内部消息一行一条，重启不丢；LLM 上下文每次现渲染，按 token 预算裁剪（增量缓存，大块只算一次）。
 - **多消息输出**：模型用 `<message>…</message>` 包住每条要说的话，可连发多条、可干活中途先说一句、也可保持静默；一条气泡 = 一条可被引用的消息。
-- **记忆由 R（Recorder）整理**：记忆的唯一写者（M 只读注入 `data/memory/memory.md`）。对话停顿时把值得长存的事实写进记忆库、判断上下文切点（旧上下文退役、被引用时仍可回补）；M 随时可用 `record_memory` 提案要记的内容（异步入账，R 定稿）。设计见 `docs/设计-R记忆海马体.md`。
+- **记忆由 R（Recorder）整理**：记忆的唯一写者（M 只读注入 `memory.md`）。对话停顿时把值得长存的事实写进记忆库、判断上下文切点（旧上下文退役、被引用时仍可回补）；M 随时可用 `record_memory` 提案要记的内容（异步入账，R 定稿）。设计见 `docs/设计-R记忆海马体.md`。
 - **请求现场可查**：M/R 每次模型请求的 messages 落盘到 `data/modellog/`（每会话一份 md，覆盖更新、只留最新一次请求），"当时到底发了什么"以它为准；`modellog_dir` 置空关闭。
+
+## 配置（~/.neoagent/）
+
+```
+~/.neoagent/
+├── config.yml        # model / personality / memory / limits / advanced（带注释）
+├── channels/         # 一个频道一个 yml：kind + enabled + 凭据（/connect 会生成）
+├── prompts/          # 人设（首启从包内拷入，改你自己的那份，升级不被冲）
+├── logs/latest.log   # 技术日志（控制台不刷屏；/logs 50 现场调看）
+└── data/             # 账本、转录、记忆、工作台、登录态、control.sock
+```
+
+指令热改（`/effort`、`/connect`…）和手改文件殊途同归：程序写回用 ruamel 保注释，
+生效值单源头。密钥可走环境变量 `NEOAGENT_LLM_API_KEY` 等，不落盘。
 
 ## 安全边界（demo 也必须有）
 
-IM 里的 LLM 等于拿着一台 shell，三道防线都在 `config.toml` 里可调：
+IM 里的 LLM 等于拿着一台 shell，三道防线都在 `config.yml` 的 `advanced.safety` 里可调：
 
 | 工具 | 防线 |
 |---|---|
-| `read_file` / `write_file` | `files.allowed_roots` 路径白名单（防越界，实测会拦 + 模型自纠） |
+| `read_file` / `write_file` | `files_roots` 路径白名单（防越界，实测会拦 + 模型自纠） |
 | `exec` | cwd 白名单 + 危险命令正则拒绝 + 超时强杀（60s）+ 输出截断（20KB） |
+| `run_command` | 指令权限档（`/stop` 禁）+ 每次执行留审计；指令本身不碰文件边界 |
 
-⚠️ `exec.deny_patterns` 只是兜底，真正的边界是把 `allowed_roots` 限制在你的工作目录里。
+⚠️ `deny_patterns` 只是兜底，真正的边界是把 `files_roots`/`exec_roots` 限制在你的工作目录里。
 
 ## 目录结构
 
 ```
 neoagent/
-├── core/          MessageEvent / ChannelAdapter / LLM 客户端 / agent 循环 / Recorder
+├── core/          MessageEvent / ChannelAdapter / LLM 客户端 / agent 循环 / Recorder / 指令注册表
 ├── channels/
 │   ├── weixin/    iLink Bot API 协议层 + 适配器 + 扫码登录
 │   └── feishu/    lark-oapi 适配器
-├── tools/         工具注册表 + read_file / write_file / exec / record_memory / 记忆工具组
+├── tools/         工具注册表 + read_file / write_file / exec / record_memory / run_command / 记忆工具组
+├── console/       控制台：渲染（朴素规则）/ 转录存储 / prompt_toolkit 客户端
+├── control.py     控制协议（本机 socket：转录回放 + 实时事件 + 输入）
+├── config.py      配置加载（yml + channels/*.yml + 保注释写回）
+├── convert.py     老配置迁移（config.toml + data/ → ~/.neoagent/）
 ├── app.py         组装（配置 → 工具 → agent + Recorder）
-├── run.py         服务入口
-└── cli.py         终端入口（M0 验证载体）
+├── run.py         入口（一体化 / serve / console 三形态）
+└── cli.py         终端 REPL（M0 验证载体，控制台的前身）
 ```
 
 ## 参考实现

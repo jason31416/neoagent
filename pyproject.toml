@@ -16,7 +16,7 @@ dependencies = [
 feishu = ["lark-oapi>=1.3"]  # 飞书官方 SDK（WebSocket 长连接）
 
 [project.scripts]
-neoagent = "neoagent.cli:main"
+neoagent = "neoagent.run:main"
 
 [build-system]
 requires = ["setuptools>=68"]
