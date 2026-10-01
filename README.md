@@ -26,9 +26,6 @@ uv run python -m neoagent.run
 # 服务挂后台（launchd/systemd 收日志），控制台随时连上
 uv run python -m neoagent.run serve      # 无头服务
 uv run python -m neoagent.run console    # 只开控制台（别名 tui），多终端可同时连
-
-# 老仓库（config.toml + data/）一次迁移进 ~/.neoagent/
-uv run python -m neoagent.convert
 ```
 
 控制台里 `/` 开头 = 指令（和聊天里同语法：`/help /home /status /effort /connect …`），
@@ -95,7 +92,6 @@ neoagent/
 ├── console/       控制台：渲染（朴素规则）/ 转录存储 / prompt_toolkit 客户端
 ├── control.py     控制协议（本机 socket：转录回放 + 实时事件 + 输入）
 ├── config.py      配置加载（yml + channels/*.yml + 保注释写回）
-├── convert.py     老配置迁移（config.toml + data/ → ~/.neoagent/）
 ├── app.py         组装（配置 → 工具 → agent + Recorder）
 ├── run.py         入口（一体化 / serve / console 三形态）
 └── cli.py         终端 REPL（M0 验证载体，控制台的前身）

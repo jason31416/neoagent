@@ -358,17 +358,14 @@ def load_config(home: Optional[Path] = None) -> Config:
 
     cfg.channels = load_channels(home)
 
-    # 环境变量覆盖（密钥走这里更安全；旧名兼容）
+    # 环境变量覆盖（密钥走这里更安全）
     cfg.llm.api_key = os.environ.get("NEOAGENT_LLM_API_KEY", cfg.llm.api_key)
     cfg.llm.base_url = os.environ.get("NEOAGENT_LLM_BASE_URL", cfg.llm.base_url)
     cfg.llm.model = os.environ.get("NEOAGENT_LLM_MODEL", cfg.llm.model)
-    cfg.llm.reasoning_effort = os.environ.get(
-        "NEOAGENT_LLM_THINKING",
-        os.environ.get("NEOAGENT_LLM_REASONING_EFFORT", cfg.llm.reasoning_effort))
+    cfg.llm.reasoning_effort = os.environ.get("NEOAGENT_LLM_THINKING", cfg.llm.reasoning_effort)
     cfg.asr.api_key = os.environ.get("NEOAGENT_ASR_API_KEY", cfg.asr.api_key)
-    cfg.recorder.reasoning_effort = os.environ.get(
-        "NEOAGENT_MEMORY_TIDY_THINKING",
-        os.environ.get("NEOAGENT_RECORDER_REASONING_EFFORT", cfg.recorder.reasoning_effort))
+    cfg.recorder.reasoning_effort = os.environ.get("NEOAGENT_MEMORY_TIDY_THINKING",
+                                                   cfg.recorder.reasoning_effort)
     # 飞书凭据按 kind 覆盖到每个飞书频道（多开也吃得下）
     feishu_env = {k.split("__", 1)[0][len("NEOAGENT_FEISHU_"):].lower(): v
                   for k, v in os.environ.items() if k.startswith("NEOAGENT_FEISHU_")}
