@@ -77,24 +77,27 @@ async def _run(mode: str, verbose: bool) -> None:
     if mode in ("console", "tui"):
         setup_logging(file_path=log_file, stderr=verbose, color_stream=sys.stdout)
         if not control_alive(sock):
-            raise SystemExit(f"服务没在跑：先 `neoagent` 或 `neoagent serve`（{sock} 不通）")
+            raise SystemExit(f"服务没在跑，请先 `neoagent` 或 `neoagent serve`（{sock} not found）")
         await run_client(sock, home=str(cfg.home))
         return
 
     # ---- 一体化：服务已在跑 → 降级 attach（永不双开）
     if mode != "serve" and control_alive(sock):
-        print("服务已经在跑，帮你连上控制台。")
+        print("服务已经在跑，帮你连上控制台")
         await run_client(sock, home=str(cfg.home))
         return
 
     headless = mode == "serve" or not sys.stdin.isatty()
     if not headless:
-        print("neoagent启动中")   # 装配+频道连接期间别让用户对着黑屏干等
+        print("Loading neoagent TUI...")
+    else:
+        print("Loading neoagent server...")
     setup_logging(file_path=log_file, stderr=(headless or verbose),
                   color_stream=sys.stdout)
 
     agent = build_agent(cfg)
-    transcript = ConsoleTranscript(cfg.data_dir / "neoagent.db")
+    ConsoleTranscript.drop_stored(cfg.data_dir / "neoagent.db")   # 旧版落盘转录：一次性清掉
+    transcript = ConsoleTranscript()
     stop_event = asyncio.Event()
 
     scheduler = getattr(agent, "recorder_scheduler", None)
@@ -304,7 +307,6 @@ async def _run(mode: str, verbose: bool) -> None:
             disconnect_channel=op_disconnect,
             channels_info=op_channels,
             tail_logs=tail_logs,
-            tail_history=transcript.recent,
             reply_rows=lambda rows: server.reply_rows(conn, list(rows)),
             get_quiet=lambda: conn.quiet,
             set_quiet=lambda on: setattr(conn, "quiet", on),
@@ -384,11 +386,17 @@ async def _run(mode: str, verbose: bool) -> None:
         except Exception:
             logger.exception("断开频道超时/出错，直接退出")
 
+def _version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("neoagent")
+    except Exception:
+        return "?"
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="neoagent",
-        description="neoagent：IM（微信/飞书）+ 工具调用闭环的个人助手服务")
+        description="neoagent：你的个人助手服务")
     parser.add_argument("mode", nargs="?", default="",
                         choices=["", "serve", "console", "tui"],
                         help="serve=无头服务 / console(tui)=只开控制台 / 不写=一体化")

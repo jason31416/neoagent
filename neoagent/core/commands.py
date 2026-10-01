@@ -34,7 +34,6 @@ class CommandContext:
     channels_info: Optional[Callable[[], Sequence[str]]] = None
     # 控制台视图钩子（view 指令用；agent/聊天上下文里没有 → 降级说明）
     tail_logs: Optional[Callable[[int], Sequence[str]]] = None
-    tail_history: Optional[Callable[[int], Sequence[dict]]] = None
     reply_rows: Optional[Callable[[Sequence[dict]], None]] = None
     get_quiet: Optional[Callable[[], bool]] = None
     set_quiet: Optional[Callable[[bool], None]] = None
@@ -156,16 +155,6 @@ def _logs(args: List[str], ctx: CommandContext) -> str:
     return "\n".join(lines) if lines else "（日志是空的）"
 
 
-def _history(args: List[str], ctx: CommandContext) -> str:
-    if ctx.tail_history is None or ctx.reply_rows is None:
-        return "这个指令只能在控制台用"
-    rows = ctx.tail_history(_int_arg(args, 100))
-    if not rows:
-        return "（转录是空的）"
-    ctx.reply_rows(rows)      # 客户端自己渲染（带色）
-    return ""
-
-
 def _quiet(args: List[str], ctx: CommandContext) -> str:
     if ctx.set_quiet is None:
         return "这个指令只能在控制台用"
@@ -213,7 +202,6 @@ def _install_defaults() -> None:
     register("channels", "列出频道与状态", _channels)
     # 控制台视图/管理指令（输出不落转录；agent 拿不到视图钩子会得到一句说明）
     register("logs", "logs [行数]  看最近的技术日志", _logs, surfaces=("console",), view=True)
-    register("history", "history [行数]  翻控制台的旧账", _history, surfaces=("console",), view=True)
     register("quiet", "隐藏/显示工作行（工具调用那些）", _quiet, surfaces=("console",), view=True)
     register("stop", "停服务（等回合收完、断频道、退）", _stop, surfaces=("console",), agent_ok=False)
 

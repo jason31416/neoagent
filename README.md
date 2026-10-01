@@ -7,7 +7,7 @@
 
 - 在**微信**里和它说话（腾讯官方 iLink Bot API，扫码登录，无封号风险）
 - 在**飞书**里和它说话（官方 lark-oapi SDK，WebSocket 长连接）
-- 在**控制台**里和它说话、看它干活（全频道对话 + 每次工具调用一行，转录持久化）
+- 在**控制台**里和它说话、看它干活（全频道对话 + 每次工具调用一行，转录只存内存、重启即清）
 - 它能调用工具干活：`read_file`（读文件）/ `write_file`（写文件）/ `exec`（跑命令）
   / `run_command`（跑 neoagent 自己的指令）
 - 干完把结果用聊天消息回给你（OpenAI 兼容 tool calling 循环，当前接 DeepSeek）
@@ -62,7 +62,7 @@ uv run python -m neoagent.run console    # 只开控制台（别名 tui），多
 ├── channels/         # 一个频道一个 yml：kind + enabled + 凭据（/connect 会生成）
 ├── prompts/          # 人设（首启从包内拷入，改你自己的那份，升级不被冲）
 ├── logs/latest.log   # 技术日志（控制台不刷屏；/logs 50 现场调看）
-└── data/             # 账本、转录、记忆、工作台、登录态、control.sock
+└── data/             # 账本、记忆、工作台、登录态、control.sock
 ```
 
 指令热改（`/effort`、`/connect`…）和手改文件殊途同归：程序写回用 ruamel 保注释，
@@ -89,7 +89,7 @@ neoagent/
 │   ├── weixin/    iLink Bot API 协议层 + 适配器 + 扫码登录
 │   └── feishu/    lark-oapi 适配器
 ├── tools/         工具注册表 + read_file / write_file / exec / record_memory / run_command / 记忆工具组
-├── console/       控制台：渲染（朴素规则）/ 转录存储 / prompt_toolkit 客户端
+├── console/       控制台：渲染（朴素规则）/ 转录缓冲 / prompt_toolkit 客户端
 ├── control.py     控制协议（本机 socket：转录回放 + 实时事件 + 输入）
 ├── config.py      配置加载（yml + channels/*.yml + 保注释写回）
 ├── app.py         组装（配置 → 工具 → agent + Recorder）
