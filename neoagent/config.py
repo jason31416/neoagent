@@ -1,19 +1,42 @@
-"""配置加载。
+"""配置：~/.neoagent/ 下的 yml（人看的）+ channels/*.yml（每频道一个）。
 
-优先级：环境变量 NEOAGENT_* > config.toml > 默认值。
-密钥放 config.toml（已 gitignore）或环境变量，绝不写死在代码里。
+布局（NEOAGENT_HOME 或 --home 可指到别处）：
+
+    ~/.neoagent/
+    ├── config.yml        总配置（model / personality / memory / limits / advanced）
+    ├── channels/         每频道一个 yml，文件名 = 频道名（时间线 channel 值）
+    ├── prompts/          人设等（首启从包内拷入，用户改、升级不冲）
+    ├── logs/             日志（排障用，基本没人看）
+    └── data/             账本、转录、记忆、工作台、登录态
+
+优先级：环境变量 NEOAGENT_* > config.yml > 默认值。密钥可不落盘。
+配置写回（/effort、/connect 等指令）走 ruamel 保注释——改文件和改指令殊途同归。
+相对路径一律相对家目录解析。
 """
 
 from __future__ import annotations
 
 import os
-import tomllib
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List, Optional
 
-# 项目根目录（neoagent/ 包的上一级）
+from ruamel.yaml import YAML
+
+# 源码/安装目录：内置 prompts 与配置骨架从这里拷
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PACKAGE_DIR = Path(__file__).resolve().parent
+
+# 内置频道（控制台），不占 channels/*.yml
+BUILTIN_CHANNELS = ("cli",)
+
+
+def home_dir() -> Path:
+    """配置家目录：NEOAGENT_HOME > ~/.neoagent。"""
+    env = os.environ.get("NEOAGENT_HOME", "").strip()
+    base = Path(env) if env else Path("~/.neoagent")
+    return base.expanduser().resolve()
 
 
 @dataclass
@@ -21,8 +44,8 @@ class LLMConfig:
     base_url: str = "https://api.deepseek.com"
     api_key: str = ""
     model: str = "deepseek-chat"
-    # 思考档位（OpenAI 标准参数 reasoning_effort）：
-    # "none" 关思考 | "minimal/low/medium/high/xhigh/ultra/max" 开思考 | "" = 不传（用服务端默认）
+    # 思考档位（OpenAI 标准参数 reasoning_effort，用户面叫 thinking）：
+    # "none" 关思考 | "minimal/low/medium/high/xhigh/ultra/max" 开思考 | "" 不传
     reasoning_effort: str = "medium"
 
 
@@ -31,24 +54,22 @@ class AgentConfig:
     max_tool_rounds: int = 12
     history_token_budget: int = 250_000  # 时间线 token 预算（成组抛弃，召回不计）
     image_token_estimate: int = 1024     # 每张图估算 token（计数器用）
-    memory_file: str = "data/MEMORY.md"  # 旧记忆文件（仅用于一次性迁移到 recorder 的 memory_dir）
-    identity_file: str = "neoagent/prompts/messenger.md"   # 系统提示词（core/prompts/）
+    identity_file: str = "prompts/messenger.md"   # 人设（相对家目录）
     workspace: str = "data/workspace"    # 工作台：exec 默认 cwd、相对路径基准、产出物落脚点
-    # 模型请求上下文落盘（M/R 共用，调试用）：每会话一份 md、只留最新一次请求，
-    # 置空关闭
+    # 模型请求上下文落盘（调试用）：置空关闭
     modellog_dir: str = "data/modellog"
-    # 气泡连发间隔（秒）：多条消息发送之间的随机停顿（真实感 + 给阅读时间），0 = 不间隔
-    bubble_gap_min: float = 1.5
-    bubble_gap_max: float = 2.5
+    # 气泡连发间隔（秒）：多条消息之间的随机停顿（真实感 + 给阅读时间），0 = 不间隔
+    bubble_gap_min: float = 0.5
+    bubble_gap_max: float = 1.5
 
 
 @dataclass
 class RecorderConfig:
-    """R（Recorder）——记忆整理模块：记忆的唯一写者 + 上下文退役的判断者。"""
-    memory_dir: str = "data/memory"        # 记忆库：memory.md（注入 M）+ 子文件 + old/ 归档
-    pause_debounce_seconds: int = 150      # 快整理延迟：任务执行收工后静默这么久才整理
-    slow_interval: int = 86400          # 慢周期整理的节律
-    slow_lookback_days: int = 7            # 慢周期回看起点（天）
+    """记忆整理：记忆的唯一写者 + 上下文退役的判断者（内部模块，配置面叫 memory）。"""
+    memory_dir: str = "data/memory"        # 记忆库：memory.md + 子文件 + old/ 归档
+    pause_debounce_seconds: int = 150      # 快整理延迟：任务收工后静默这么久才整理
+    slow_interval: int = 86400             # 定期整理的节律
+    slow_lookback_days: int = 7            # 定期整理回看起点（天）
     max_tool_rounds: int = 12              # 一次整理跑的工具轮上限
     reasoning_effort: str = "medium"       # 整理用的思考档位（快慢同档）
 
@@ -72,31 +93,30 @@ class AsrConfig:
 
 @dataclass
 class FilesConfig:
-    allowed_roots: List[str] = field(default_factory=lambda: [str(PROJECT_ROOT)])
+    allowed_roots: List[str] = field(default_factory=lambda: ["~"])
 
 
 @dataclass
 class ExecConfig:
     timeout_seconds: int = 60
     max_output_bytes: int = 20000
-    allowed_roots: List[str] = field(default_factory=lambda: [str(PROJECT_ROOT)])
+    allowed_roots: List[str] = field(default_factory=lambda: ["~"])
     deny_patterns: List[str] = field(default_factory=list)
 
 
 @dataclass
-class WeixinConfig:
+class ChannelConfig:
+    """一个频道（channels/<name>.yml）：文件名 = 频道名，kind = 通道类型。"""
+    name: str
+    kind: str = ""
     enabled: bool = False
-
-
-@dataclass
-class FeishuConfig:
-    enabled: bool = False
-    app_id: str = ""
-    app_secret: str = ""
+    params: Dict[str, Any] = field(default_factory=dict)   # 其余键自由（app_id 等）
+    path: Optional[Path] = None
 
 
 @dataclass
 class Config:
+    home: Path = field(default_factory=home_dir)
     llm: LLMConfig = field(default_factory=LLMConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
     recorder: RecorderConfig = field(default_factory=RecorderConfig)
@@ -104,9 +124,161 @@ class Config:
     asr: AsrConfig = field(default_factory=AsrConfig)
     files: FilesConfig = field(default_factory=FilesConfig)
     exec: ExecConfig = field(default_factory=ExecConfig)
-    weixin: WeixinConfig = field(default_factory=WeixinConfig)
-    feishu: FeishuConfig = field(default_factory=FeishuConfig)
-    data_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "data")
+    channels: List[ChannelConfig] = field(default_factory=list)
+    fresh_install: bool = False      # 本次启动才生成的骨架（给首启指引用）
+
+    @property
+    def data_dir(self) -> Path:
+        return self.home / "data"
+
+    def channel_names(self) -> List[str]:
+        """模型 channel 属性的白名单：启用的频道 + 内置频道。"""
+        return [ch.name for ch in self.channels if ch.enabled] + list(BUILTIN_CHANNELS)
+
+
+# ---------------------------------------------------------------- yml 读写
+
+
+def _rt_yaml() -> YAML:
+    """round-trip YAML：保注释、保排版——写回用户配置必须用它。"""
+    y = YAML()
+    y.preserve_quotes = True
+    y.indent(mapping=2, sequence=4, offset=2)
+    y.width = 4096
+    return y
+
+
+def _load_yaml(path: Path) -> Any:
+    if not path.exists():
+        return {}
+    data = _rt_yaml().load(path)
+    return data if data is not None else {}
+
+
+def _dump_yaml(path: Path, data: Any) -> None:
+    _rt_yaml().dump(data, path)
+
+
+def _get(data: Any, dotted: str, default: Any = None) -> Any:
+    cur = data
+    for key in dotted.split("."):
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
+
+
+def _set(data: Any, dotted: str, value: Any) -> None:
+    """嵌套赋值（保注释的 CommentedMap 上原地改）。"""
+    keys = dotted.split(".")
+    cur = data
+    for key in keys[:-1]:
+        if not isinstance(cur, dict) or key not in cur:
+            return
+        cur = cur[key]
+    if isinstance(cur, dict):
+        cur[keys[-1]] = value
+
+
+def config_path(home: Optional[Path] = None) -> Path:
+    return (home or home_dir()) / "config.yml"
+
+
+def save_config_value(dotted: str, value: Any, home: Optional[Path] = None) -> bool:
+    """改 config.yml 里的一个键（保注释）：/effort 等指令的落盘口。
+
+    指令改文件、手改文件两条路殊途同归（生效值单源头）。
+    """
+    path = config_path(home)
+    try:
+        data = _load_yaml(path)
+        if not isinstance(data, dict):
+            return False
+        _set(data, dotted, value)
+        _dump_yaml(path, data)
+        return True
+    except Exception:
+        return False
+
+
+def save_channel(ch: ChannelConfig) -> None:
+    """把频道配置写回 channels/<name>.yml（保注释）：/connect 等指令的落盘口。"""
+    data: Dict[str, Any] = {}
+    if ch.path is not None and ch.path.exists():
+        loaded = _load_yaml(ch.path)
+        if isinstance(loaded, dict):
+            data = loaded
+    data["kind"] = ch.kind
+    data["enabled"] = bool(ch.enabled)
+    for key, value in ch.params.items():
+        data[key] = value
+    if ch.path is None:
+        ch.path = home_dir() / "channels" / f"{ch.name}.yml"
+    ch.path.parent.mkdir(parents=True, exist_ok=True)
+    if ch.path.exists():
+        _dump_yaml(ch.path, data)
+    else:
+        import io
+        buf = io.StringIO()
+        _rt_yaml().dump(data, buf)
+        header = (f"# 频道配置：{ch.name}（kind={ch.kind}）\n"
+                  "# enabled 控制起不起；聊天/控制台里 /connect //disconnect 会改这一行\n")
+        ch.path.write_text(header + buf.getvalue(), encoding="utf-8")
+
+
+def load_channels(home: Path) -> List[ChannelConfig]:
+    """channels/*.yml → 频道列表；文件名 = 频道名，kind 决定通道类型。"""
+    channels: List[ChannelConfig] = []
+    dirp = home / "channels"
+    if not dirp.is_dir():
+        return channels
+    for path in sorted(dirp.glob("*.yml")):
+        raw = _load_yaml(path)
+        if not isinstance(raw, dict):
+            continue
+        params = {k: v for k, v in raw.items() if k not in ("kind", "enabled")}
+        channels.append(ChannelConfig(
+            name=path.stem,
+            kind=str(raw.get("kind") or path.stem),
+            enabled=bool(raw.get("enabled", False)),
+            params=params,
+            path=path,
+        ))
+    return channels
+
+
+# ---------------------------------------------------------------- 首启骨架
+
+
+def ensure_home(home: Optional[Path] = None) -> bool:
+    """没有配置就生成骨架：config.yml + channels/ + prompts/ + data/。
+
+    返回是否是首启（本次才生成骨架）。幂等，已有的文件一律不覆盖。
+    """
+    home = home or home_dir()
+    fresh = not (home / "config.yml").exists()
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "data").mkdir(exist_ok=True)
+    (home / "logs").mkdir(exist_ok=True)
+    (home / "channels").mkdir(exist_ok=True)
+    (home / "prompts").mkdir(exist_ok=True)
+
+    example = PACKAGE_DIR / "config.example.yml"
+    cfg_file = home / "config.yml"
+    if not cfg_file.exists() and example.exists():
+        shutil.copy(example, cfg_file)
+
+    # 人设等：包内拷入 home，用户改自己那份、升级不被冲
+    pkg_prompts = PACKAGE_DIR / "prompts"
+    if pkg_prompts.is_dir():
+        for src in pkg_prompts.glob("*.md"):
+            dst = home / "prompts" / src.name
+            if not dst.exists():
+                shutil.copy(src, dst)
+    return fresh
+
+
+# ---------------------------------------------------------------- 加载
 
 
 def _expand_roots(roots: List[str]) -> List[str]:
@@ -114,125 +286,127 @@ def _expand_roots(roots: List[str]) -> List[str]:
     return [str(Path(r).expanduser().resolve()) for r in roots]
 
 
-def load_config(path: Path | None = None) -> Config:
-    """读取 config.toml（如存在）并叠加环境变量覆盖。"""
-    cfg = Config()
-    path = path or PROJECT_ROOT / "config.toml"
+def resolve_path(home: Path, value: str) -> Path:
+    """配置里的相对路径一律相对家目录。"""
+    p = Path(value).expanduser()
+    return p if p.is_absolute() else home / p
 
-    if path.exists():
-        with open(path, "rb") as f:
-            raw = tomllib.load(f)
 
-        llm = raw.get("llm", {})
-        cfg.llm.base_url = llm.get("base_url", cfg.llm.base_url)
-        cfg.llm.api_key = llm.get("api_key", cfg.llm.api_key)
-        cfg.llm.model = llm.get("model", cfg.llm.model)
-        cfg.llm.reasoning_effort = str(llm.get("reasoning_effort", cfg.llm.reasoning_effort))
-        # 旧字段 thinking 兼容映射（只在没配 reasoning_effort 时生效）：
-        # "disabled"→"none"，"enabled"→"medium"，""→不传
-        if "reasoning_effort" not in llm and "thinking" in llm:
-            t = str(llm.get("thinking", ""))
-            cfg.llm.reasoning_effort = {"disabled": "none", "enabled": "medium"}.get(t, t)
+def load_config(home: Optional[Path] = None) -> Config:
+    """读取 ~/.neoagent/config.yml 与 channels/*.yml，叠加环境变量覆盖。"""
+    home = home or home_dir()
+    fresh = ensure_home(home)
+    cfg = Config(home=home, fresh_install=fresh)
+    raw = _load_yaml(home / "config.yml")
 
-        ag = raw.get("agent", {})
-        cfg.agent.max_tool_rounds = int(ag.get("max_tool_rounds", cfg.agent.max_tool_rounds))
-        cfg.agent.history_token_budget = int(ag.get("history_token_budget",
-                                                   cfg.agent.history_token_budget))
-        cfg.agent.image_token_estimate = int(ag.get("image_token_estimate",
-                                                    cfg.agent.image_token_estimate))
-        cfg.agent.memory_file = str(ag.get("memory_file", cfg.agent.memory_file))
-        cfg.agent.identity_file = str(ag.get("identity_file", cfg.agent.identity_file))
-        cfg.agent.workspace = str(ag.get("workspace", cfg.agent.workspace))
-        cfg.agent.modellog_dir = str(ag.get("modellog_dir", cfg.agent.modellog_dir))
-        cfg.agent.bubble_gap_min = float(ag.get("bubble_gap_min", cfg.agent.bubble_gap_min))
-        cfg.agent.bubble_gap_max = float(ag.get("bubble_gap_max", cfg.agent.bubble_gap_max))
+    cfg.llm.base_url = str(_get(raw, "model.base_url", cfg.llm.base_url))
+    cfg.llm.api_key = str(_get(raw, "model.api_key", cfg.llm.api_key) or "")
+    cfg.llm.model = str(_get(raw, "model.name", cfg.llm.model))
+    cfg.llm.reasoning_effort = str(_get(raw, "model.thinking", cfg.llm.reasoning_effort))
 
-        rc = raw.get("recorder", {})
-        cfg.recorder.memory_dir = str(rc.get("memory_dir", cfg.recorder.memory_dir))
-        cfg.recorder.pause_debounce_seconds = int(rc.get("pause_debounce_seconds",
-                                                         cfg.recorder.pause_debounce_seconds))
-        cfg.recorder.slow_interval = int(rc.get("slow_interval",
-                                                      cfg.recorder.slow_interval))
-        cfg.recorder.slow_lookback_days = int(rc.get("slow_lookback_days",
-                                                     cfg.recorder.slow_lookback_days))
-        cfg.recorder.max_tool_rounds = int(rc.get("max_tool_rounds",
-                                                  cfg.recorder.max_tool_rounds))
-        cfg.recorder.reasoning_effort = str(rc.get("reasoning_effort",
-                                                   cfg.recorder.reasoning_effort))
+    cfg.agent.identity_file = str(_get(raw, "personality.prompt", cfg.agent.identity_file))
+    cfg.agent.max_tool_rounds = int(_get(raw, "limits.max_tool_rounds", cfg.agent.max_tool_rounds))
+    cfg.agent.history_token_budget = int(_get(raw, "limits.history_token_budget",
+                                              cfg.agent.history_token_budget))
 
-        md = raw.get("media", {})
-        cfg.media.max_bytes = int(md.get("max_bytes", cfg.media.max_bytes))
-        cfg.media.max_images_per_message = int(md.get("max_images_per_message", cfg.media.max_images_per_message))
-        cfg.media.download_quoted_media = bool(md.get("download_quoted_media", cfg.media.download_quoted_media))
+    cfg.recorder.memory_dir = str(_get(raw, "memory.dir", cfg.recorder.memory_dir))
+    cfg.recorder.pause_debounce_seconds = int(_get(raw, "memory.tidy_delay",
+                                                   cfg.recorder.pause_debounce_seconds))
+    cfg.recorder.slow_interval = int(_get(raw, "memory.tidy_interval", cfg.recorder.slow_interval))
+    cfg.recorder.slow_lookback_days = int(_get(raw, "memory.tidy_lookback_days",
+                                               cfg.recorder.slow_lookback_days))
+    cfg.recorder.reasoning_effort = str(_get(raw, "memory.tidy_thinking",
+                                             cfg.recorder.reasoning_effort))
+    cfg.recorder.max_tool_rounds = int(_get(raw, "memory.tidy_tool_rounds",
+                                            cfg.recorder.max_tool_rounds))
 
-        ar = raw.get("asr", {})
-        cfg.asr.provider = str(ar.get("provider", cfg.asr.provider))
-        cfg.asr.api_key = str(ar.get("api_key", cfg.asr.api_key))
-        cfg.asr.base_url = str(ar.get("base_url", cfg.asr.base_url))
-        cfg.asr.model = str(ar.get("model", cfg.asr.model))
-        cfg.asr.language = str(ar.get("language", cfg.asr.language))
-        cfg.asr.max_audio_seconds = int(ar.get("max_audio_seconds", cfg.asr.max_audio_seconds))
+    cfg.agent.workspace = str(_get(raw, "advanced.workspace", cfg.agent.workspace))
+    cfg.agent.modellog_dir = str(_get(raw, "advanced.modellog_dir", cfg.agent.modellog_dir))
+    cfg.agent.image_token_estimate = int(_get(raw, "advanced.image_token_estimate",
+                                              cfg.agent.image_token_estimate))
+    gap = _get(raw, "advanced.bubble_gap", [cfg.agent.bubble_gap_min, cfg.agent.bubble_gap_max])
+    try:
+        cfg.agent.bubble_gap_min = float(gap[0])
+        cfg.agent.bubble_gap_max = float(gap[1])
+    except (TypeError, ValueError, IndexError):
+        pass
 
-        fl = raw.get("files", {})
-        if "allowed_roots" in fl:
-            cfg.files.allowed_roots = list(fl["allowed_roots"])
+    cfg.media.max_bytes = int(_get(raw, "advanced.media.max_bytes", cfg.media.max_bytes))
+    cfg.media.max_images_per_message = int(_get(raw, "advanced.media.max_images_per_message",
+                                                cfg.media.max_images_per_message))
+    cfg.media.download_quoted_media = bool(_get(raw, "advanced.media.download_quoted_media",
+                                                cfg.media.download_quoted_media))
 
-        ex = raw.get("exec", {})
-        cfg.exec.timeout_seconds = int(ex.get("timeout_seconds", cfg.exec.timeout_seconds))
-        cfg.exec.max_output_bytes = int(ex.get("max_output_bytes", cfg.exec.max_output_bytes))
-        if "allowed_roots" in ex:
-            cfg.exec.allowed_roots = list(ex["allowed_roots"])
-        if "deny_patterns" in ex:
-            cfg.exec.deny_patterns = list(ex["deny_patterns"])
+    cfg.asr.provider = str(_get(raw, "advanced.asr.provider", cfg.asr.provider))
+    cfg.asr.api_key = str(_get(raw, "advanced.asr.api_key", cfg.asr.api_key) or "")
+    cfg.asr.base_url = str(_get(raw, "advanced.asr.base_url", cfg.asr.base_url))
+    cfg.asr.model = str(_get(raw, "advanced.asr.model", cfg.asr.model))
+    cfg.asr.language = str(_get(raw, "advanced.asr.language", cfg.asr.language))
+    cfg.asr.max_audio_seconds = int(_get(raw, "advanced.asr.max_audio_seconds",
+                                         cfg.asr.max_audio_seconds))
 
-        wx = raw.get("channels", {}).get("weixin", {})
-        cfg.weixin.enabled = bool(wx.get("enabled", False))
+    if _get(raw, "advanced.safety.files_roots") is not None:
+        cfg.files.allowed_roots = list(_get(raw, "advanced.safety.files_roots"))
+    if _get(raw, "advanced.safety.exec_roots") is not None:
+        cfg.exec.allowed_roots = list(_get(raw, "advanced.safety.exec_roots"))
+    cfg.exec.timeout_seconds = int(_get(raw, "advanced.safety.exec_timeout",
+                                        cfg.exec.timeout_seconds))
+    cfg.exec.max_output_bytes = int(_get(raw, "advanced.safety.exec_max_output",
+                                         cfg.exec.max_output_bytes))
+    if _get(raw, "advanced.safety.deny_patterns") is not None:
+        cfg.exec.deny_patterns = list(_get(raw, "advanced.safety.deny_patterns"))
 
-        fs = raw.get("channels", {}).get("feishu", {})
-        cfg.feishu.enabled = bool(fs.get("enabled", False))
-        cfg.feishu.app_id = str(fs.get("app_id", ""))
-        cfg.feishu.app_secret = str(fs.get("app_secret", ""))
+    cfg.channels = load_channels(home)
 
-    # 环境变量覆盖（密钥走这里更安全）
+    # 环境变量覆盖（密钥走这里更安全；旧名兼容）
     cfg.llm.api_key = os.environ.get("NEOAGENT_LLM_API_KEY", cfg.llm.api_key)
     cfg.llm.base_url = os.environ.get("NEOAGENT_LLM_BASE_URL", cfg.llm.base_url)
     cfg.llm.model = os.environ.get("NEOAGENT_LLM_MODEL", cfg.llm.model)
-    cfg.llm.reasoning_effort = os.environ.get("NEOAGENT_LLM_REASONING_EFFORT",
-                                             cfg.llm.reasoning_effort)
+    cfg.llm.reasoning_effort = os.environ.get(
+        "NEOAGENT_LLM_THINKING",
+        os.environ.get("NEOAGENT_LLM_REASONING_EFFORT", cfg.llm.reasoning_effort))
     cfg.asr.api_key = os.environ.get("NEOAGENT_ASR_API_KEY", cfg.asr.api_key)
-    cfg.recorder.reasoning_effort = os.environ.get("NEOAGENT_RECORDER_REASONING_EFFORT",
-                                                   cfg.recorder.reasoning_effort)
-    cfg.feishu.app_id = os.environ.get("NEOAGENT_FEISHU_APP_ID", cfg.feishu.app_id)
-    cfg.feishu.app_secret = os.environ.get("NEOAGENT_FEISHU_APP_SECRET", cfg.feishu.app_secret)
+    cfg.recorder.reasoning_effort = os.environ.get(
+        "NEOAGENT_MEMORY_TIDY_THINKING",
+        os.environ.get("NEOAGENT_RECORDER_REASONING_EFFORT", cfg.recorder.reasoning_effort))
+    # 飞书凭据按 kind 覆盖到每个飞书频道（多开也吃得下）
+    feishu_env = {k.split("__", 1)[0][len("NEOAGENT_FEISHU_"):].lower(): v
+                  for k, v in os.environ.items() if k.startswith("NEOAGENT_FEISHU_")}
+    for ch in cfg.channels:
+        if ch.kind == "feishu":
+            for key in ("app_id", "app_secret"):
+                if key in feishu_env:
+                    ch.params[key] = feishu_env[key]
 
-    # 根目录统一展开 ~ 并解析为绝对路径
+    # 相对路径一律相对家目录；根目录统一展开 ~
     cfg.files.allowed_roots = _expand_roots(cfg.files.allowed_roots)
     cfg.exec.allowed_roots = _expand_roots(cfg.exec.allowed_roots)
-
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
     return cfg
 
 
 class ReasoningEffortSource:
-    """reasoning_effort 热调整：config.toml 改了下一轮就生效（按 mtime 重载）。
+    """thinking 热调整：config.yml 改了下一轮就生效（按 mtime 重载）。
 
-    每次模型调用前 get()——文件没变零成本；变了就重读（小 toml，毫秒级）。
-    配置坏了沿用旧值，绝不炸请求。将来"聊天指令调档"可替换本类接入。"""
+    每次模型调用前 get()——文件没变零成本；变了就重读（小 yml，毫秒级）。
+    配置坏了沿用旧值，绝不炸请求。/effort 指令改的就是这个文件。
+    """
 
-    def __init__(self, path: Path | None = None, initial: str = "medium") -> None:
-        self._path = Path(path) if path else PROJECT_ROOT / "config.toml"
+    def __init__(self, home: Optional[Path] = None, initial: str = "medium") -> None:
+        self._home = Path(home) if home else home_dir()
         self._value = initial
-        self._mtime: float | None = None
+        self._mtime: Optional[float] = None
 
     def get(self) -> str:
+        path = config_path(self._home)
         try:
-            mtime = self._path.stat().st_mtime
+            mtime = path.stat().st_mtime
         except OSError:
             return self._value
         if mtime != self._mtime:
             self._mtime = mtime
             try:
-                self._value = load_config(self._path).llm.reasoning_effort
+                self._value = load_config(self._home).llm.reasoning_effort
             except Exception:
                 pass
         return self._value

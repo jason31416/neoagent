@@ -7,7 +7,7 @@
 - 回：create 接口发普通消息到会话（不做消息级引用）
 
 用法前置：飞书开放平台建自建应用，开通 im:message 收发权限
-（群聊引用解析还需 im:message.group_msg），把 App ID / Secret 填进 config.toml。
+（群聊引用解析还需 im:message.group_msg），把 App ID / Secret 填进 channels/<名字>.yml。
 """
 
 from __future__ import annotations

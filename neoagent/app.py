@@ -5,10 +5,8 @@ CLI / 微信 / 飞书入口都走这里，保证"同一核心挂多通道"。
 from __future__ import annotations
 
 import logging
-import shutil
-from pathlib import Path
 
-from .config import Config, PROJECT_ROOT, ReasoningEffortSource
+from .config import Config, ReasoningEffortSource, resolve_path
 from .core import modellog
 from .core.agent_loop import AgentLoop
 from .core.ledger import MessageLedger
@@ -30,36 +28,24 @@ TIMELINE_BUCKET = "main"   # 产品层一条连续记录的桶名（session 语�
 def build_agent(cfg: Config) -> AgentLoop:
     """按配置组装 M（agent 核心）：LLM + 工具 + providers + 消息库。"""
     if not cfg.llm.api_key:
-        raise SystemExit("缺少 LLM api_key：请在 config.toml 或 NEOAGENT_LLM_API_KEY 配置")
+        raise SystemExit(f"缺少模型 api_key：请在 {cfg.home / 'config.yml'} 的 model.api_key"
+                         " 或环境变量 NEOAGENT_LLM_API_KEY 配置")
 
     # 工作台：agent 的工作目录（相对路径基准 / exec 默认 cwd / 产出物落脚点）。
     # 它是 agent 自己的地盘——自动并入 files/exec/media 的允许范围，不必再配 roots。
-    workspace = Path(cfg.agent.workspace)
-    if not workspace.is_absolute():
-        workspace = PROJECT_ROOT / workspace
+    workspace = resolve_path(cfg.home, cfg.agent.workspace)
     workspace.mkdir(parents=True, exist_ok=True)
     file_roots = list(dict.fromkeys([*cfg.files.allowed_roots, str(workspace)]))
     exec_roots = list(dict.fromkeys([*cfg.exec.allowed_roots, str(workspace)]))
 
     # 模型请求上下文落盘（调试用；modellog_dir 置空关闭）
     if cfg.agent.modellog_dir:
-        ml_dir = Path(cfg.agent.modellog_dir)
-        if not ml_dir.is_absolute():
-            ml_dir = PROJECT_ROOT / ml_dir
-        modellog.setup(ml_dir)
+        modellog.setup(resolve_path(cfg.home, cfg.agent.modellog_dir))
 
     # 记忆库（Recorder 维护，M 只读）：先算出来，M 的文件工具要开 memory:// 只读口
-    memory_dir = Path(cfg.recorder.memory_dir)
-    if not memory_dir.is_absolute():
-        memory_dir = PROJECT_ROOT / memory_dir
+    memory_dir = resolve_path(cfg.home, cfg.recorder.memory_dir)
     memory_dir.mkdir(parents=True, exist_ok=True)
     memory_md = memory_dir / "memory.md"
-    legacy = Path(cfg.agent.memory_file)          # 旧记忆文件：一次性迁移，不动原件
-    if not legacy.is_absolute():
-        legacy = PROJECT_ROOT / legacy
-    if not memory_md.exists() and legacy.exists():
-        shutil.copy(legacy, memory_md)
-        logger.info("旧记忆文件已迁入 %s（原件保留在 %s）", memory_md, legacy)
 
     # 工具（本期变体：M 直接持有工具——产品文档里这些是 E 的活）。
     # 文件工具与 R 共用同一实现（file_tools），沙箱按 scope 绑定：
@@ -82,11 +68,9 @@ def build_agent(cfg: Config) -> AgentLoop:
         cfg.asr.provider, cfg.asr.base_url, cfg.asr.api_key, cfg.asr.model,
         cfg.asr.language, cfg.asr.max_audio_seconds)
 
-    # 消息库（SQLite，全量落盘）+ 身份文件
+    # 消息库（SQLite，全量落盘）+ 人设文件
     ledger = MessageLedger(cfg.data_dir / "neoagent.db")
-    identity_file = Path(cfg.agent.identity_file)
-    if not identity_file.is_absolute():
-        identity_file = PROJECT_ROOT / identity_file
+    identity_file = resolve_path(cfg.home, cfg.agent.identity_file)
 
     llm = LLMClient(cfg.llm.base_url, cfg.llm.api_key, cfg.llm.model,
                     reasoning_effort=cfg.llm.reasoning_effort)
@@ -94,7 +78,8 @@ def build_agent(cfg: Config) -> AgentLoop:
     agent = AgentLoop(llm, registry, ledger, memory_md,
                       identity_file=identity_file,
                       vision=vision, transcriber=transcriber,
-                      effort_provider=ReasoningEffortSource(initial=cfg.llm.reasoning_effort),
+                      effort_provider=ReasoningEffortSource(home=cfg.home,
+                                                            initial=cfg.llm.reasoning_effort),
                       token_counter=token_counter,
                       max_tool_rounds=cfg.agent.max_tool_rounds,
                       token_budget=cfg.agent.history_token_budget,
@@ -103,10 +88,8 @@ def build_agent(cfg: Config) -> AgentLoop:
                       media_max_bytes=cfg.media.max_bytes,
                       bubble_gap_min=cfg.agent.bubble_gap_min,
                       bubble_gap_max=cfg.agent.bubble_gap_max,
-                      # 模型 channel 属性的白名单（= 适配器 name）
-                      known_channels=[name for name, on in
-                                      (("weixin", cfg.weixin.enabled),
-                                       ("feishu", cfg.feishu.enabled)) if on],
+                      # 模型 channel 属性的白名单（= 频道名 + 内置频道）
+                      known_channels=cfg.channel_names(),
                       timeline_bucket=TIMELINE_BUCKET,   # 一条连续记录
                       workspace=workspace)
 

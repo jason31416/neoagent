@@ -1,7 +1,7 @@
 """OpenAI 兼容 LLM 客户端。
 
 DeepSeek / 通义 / OpenAI / 自建 vLLM 都走 OpenAI Chat Completions 协议，
-换供应商只改 config.toml 的 base_url / api_key / model，代码零改动。
+换供应商只改 config.yml 的 model（base_url / api_key / name），代码零改动。
 """
 
 from __future__ import annotations

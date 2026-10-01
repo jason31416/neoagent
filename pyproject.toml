@@ -8,6 +8,8 @@ dependencies = [
     "aiohttp>=3.9",        # 微信 iLink Bot API 长轮询 / HTTP
     "cryptography>=42.0",  # 微信媒体 AES-128-ECB（iLink 协议要求）
     "qrcode>=8.0",         # 微信扫码登录时终端渲染二维码
+    "ruamel-yaml>=0.18",
+    "prompt-toolkit>=3.0",
 ]
 
 [project.optional-dependencies]
@@ -22,3 +24,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["neoagent*"]
+
+[tool.setuptools.package-data]
+neoagent = ["config.example.yml", "prompts/*.md"]

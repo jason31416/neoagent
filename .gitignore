@@ -9,6 +9,7 @@ data/
 __pycache__/
 *.pyc
 .venv/
+.uv-cache/
 *.egg-info/
 build/
 dist/

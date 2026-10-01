@@ -1,8 +1,8 @@
-"""服务入口：按配置启动通道，把消息接到 agent 核心。
+"""服务入口：按配置启动频道，把消息接到 agent 核心。
 
     uv run python -m neoagent.run
 
-配置里 channels.weixin.enabled / channels.feishu.enabled 决定起哪些通道。
+配置在 ~/.neoagent/（config.yml + channels/*.yml），channels/ 里 enabled 的频道会起。
 所有频道共用同一个 agent 核心、同一条连续记录（每条消息标 channel）。
 """
 
@@ -12,13 +12,27 @@ import asyncio
 import logging
 
 from .app import build_agent
-from .config import load_config
+from .config import ChannelConfig, Config, load_config
 from .core.channel import ChannelAdapter
 from .core.events import SendResult
 from .log import bold_cyan, bold_green, gray, setup_logging
 
 setup_logging()
 logger = logging.getLogger("neoagent")
+
+
+def _make_adapter(ch: ChannelConfig, cfg: Config) -> ChannelAdapter | None:
+    """按频道 kind 构造适配器（新频道类型在这里登记）。"""
+    if ch.kind == "weixin":
+        from .channels.weixin.adapter import WeixinAdapter
+        return WeixinAdapter(cfg.data_dir, max_bytes=cfg.media.max_bytes)
+    if ch.kind == "feishu":
+        from .channels.feishu.adapter import FeishuAdapter
+        return FeishuAdapter(str(ch.params.get("app_id") or ""),
+                             str(ch.params.get("app_secret") or ""),
+                             data_dir=cfg.data_dir, max_bytes=cfg.media.max_bytes)
+    logger.warning("未知的频道类型 %s（%s.yml），跳过", ch.kind, ch.name)
+    return None
 
 
 async def _run() -> None:
@@ -31,17 +45,17 @@ async def _run() -> None:
     if scheduler is not None:
         asyncio.get_event_loop().create_task(scheduler.run_forever())
 
-    if cfg.weixin.enabled:
-        from .channels.weixin.adapter import WeixinAdapter
-        adapters.append(WeixinAdapter(cfg.data_dir, max_bytes=cfg.media.max_bytes))
-
-    if cfg.feishu.enabled:
-        from .channels.feishu.adapter import FeishuAdapter
-        adapters.append(FeishuAdapter(cfg.feishu.app_id, cfg.feishu.app_secret,
-                                     data_dir=cfg.data_dir, max_bytes=cfg.media.max_bytes))
+    for ch in cfg.channels:
+        if not ch.enabled:
+            continue
+        adapter = _make_adapter(ch, cfg)
+        if adapter is not None:
+            adapter.name = ch.name        # 频道名 = channels/<name>.yml 的文件名
+            adapters.append(adapter)
 
     if not adapters:
-        raise SystemExit("没有启用任何通道：请在 config.toml 的 [channels.*] 里打开 enabled")
+        raise SystemExit(f"没有启用任何频道：在 {cfg.home / 'channels'} 里建个 yml"
+                         "（channels/feishu.yml 之类的，enabled: true）")
 
     # 每频道最近一条入站消息：跨频道投递时当该频道的回复上下文（chat/引用载体）
     last_events: dict[str, object] = {}

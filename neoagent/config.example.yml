@@ -1,0 +1,76 @@
+# neoagent 配置（~/.neoagent/config.yml）
+# 改完保存即生效；带"热改"标注的也能在聊天/控制台用指令改，两边殊途同归。
+# 改坏了不用担心：加载出错会沿用旧值并提示，不会带着坏配置跑。
+
+model:
+  # OpenAI 兼容接口：DeepSeek 官方 / 通义 / OpenAI / 自建均可
+  base_url: https://api.deepseek.com
+  # 密钥也可以不落盘：环境变量 NEOAGENT_LLM_API_KEY 优先
+  api_key: ""
+  name: deepseek-chat
+  # 思考档位（热改：/effort low 之类，改了下一条消息即生效）：
+  # none=不思考 | minimal/low/medium/high/xhigh/ultra/max=思考，档位越高想得越多
+  thinking: medium
+
+personality:
+  # neoagent 的人设与说话方式（改它就改了性格与消息协议说明）
+  prompt: prompts/messenger.md
+
+memory:
+  # 记忆库目录（相对本目录）：memory.md + 子文件 + old/ 归档
+  dir: data/memory
+  # 收工静默多久后整理一次记忆（秒）
+  tidy_delay: 150
+  # 定期整理的节律（秒）
+  tidy_interval: 86400
+  # 定期整理回看多少天
+  tidy_lookback_days: 7
+  # 整理用的思考档位（要省可降）
+  tidy_thinking: medium
+  # 一次整理最多连续调用多少轮工具
+  tidy_tool_rounds: 12
+
+limits:
+  # 一次回复内最多连续调用多少轮工具（防失控）
+  max_tool_rounds: 90
+  # 记忆上下文的 token 预算：从最老端成组裁掉到装进预算
+  history_token_budget: 250000
+
+advanced:
+  # 工作台：neoagent 的工作目录（工具的默认目录、产出物落脚点）
+  workspace: data/workspace
+  # 模型请求落盘（调试用，每会话一份 md 只留最新一次请求）；置空关闭
+  modellog_dir: data/modellog
+  # 每张图估算 token（计数器用）
+  image_token_estimate: 1024
+  # 气泡连发间隔（秒）：多条消息之间的随机停顿，给阅读时间；0 = 不间隔
+  bubble_gap: [0.5, 1.5]
+  media:
+    max_bytes: 20971520          # 附件大小上限（20MB）
+    max_images_per_message: 4
+    download_quoted_media: false # 引用里的媒体默认不下载
+  asr:
+    provider: xiaomi-mimo        # 语音转写供应商（可拆换）
+    api_key: ""                  # 或环境变量 NEOAGENT_ASR_API_KEY
+    base_url: https://api.xiaomimimo.com/v1
+    model: mimo-v2.5-asr
+    language: auto
+    max_audio_seconds: 300
+  safety:
+    # 文件读写允许的根目录（可写 ~ 或绝对路径；想收紧就改这里）
+    files_roots: ["~"]
+    # 命令执行允许的工作目录范围
+    exec_roots: ["~"]
+    exec_timeout: 60             # 单条命令超时（秒）
+    exec_max_output: 20000       # 输出超长截断
+    # 命中即拒绝的危险命令（正则；弱防线但必须有，别当唯一防线）
+    deny_patterns:
+      - "\\bsudo\\b"
+      - "\\brm\\s+-rf\\b"
+      - "\\bmkfs\\b"
+      - "\\bdd\\s+of=/dev"
+      - "\\bshutdown\\b"
+      - "\\breboot\\b"
+      - ":\\(\\)\\s*\\{"
+
+# 频道在 channels/ 目录里，一个频道一个文件（聊天/控制台里 /connect 会自动生成）。
