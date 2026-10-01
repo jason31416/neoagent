@@ -6,15 +6,17 @@ from __future__ import annotations
 
 import logging
 
-from .config import Config, ReasoningEffortSource, resolve_path
+from .config import Config, ReasoningEffortSource, resolve_path, save_config_value
 from .core import modellog
 from .core.agent_loop import AgentLoop
+from .core.commands import CommandContext
 from .core.ledger import MessageLedger
 from .core.llm import LLMClient
 from .core.recorder import Recorder, RecorderScheduler
 from .providers.asr import make_transcriber
 from .providers.tokens import HeuristicTokenCounter
 from .providers.vision import make_vision
+from .tools.command_tool import register_run_command
 from .tools.exec_tool import ExecPolicy, register_exec_tool
 from .tools.file_tools import FileScope, register_file_tools
 from .tools.memory_tools import register_record_memory
@@ -62,6 +64,20 @@ def build_agent(cfg: Config) -> AgentLoop:
     ))
     register_record_memory(registry)     # M 的记忆提案通道（异步入账，R 定稿）
 
+    # 指令工具：neoagent 自己也能跑指令（同一注册表、同一权限档；/stop 类不放行）
+    effort = ReasoningEffortSource(home=cfg.home, initial=cfg.llm.reasoning_effort)
+
+    def _cmd_ctx() -> CommandContext:
+        return CommandContext(
+            surface="chat",
+            home=ledger.get_setting("home"),
+            known_channels=cfg.channel_names(),
+            set_home=lambda ch: ledger.set_setting("home", ch),
+            thinking=effort(),
+            set_thinking=lambda v: save_config_value("model.thinking", v, home=cfg.home))
+
+    register_run_command(registry, ctx_factory=_cmd_ctx)
+
     # providers（供应商适配全部藏在 providers/ 后面）
     vision = make_vision()
     transcriber = make_transcriber(
@@ -78,8 +94,9 @@ def build_agent(cfg: Config) -> AgentLoop:
     agent = AgentLoop(llm, registry, ledger, memory_md,
                       identity_file=identity_file,
                       vision=vision, transcriber=transcriber,
-                      effort_provider=ReasoningEffortSource(home=cfg.home,
-                                                            initial=cfg.llm.reasoning_effort),
+                      effort_provider=effort,
+                      effort_setter=lambda v: save_config_value("model.thinking", v,
+                                                                home=cfg.home),
                       token_counter=token_counter,
                       max_tool_rounds=cfg.agent.max_tool_rounds,
                       token_budget=cfg.agent.history_token_budget,

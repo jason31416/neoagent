@@ -90,6 +90,7 @@ class AgentLoop:
                  bubble_gap_min: float = 0.0, bubble_gap_max: float = 0.0,
                  workspace: Optional[Path] = None,
                  effort_provider: Optional[Callable[[], str]] = None,
+                 effort_setter: Optional[Callable[[str], bool]] = None,
                  known_channels: Optional[List[str]] = None,
                  timeline_bucket: str = "",
                  recorder=None) -> None:
@@ -113,6 +114,7 @@ class AgentLoop:
         # 思考档位（reasoning_effort）：每轮请求前现取 → 改配置即生效，可随时切换
         # 思考/非思考混用；默认 "medium"（none=不思考）
         self.effort_provider = effort_provider or (lambda: "medium")
+        self.effort_setter = effort_setter     # /effort 落盘口（保注释写 config.yml）
         # 已知频道 id（= 适配器 name）：模型 channel 属性的白名单
         self.known_channels = tuple(known_channels or ())
         # 时间线桶名：非空时所有事件归同一条连续记录（session 语义退役，
@@ -195,10 +197,14 @@ class AgentLoop:
                               text: str, responder) -> None:
         """指令执行 + 系统回执：回执是 internal 行 + **真气泡**（可被引用），
         发到指令来的频道，不触发模型回合。"""
-        receipt = commands.execute(
-            text, channel=event.channel, home=self.ledger.get_setting("home"),
+        receipt = commands.execute(text, commands.CommandContext(
+            surface="chat",
+            channel=event.channel,
+            home=self.ledger.get_setting("home"),
             known_channels=self.known_channels,
-            set_home=lambda ch: self.ledger.set_setting("home", ch))
+            set_home=lambda ch: self.ledger.set_setting("home", ch),
+            thinking=self.effort_provider() if callable(self.effort_provider) else "",
+            set_thinking=self.effort_setter))
         logger.info("[command] %s → %s", text, receipt)
         ts = time.time()
         bid = self.ledger.alloc_bubbles(session_key, 1)[0]
