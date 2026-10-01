@@ -88,6 +88,8 @@ async def _run(mode: str, verbose: bool) -> None:
         return
 
     headless = mode == "serve" or not sys.stdin.isatty()
+    if not headless:
+        print("neoagent启动中")   # 装配+频道连接期间别让用户对着黑屏干等
     setup_logging(file_path=log_file, stderr=(headless or verbose),
                   color_stream=sys.stdout)
 
@@ -204,6 +206,7 @@ async def _run(mode: str, verbose: bool) -> None:
             adapter.notice = (lambda s, _n=ch.name: server.broadcast(
                 {"kind": "notice", "text": f"{_n} {s}"}))
         by_name[ch.name] = adapter
+        server.broadcast({"kind": "notice", "text": f"{ch.name} 连接中…"})
         try:
             await adapter.connect()
             server.broadcast({"kind": "notice", "text": f"{ch.name} 已连接"})
@@ -337,20 +340,14 @@ async def _run(mode: str, verbose: bool) -> None:
                          "info": op_channels}
 
     if cfg.fresh_install or not cfg.llm.api_key:
-        print(f"neoagent 首启：配置在 {cfg.home / 'config.yml'}")
-        print("三步：1) model.api_key 填进 config.yml  2) /connect weixin 扫码  3) 回来说话")
-
-    for ch in cfg.channels:
-        if ch.enabled and ch.name not in by_name and not _connecting(ch.name):
-            conn_tasks[ch.name] = asyncio.get_event_loop().create_task(start_channel(ch))
-    if conn_tasks:
-        await asyncio.gather(*conn_tasks.values())
-        logger.info("neoagent 已启动，频道：%s", ", ".join(by_name) or "（无）")
-    else:
         server.broadcast({"kind": "notice",
-                          "text": "没有启用任何频道：/connect weixin 之类接一个就能聊"})
+                          "text": f"neoagent 首启：配置在 {cfg.home / 'config.yml'}"})
+        server.broadcast({"kind": "notice",
+                          "text": "三步：1) model.api_key 填进 config.yml  2) /connect weixin 扫码  3) 回来说话"})
 
-    # ---- 控制台：一体化且有终端才内嵌（attach 形态自己起客户端）
+    # ---- 控制台：一体化且有终端才内嵌（attach 形态自己起客户端）。
+    # 先起控制台再连频道：频道连得慢（扫码/建连）不该挡提示符，
+    # 连接进度以通知流的形式出在提示符上方。
     async def embedded_console() -> None:
         reason = await run_client(sock, home=str(cfg.home), detachable=False)
         if reason == "stop":
@@ -359,6 +356,16 @@ async def _run(mode: str, verbose: bool) -> None:
     console_task = None
     if not headless:
         console_task = asyncio.get_event_loop().create_task(embedded_console())
+
+    enabled = [ch for ch in cfg.channels
+               if ch.enabled and ch.name not in by_name and not _connecting(ch.name)]
+    if enabled:
+        logger.info("neoagent 已启动，启用频道：%s", ", ".join(ch.name for ch in enabled))
+        for ch in enabled:
+            conn_tasks[ch.name] = asyncio.get_event_loop().create_task(start_channel(ch))
+    else:
+        server.broadcast({"kind": "notice",
+                          "text": "没有启用任何频道：/connect weixin 之类接一个就能聊"})
 
     try:
         await stop_event.wait()
