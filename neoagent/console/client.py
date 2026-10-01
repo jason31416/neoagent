@@ -73,7 +73,8 @@ async def run_client(sock_path: Path, *, home: str = "~/.neoagent",
     session: PromptSession = PromptSession("> ")
     try:
         while True:
-            with patch_stdout():
+            # raw=True 必须：不然 prompt_toolkit 会把 ANSI 转义转义掉（ESC 变 ?，颜色全丢）
+            with patch_stdout(raw=True):
                 try:
                     line = await session.prompt_async()
                 except KeyboardInterrupt:
