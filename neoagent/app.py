@@ -122,7 +122,8 @@ def build_agent(cfg: Config) -> AgentLoop:
                         token_budget=cfg.agent.history_token_budget,
                         max_tool_rounds=cfg.recorder.max_tool_rounds,
                         effort_provider=lambda: cfg.recorder.reasoning_effort,
-                        slow_lookback_days=cfg.recorder.slow_lookback_days)
+                        slow_lookback_days=cfg.recorder.slow_lookback_days,
+                        prompt_path=resolve_path(cfg.home, "prompts/recorder.md"))
     agent.recorder = recorder
     agent.recorder_scheduler = RecorderScheduler(
         recorder, ledger,
