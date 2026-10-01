@@ -1,23 +1,35 @@
-"""服务入口：按配置启动频道，把消息接到 agent 核心。
+"""服务入口（一体化 / serve / console 三形态）与控制台接线。
 
-    uv run python -m neoagent.run
+    uv run python -m neoagent.run              # 一体化：服务 + 控制台（已在跑则 attach）
+    uv run python -m neoagent.run serve        # 无头服务（launchd/systemd 收日志）
+    uv run python -m neoagent.run console      # 只开控制台连上服务（别名 tui）
 
-配置在 ~/.neoagent/（config.yml + channels/*.yml），channels/ 里 enabled 的频道会起。
+配置在 ~/.neoagent/（config.yml + channels/*.yml），NEOAGENT_HOME/--home 可指走。
 所有频道共用同一个 agent 核心、同一条连续记录（每条消息标 channel）。
+控制台是 socket 客户端（前端无关内核的第一客户端）：日志落文件不刷控制台，
+控制台只看对话（全频道）+ 工作行（工具调用）+ 指令回执 + 需要主人动作的通知。
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
+import sys
+import time
+import uuid
+from pathlib import Path
 
 from .app import build_agent
-from .config import ChannelConfig, Config, load_config
+from .config import ChannelConfig, Config, load_config, save_config_value
+from .console.client import run_client
+from .console.transcript import ConsoleTranscript
+from .control import ClientConn, ControlServer, control_alive
+from .core import commands
 from .core.channel import ChannelAdapter
-from .core.events import SendResult
-from .log import bold_cyan, bold_green, gray, setup_logging
+from .core.events import Conversation, MessageEvent, SendResult, Sender
+from .log import bold_cyan, bold_green, gray, setup_logging, strip_ansi
 
-setup_logging()
 logger = logging.getLogger("neoagent")
 
 
@@ -35,12 +47,54 @@ def _make_adapter(ch: ChannelConfig, cfg: Config) -> ChannelAdapter | None:
     return None
 
 
-async def _run() -> None:
+_KIND_WORD = {"image": "图片", "file": "文件", "audio": "语音", "video": "视频"}
+
+
+def _inbound_ev(event: MessageEvent) -> dict:
+    """入站消息 → 控制台事件（媒体出占位、回复挂前缀素材）。"""
+    text = event.text or ""
+    counts: dict = {}
+    for att in event.attachments or []:
+        counts[att.kind] = counts.get(att.kind, 0) + 1
+    if counts:
+        ph = "、".join(f"{_KIND_WORD.get(k, k)} {n}" for k, n in counts.items())
+        text = f"{text}（{ph}）" if text else f"（{ph}）"
+    ev = {"kind": "msg", "channel": event.channel,
+          "speaker": "你" if event.channel == "cli" else (event.sender.name or event.sender.id),
+          "text": text}
+    if event.reply_to is not None and event.reply_to.sender_name:
+        ev["reply"] = event.reply_to.sender_name
+    return ev
+
+
+async def _run(mode: str, verbose: bool) -> None:
     cfg = load_config()
+    sock = cfg.data_dir / "control.sock"
+    log_file = cfg.home / "logs" / "latest.log"
+
+    # ---- 只开控制台：连上服务就干活
+    if mode in ("console", "tui"):
+        setup_logging(file_path=log_file, stderr=verbose, color_stream=sys.stdout)
+        if not control_alive(sock):
+            raise SystemExit(f"服务没在跑：先 `neoagent` 或 `neoagent serve`（{sock} 不通）")
+        await run_client(sock, home=str(cfg.home))
+        return
+
+    # ---- 一体化：服务已在跑 → 降级 attach（永不双开）
+    if mode != "serve" and control_alive(sock):
+        print("服务已经在跑，帮你连上控制台。")
+        await run_client(sock, home=str(cfg.home))
+        return
+
+    headless = mode == "serve" or not sys.stdin.isatty()
+    setup_logging(file_path=log_file, stderr=(headless or verbose),
+                  color_stream=sys.stdout)
+
     agent = build_agent(cfg)
+    transcript = ConsoleTranscript(cfg.data_dir / "neoagent.db")
+    stop_event = asyncio.Event()
     adapters: list[ChannelAdapter] = []
 
-    # R（Recorder）调度：停顿快周期 / 低频慢周期，静默运行
     scheduler = getattr(agent, "recorder_scheduler", None)
     if scheduler is not None:
         asyncio.get_event_loop().create_task(scheduler.run_forever())
@@ -53,30 +107,63 @@ async def _run() -> None:
             adapter.name = ch.name        # 频道名 = channels/<name>.yml 的文件名
             adapters.append(adapter)
 
-    if not adapters:
-        raise SystemExit(f"没有启用任何频道：在 {cfg.home / 'channels'} 里建个 yml"
-                         "（channels/feishu.yml 之类的，enabled: true）")
+    by_name = {a.name: a for a in adapters}
+    last_events: dict[str, MessageEvent] = {}
 
-    # 每频道最近一条入站消息：跨频道投递时当该频道的回复上下文（chat/引用载体）
-    last_events: dict[str, object] = {}
+    # ---- 控制台转录：工具工作行（M 的工具才有；R 的整理细节进日志不进控制台）
+    def tool_observer(part: str, name: str, args: dict, stat: str, result: str) -> None:
+        if part != "messenger":
+            return
+        if name == "run_command":
+            label = str(args.get("command") or "").strip()
+            args_s = ""
+        else:
+            label = name
+            args_s = " ".join(f"{k}={v}" for k, v in (args or {}).items())
+            if len(args_s) > 60:
+                args_s = args_s[:57] + "…"
+        digest = strip_ansi(stat) or ((result or "").splitlines() or [""])[0][:30]
+        server.broadcast({"kind": "tool", "tool": label, "args": args_s, "digest": digest})
 
-    # 核心入口：submit 即返回；回复经 responder 按气泡的 channel 路由到对应频道
-    async def on_message(event) -> None:
-        logger.info("[%s] %s %s", event.channel, bold_cyan("<<"), event.text[:80])
-        adapter = event_adapter(event.channel)
+    agent.registry.observer = tool_observer
+
+    # ---- 消息进来：转录 + 入核心；回复经 responder 按气泡 channel 路由
+    async def on_message(event: MessageEvent) -> None:
+        logger.info("[%s] %s %s", event.channel, bold_cyan("<<"), (event.text or "")[:80])
         last_events[event.channel] = event
+        server.broadcast(_inbound_ev(event))
+        adapter = by_name.get(event.channel)
+
+        def quote_ref(quote_to: str | None, target: str) -> str:
+            """出站回复前缀素材：引用那条的正文摘要（拿不到就不挂）。"""
+            if not quote_to:
+                return ""
+            try:
+                hit = agent.ledger.find_bubble(agent.bucket_of(event), quote_to, channel=target)
+                if hit is not None and hit.content:
+                    clip = hit.content.replace("\n", " ")[:12]
+                    return clip + ("…" if len(hit.content) > 12 else "")
+            except Exception:
+                pass
+            return ""
 
         async def responder(text: str, quote_to: str | None = None,
                             media: str | None = None, channel: str | None = None,
-                            _event=event, _adapter=adapter):
-            """回复出口：按气泡的 channel 路由（不写 = 来的频道）。
-            quote_to：M 的 replyTo → 通道级引用；media：媒体消息（<img>/<file>，独立消息）。
-            返回 SendResult（message_id 回填账用）。"""
+                            _event=event):
+            """回复出口：按气泡的 channel 路由（不写 = 来的频道）。"""
             target = channel or _event.channel
+            reply = quote_ref(quote_to, target)
+            body = text or f"（{Path(media).name}）" if media else text
+            if target == "cli":
+                server.broadcast({"kind": "msg", "channel": "cli", "speaker": "neoagent",
+                                  "text": body, "reply": reply})
+                return SendResult(ok=True)
             ad = by_name.get(target)
             ev = last_events.get(target)
             if ad is None or ev is None:
                 logger.warning("[%s] 频道还没有对话上下文，发不出去", target)
+                server.broadcast({"kind": "notice",
+                                  "text": f"{target} 还没有对话，发不出去"})
                 return SendResult(ok=False, error=f"频道 {target} 还没有对话，发不出去")
             note = gray(f"（引用 {quote_to}）") if quote_to else ""
             if media:
@@ -86,43 +173,132 @@ async def _run() -> None:
             else:
                 logger.info("[%s] %s %s%s", target, bold_green(">>"), note, text)
                 result = await ad.send_reply(ev, text, quote_to=quote_to)
-            if not result.ok:
+            if result.ok:
+                server.broadcast({"kind": "msg", "channel": target, "speaker": "neoagent",
+                                  "text": body, "reply": reply})
+            else:
                 logger.error("[%s] 回复失败：%s", target, result.error)
+                server.broadcast({"kind": "notice",
+                                  "text": f"{target} 回复失败：{result.error}"})
             return result
 
-        # 空闲开 turn，忙则 steer/redirect 注入当前 turn（不起并行任务）
-        await agent.submit(event, quote_fetcher=adapter.fetch_message_text,
+        await agent.submit(event,
+                           quote_fetcher=(adapter.fetch_message_text if adapter else None),
                            responder=responder)
 
-    by_name = {a.name: a for a in adapters}
+    # ---- 控制台输入：/ 指令（回执两形态）或裸输入（channel=cli 聊天）
+    def console_ctx(conn: ClientConn) -> commands.CommandContext:
+        def tail_logs(n: int):
+            try:
+                lines = (cfg.home / "logs" / "latest.log").read_text(
+                    encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                return []
+            return lines[-n:]
 
-    def event_adapter(channel: str) -> ChannelAdapter:
-        return by_name[channel]
+        def status_extra():
+            out = []
+            for ch in cfg.channels:
+                state = "已启用" if ch.enabled else "已停用"
+                live = "（在跑）" if ch.name in by_name else ""
+                out.append(f"频道 {ch.name}（{ch.kind}）{state}{live}")
+            return out
+
+        return commands.CommandContext(
+            surface="console", channel="cli",
+            home=agent.ledger.get_setting("home"),
+            known_channels=cfg.channel_names(),
+            set_home=lambda c: agent.ledger.set_setting("home", c),
+            thinking=agent.effort_provider(),
+            set_thinking=lambda v: save_config_value("model.thinking", v, home=cfg.home),
+            status_extra=status_extra,
+            tail_logs=tail_logs,
+            tail_history=transcript.recent,
+            reply_rows=lambda rows: server.reply_rows(conn, list(rows)),
+            get_quiet=lambda: conn.quiet,
+            set_quiet=lambda on: setattr(conn, "quiet", on),
+            request_stop=stop_event.set)
+
+    async def on_input(conn: ClientConn, text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        if text.startswith("/"):
+            cmd = commands.lookup(text)
+            receipt = commands.execute(text, console_ctx(conn))
+            if not receipt:
+                return
+            if cmd is not None and cmd.view:
+                server.reply_text(conn, receipt)       # 视图指令：只给发起者，不落转录
+            else:
+                server.broadcast({"kind": "msg", "channel": "cli", "speaker": "系统",
+                                  "text": receipt})
+            return
+        # 裸输入 = 以主人身份跟 neoagent 说话（入账 channel=cli；转录经 on_message）
+        event = MessageEvent(id=uuid.uuid4().hex[:12], channel="cli",
+                             sender=Sender(id="cli-owner", name="主人"),
+                             conversation=Conversation(id="cli", type="direct"),
+                             text=text, timestamp=time.time())
+        await on_message(event)
+
+    server = ControlServer(sock, transcript, on_input=on_input)
+    await server.start()
 
     for a in adapters:
         a.set_message_handler(on_message)
 
-    # 连接所有通道（内部各自跑长轮询/WS），然后挂起等信号
-    await asyncio.gather(*(a.connect() for a in adapters))
-    logger.info("neoagent 已启动，通道：%s", ", ".join(by_name))
+    if not adapters:
+        server.broadcast({"kind": "notice",
+                          "text": f"没有启用任何频道：{cfg.home / 'channels'} 里建个 yml"
+                                  "（enabled: true），或在聊天里 /connect"})
+    else:
+        await asyncio.gather(*(a.connect() for a in adapters))
+        logger.info("neoagent 已启动，频道：%s", ", ".join(by_name))
+
+    # ---- 控制台：一体化且有终端才内嵌（attach 形态自己起客户端）
+    async def embedded_console() -> None:
+        reason = await run_client(sock, home=str(cfg.home), detachable=False)
+        if reason == "stop":
+            stop_event.set()
+
+    console_task = None
+    if not headless:
+        console_task = asyncio.get_event_loop().create_task(embedded_console())
 
     try:
-        await asyncio.Event().wait()  # 常驻，直到被 Ctrl-C 打断
+        await stop_event.wait()
     finally:
-        # 收尾限时：哪个通道断得慢都别拖住退出
+        if console_task is not None and not console_task.done():
+            console_task.cancel()
+        await server.stop()
+        # 收尾限时：哪个频道断得慢都别拖住退出
         try:
             await asyncio.wait_for(
                 asyncio.gather(*(a.disconnect() for a in adapters), return_exceptions=True),
                 timeout=5)
         except Exception:
-            logger.exception("断开通道超时/出错，直接退出")
+            logger.exception("断开频道超时/出错，直接退出")
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="neoagent",
+        description="neoagent：IM（微信/飞书）+ 工具调用闭环的个人助手服务")
+    parser.add_argument("mode", nargs="?", default="",
+                        choices=["", "serve", "console", "tui"],
+                        help="serve=无头服务 / console(tui)=只开控制台 / 不写=一体化")
+    parser.add_argument("--home", default=None,
+                        help="配置家目录（默认 ~/.neoagent，或环境变量 NEOAGENT_HOME）")
+    parser.add_argument("--verbose", action="store_true",
+                        help="日志同时打进终端（开发用；默认日志只落文件）")
+    args = parser.parse_args()
+    if args.home:
+        import os
+        os.environ["NEOAGENT_HOME"] = str(Path(args.home).expanduser())
     try:
-        asyncio.run(_run())
+        asyncio.run(_run(args.mode, args.verbose))
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info("收到中断，退出")
+        pass
 
 
 if __name__ == "__main__":

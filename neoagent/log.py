@@ -24,6 +24,7 @@ import os
 import re
 import sys
 import time
+from pathlib import Path
 
 _RESET = "\033[0m"
 _BOLD = "\033[1m"
@@ -38,6 +39,12 @@ _LEVEL_COLOR = {
 }
 
 _TAG_RE = re.compile(r"\[([A-Za-z_][\w.]*)\]")     # [weixin] [M] [turn] …（唯一的通用 pattern）
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(s: str) -> str:
+    """剥掉 ANSI 色码（落文件/转录用纯文本）。"""
+    return _ANSI_RE.sub("", str(s))
 
 
 def _paint(msg: str) -> str:
@@ -89,6 +96,17 @@ class ColorFormatter(logging.Formatter):
         return out
 
 
+class PlainFormatter(logging.Formatter):
+    """文件版：带日期、剥 ANSI（调用点包的颜色不进文件）。"""
+
+    def format(self, record) -> str:
+        msg = strip_ansi(record.getMessage())
+        out = f"{self.formatTime(record)} {record.levelname:<7} {msg}"
+        if record.exc_info:
+            out += "\n" + strip_ansi(self.formatException(record.exc_info))
+        return out
+
+
 def _use_color(stream) -> bool:
     try:
         tty = stream.isatty()
@@ -98,18 +116,34 @@ def _use_color(stream) -> bool:
         and os.environ.get("TERM", "") != "dumb"
 
 
-def setup_logging(level: int = logging.INFO) -> None:
-    """全局日志配置（run/cli 共用）。管道/非 TTY 自动退化为纯文本。"""
+def setup_logging(level: int = logging.INFO, file_path=None,
+                  stderr: bool = True, color_stream=None) -> None:
+    """全局日志配置（run/cli 共用）。
+
+    - stderr=False：日志不进终端（控制台形态——日志是日志、控制台是控制台）；
+    - file_path：日志双写文件（剥 ANSI、带日期）；
+    - color_stream：着色判断看哪个流（控制台形态看 stdout）。
+    管道/非 TTY 自动退化为纯文本。
+    """
     global _COLOR_ON
-    handler = logging.StreamHandler(sys.stderr)
-    _COLOR_ON = _use_color(sys.stderr)
-    if _COLOR_ON:
-        handler.setFormatter(ColorFormatter())
-    else:
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M"))
+    color_stream = color_stream or sys.stderr
+    _COLOR_ON = _use_color(color_stream)
     root = logging.getLogger()
-    root.handlers[:] = [handler]
+    root.handlers[:] = []
+    if stderr:
+        handler = logging.StreamHandler(sys.stderr)
+        if _COLOR_ON:
+            handler.setFormatter(ColorFormatter())
+        else:
+            handler.setFormatter(logging.Formatter(
+                "%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M"))
+        root.addHandler(handler)
+    if file_path is not None:
+        path = Path(file_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.StreamHandler(open(path, "a", encoding="utf-8"))
+        fh.setFormatter(PlainFormatter())
+        root.addHandler(fh)
     root.setLevel(level)
     # httpx 每个请求打一行 "HTTP Request: …"，纯噪音——压到 WARNING 以下不露面。
     # ⚠️ venv 里装的 httpx 分叉包 logger 叫 "httpx2"，只压 "httpx" 没用（踩过）。

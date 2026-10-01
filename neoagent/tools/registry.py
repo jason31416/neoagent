@@ -65,6 +65,9 @@ class ToolRegistry:
         日志里标全称。"""
         self.part = part
         self._tools: Dict[str, ToolEntry] = {}
+        # 工具观察者（控制台工作行用）：(part, name, args, stat, result_text)；
+        # 内部消化异常，绝不影响工具执行
+        self.observer = None
 
     def register(self, name: str, description: str,
                  parameters: Dict[str, Any], handler: ToolHandler) -> None:
@@ -105,4 +108,10 @@ class ToolRegistry:
         logger.info("[%s] 工具 %s 结果 %s", self.part, bold_cyan(name), stat)
         logger.debug("[%s] 工具 %s 结果全文%s：%s", self.part, bold_cyan(name),
                      gray(f"（{len(text)} 字符）"), gray(text[:500]))
+        if self.observer is not None:
+            try:
+                self.observer(self.part, name, args,
+                              (out.stat if isinstance(out, ToolOutput) else "") or "", text)
+            except Exception:
+                logger.exception("工具观察者出错")
         return out
