@@ -7,14 +7,12 @@ model:
   base_url: https://api.deepseek.com
   # 密钥也可以不落盘：环境变量 NEOAGENT_LLM_API_KEY 优先
   api_key: ""
-  name: deepseek-chat
+  name: deepseek-flash
   # 思考档位（热改：/effort low 之类，改了下一条消息即生效）：
   # none=不思考 | minimal/low/medium/high/xhigh/ultra/max=思考，档位越高想得越多
   thinking: medium
 
-personality:
-  # neoagent 的人设与说话方式（改它就改了性格与消息协议说明）
-  prompt: prompts/messenger.md
+# 人格在同目录 personality.md（用户可改；消息协议等内置提示词随代码仓库走）
 
 memory:
   # 记忆库目录（相对本目录）：memory.md + 子文件 + old/ 归档
@@ -28,7 +26,7 @@ memory:
   # 整理用的思考档位（要省可降）
   tidy_thinking: medium
   # 一次整理最多连续调用多少轮工具
-  tidy_tool_rounds: 12
+  tidy_tool_rounds: 30
 
 limits:
   # 一次回复内最多连续调用多少轮工具（防失控）

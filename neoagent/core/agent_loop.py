@@ -43,8 +43,9 @@ from .render import render_messages
 
 logger = logging.getLogger(__name__)
 
-# 【它是谁】：M 的身份与行为准则（产品文档上下文第 1 段）
-# ——内容在独立文件 prompts/messenger.md（可配置 agent.identity_file），这里不重复。
+# 【它是谁】：M 的身份、行为准则与人格（产品文档上下文第 1 段）
+# ——内置部分在包内 prompts/messenger.md（协议/工作方式，随代码仓库走），
+# 人格在用户家目录 personality.md（唯一用户可改的提示词）；拼接：messenger → personality。
 
 # 兜底：语音转写失败/不可用时正文的占位
 _VOICE_FALLBACK = "（语音消息，转写暂不可用）"
@@ -82,6 +83,7 @@ class AgentLoop:
 
     def __init__(self, llm: LLMClient, registry: ToolRegistry, ledger: MessageLedger,
                  memory_file: Path, *, identity_file: Optional[Path] = None,
+                 personality_file: Optional[Path] = None,
                  vision=None, transcriber=None, token_counter: Optional[TokenCounter] = None,
                  max_tool_rounds: int = 90, token_budget: int = 250_000,
                  max_images: int = MAX_IMAGES_PER_MESSAGE,
@@ -99,6 +101,7 @@ class AgentLoop:
         self.ledger = ledger
         self.memory_file = Path(memory_file)
         self.identity_file = Path(identity_file) if identity_file else None
+        self.personality_file = Path(personality_file) if personality_file else None
         self.vision = vision
         self.transcriber = transcriber
         self.token_counter = token_counter or HeuristicTokenCounter()
@@ -643,14 +646,16 @@ class AgentLoop:
             return ""
 
     def _identity_text(self) -> str:
-        """【它是谁】段：prompts/messenger.md 全文（可配置 agent.identity_file）。"""
-        if self.identity_file is None:
-            return ""
-        try:
-            return self.identity_file.read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            logger.warning("身份文件读取失败 %s：%s", self.identity_file, exc)
-            return ""
+        """【它是谁】段：包内 messenger.md（协议/工作方式）+ 用户 personality.md（人格）。"""
+        parts: List[str] = []
+        for label, path in (("内置提示词", self.identity_file), ("人格", self.personality_file)):
+            if path is None:
+                continue
+            try:
+                parts.append(path.read_text(encoding="utf-8").strip())
+            except OSError as exc:
+                logger.warning("%s读取失败 %s：%s", label, path, exc)
+        return "\n\n".join(p for p in parts if p)
 
     def _render(self, session_key: str, overhead: int = 0):
         """装配一次请求 → (messages, 时间线估算 token, 是否被迫裁剪)。"""

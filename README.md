@@ -58,9 +58,9 @@ uv run python -m neoagent.run console    # 只开控制台（别名 tui），多
 
 ```
 ~/.neoagent/
-├── config.yml        # model / personality / memory / limits / advanced（带注释）
+├── config.yml        # model / memory / limits / advanced（带注释）
+├── personality.md    # 人格（唯一用户可改的提示词，拼在内置提示词后进系统消息）
 ├── channels/         # 一个频道一个 yml：kind + enabled + 凭据（/connect 会生成）
-├── prompts/          # 人设（首启从包内拷入，改你自己的那份，升级不被冲）
 ├── logs/latest.log   # 技术日志（控制台不刷屏；/logs 50 现场调看）
 └── data/             # 账本、记忆、工作台、登录态、control.sock
 ```

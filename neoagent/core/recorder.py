@@ -31,12 +31,11 @@ logger = logging.getLogger("neoagent.recorder")
 
 RECORD_NAME = "record_memory"      # M 的提案工具名（流水中唯一保留的工具痕迹）
 
-def _load_system(prompt_path: Optional[Path] = None) -> str:
-    """R 的系统提示词：~/.neoagent/prompts/recorder.md（首启从包内拷入，改你自己的那份，
-    升级不被冲）；没有就用包内内置。周期差异片段见 _CYCLE_NOTES，运行时拼接。"""
-    builtin = PROJECT_ROOT / "neoagent" / "prompts" / "recorder.md"
-    path = prompt_path if (prompt_path is not None and prompt_path.exists()) else builtin
-    return path.read_text(encoding="utf-8").strip()
+def _load_system() -> str:
+    """R 的系统提示词：包内 prompts/recorder.md（随代码仓库走，不开放用户配置）。
+    周期差异片段见 _CYCLE_NOTES，运行时拼接。"""
+    return (PROJECT_ROOT / "neoagent" / "prompts" / "recorder.md").read_text(
+        encoding="utf-8").strip()
 
 _CYCLE_NOTES = {
     "fast": """## 本次是快周期整理
@@ -60,8 +59,7 @@ class Recorder:
                  token_budget: int = 250_000,
                  max_tool_rounds: int = 90,
                  effort_provider: Optional[Callable[[], str]] = None,
-                 slow_lookback_days: int = 7,
-                 prompt_path: Optional[Path] = None) -> None:
+                 slow_lookback_days: int = 7) -> None:
         self.llm = llm
         self.ledger = ledger
         self.memory_dir = Path(memory_dir)
@@ -71,7 +69,7 @@ class Recorder:
         self.max_tool_rounds = int(max_tool_rounds)
         self.effort_provider = effort_provider or (lambda: "medium")
         self.slow_lookback_days = int(slow_lookback_days)
-        self._system = _load_system(prompt_path)   # 提示词 home 优先（用户那份说了算）
+        self._system = _load_system()          # 提示词随包（不开放用户配置）
         self._lock = asyncio.Lock()            # 整理跑互斥（停顿调度/紧急压缩不并发）
 
     # ------------------------------------------------------------------

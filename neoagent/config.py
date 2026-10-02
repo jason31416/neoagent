@@ -3,11 +3,11 @@
 布局（NEOAGENT_HOME 或 --home 可指到别处）：
 
     ~/.neoagent/
-    ├── config.yml        总配置（model / personality / memory / limits / advanced）
+    ├── config.yml        总配置（model / memory / limits / advanced）
+    ├── personality.md    人格（唯一用户可改的提示词；拼在内置提示词后进系统消息）
     ├── channels/         每频道一个 yml，文件名 = 频道名（时间线 channel 值）
-    ├── prompts/          人设等（首启从包内拷入，用户改、升级不冲）
     ├── logs/             日志（排障用，基本没人看）
-    └── data/             账本、转录、记忆、工作台、登录态
+    └── data/             账本、记忆、工作台、登录态
 
 优先级：环境变量 NEOAGENT_* > config.yml > 默认值。密钥可不落盘。
 配置写回（/effort、/connect 等指令）走 ruamel 保注释——改文件和改指令殊途同归。
@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 
 from ruamel.yaml import YAML
 
-# 源码/安装目录：内置 prompts 与配置骨架从这里拷
+# 源码/安装目录：人格模板与配置骨架从这里拷；messenger/recorder 等内置提示词直接读包内
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PACKAGE_DIR = Path(__file__).resolve().parent
 
@@ -54,7 +54,6 @@ class AgentConfig:
     max_tool_rounds: int = 12
     history_token_budget: int = 250_000  # 时间线 token 预算（成组抛弃，召回不计）
     image_token_estimate: int = 1024     # 每张图估算 token（计数器用）
-    identity_file: str = "prompts/messenger.md"   # 人设（相对家目录）
     workspace: str = "data/workspace"    # 工作台：exec 默认 cwd、相对路径基准、产出物落脚点
     # 模型请求上下文落盘（调试用）：置空关闭
     modellog_dir: str = "data/modellog"
@@ -251,7 +250,7 @@ def load_channels(home: Path) -> List[ChannelConfig]:
 
 
 def ensure_home(home: Optional[Path] = None) -> bool:
-    """没有配置就生成骨架：config.yml + channels/ + prompts/ + data/。
+    """没有配置就生成骨架：config.yml + personality.md + channels/ + data/。
 
     返回是否是首启（本次才生成骨架）。幂等，已有的文件一律不覆盖。
     """
@@ -261,20 +260,18 @@ def ensure_home(home: Optional[Path] = None) -> bool:
     (home / "data").mkdir(exist_ok=True)
     (home / "logs").mkdir(exist_ok=True)
     (home / "channels").mkdir(exist_ok=True)
-    (home / "prompts").mkdir(exist_ok=True)
 
     example = PACKAGE_DIR / "config.example.yml"
     cfg_file = home / "config.yml"
     if not cfg_file.exists() and example.exists():
         shutil.copy(example, cfg_file)
 
-    # 人设等：包内拷入 home，用户改自己那份、升级不被冲
-    pkg_prompts = PACKAGE_DIR / "prompts"
-    if pkg_prompts.is_dir():
-        for src in pkg_prompts.glob("*.md"):
-            dst = home / "prompts" / src.name
-            if not dst.exists():
-                shutil.copy(src, dst)
+    # 人格：包内模板拷入 home，用户改自己那份、升级不被冲
+    # （messenger/recorder 等内置提示词不拷，代码直接读包内）
+    tpl = PACKAGE_DIR / "prompts" / "personality.md"
+    dst = home / "personality.md"
+    if tpl.is_file() and not dst.exists():
+        shutil.copy(tpl, dst)
     return fresh
 
 
@@ -304,7 +301,6 @@ def load_config(home: Optional[Path] = None) -> Config:
     cfg.llm.model = str(_get(raw, "model.name", cfg.llm.model))
     cfg.llm.reasoning_effort = str(_get(raw, "model.thinking", cfg.llm.reasoning_effort))
 
-    cfg.agent.identity_file = str(_get(raw, "personality.prompt", cfg.agent.identity_file))
     cfg.agent.max_tool_rounds = int(_get(raw, "limits.max_tool_rounds", cfg.agent.max_tool_rounds))
     cfg.agent.history_token_budget = int(_get(raw, "limits.history_token_budget",
                                               cfg.agent.history_token_budget))

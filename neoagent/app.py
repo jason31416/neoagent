@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import logging
 
-from .config import Config, ReasoningEffortSource, resolve_path, save_config_value
+from .config import (PACKAGE_DIR, Config, ReasoningEffortSource, resolve_path,
+                     save_config_value)
 from .core import modellog
 from .core.agent_loop import AgentLoop
 from .core.commands import CommandContext
@@ -73,15 +74,17 @@ def build_agent(cfg: Config) -> AgentLoop:
         cfg.asr.provider, cfg.asr.base_url, cfg.asr.api_key, cfg.asr.model,
         cfg.asr.language, cfg.asr.max_audio_seconds)
 
-    # 消息库（SQLite，全量落盘）+ 人设文件
+    # 消息库（SQLite，全量落盘）+ 提示词（messenger 读包内、personality 读用户那份）
     ledger = MessageLedger(cfg.data_dir / "neoagent.db")
-    identity_file = resolve_path(cfg.home, cfg.agent.identity_file)
+    identity_file = PACKAGE_DIR / "prompts" / "messenger.md"
+    personality_file = resolve_path(cfg.home, "personality.md")
 
     llm = LLMClient(cfg.llm.base_url, cfg.llm.api_key, cfg.llm.model,
                     reasoning_effort=cfg.llm.reasoning_effort)
     token_counter = HeuristicTokenCounter(image_tokens=cfg.agent.image_token_estimate)
     agent = AgentLoop(llm, registry, ledger, memory_md,
                       identity_file=identity_file,
+                      personality_file=personality_file,
                       vision=vision, transcriber=transcriber,
                       effort_provider=effort,
                       effort_setter=lambda v: save_config_value("model.thinking", v,
@@ -122,8 +125,7 @@ def build_agent(cfg: Config) -> AgentLoop:
                         token_budget=cfg.agent.history_token_budget,
                         max_tool_rounds=cfg.recorder.max_tool_rounds,
                         effort_provider=lambda: cfg.recorder.reasoning_effort,
-                        slow_lookback_days=cfg.recorder.slow_lookback_days,
-                        prompt_path=resolve_path(cfg.home, "prompts/recorder.md"))
+                        slow_lookback_days=cfg.recorder.slow_lookback_days)
     agent.recorder = recorder
     agent.recorder_scheduler = RecorderScheduler(
         recorder, ledger,
