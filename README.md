@@ -2,7 +2,8 @@
 
 技术栈可行性 demo：**接入微信 / 飞书，能收消息、调工具、回消息**，外加一个 MC 服务器式的控制台。
 产品文档中的 M/E/R 等其余部分不在本样例范围内（见 `docs/最简样例-实施计划.md`）；
-主动性（自己决定何时请求自己）已落地，见 `docs/设计-主动性.md`。
+主动性（自己决定何时请求自己）已落地，见 `docs/设计-主动性.md`；
+对外部服务的能力（skill）见 `docs/设计-skill框架.md`。
 
 ## 它能做什么
 
@@ -11,6 +12,10 @@
 - 在**控制台**里和它说话、看它干活（全频道对话 + 每次工具调用一行，转录只存内存、重启即清）
 - 它能调用工具干活：`read_file`（读文件）/ `write_file`（写文件）/ `exec`（跑命令）
   / `run_command`（跑 neoagent 自己的指令）/ `schedule_wake`（给未来的自己排唤醒）
+  / `skill_list` 等四个 skill 工具（调外部服务）
+- **对外部服务有"手"（skill）**：服务封装成 `~/.neoagent/skills/` 下的 skill 包
+  （声明式工具 + 脚本 + 密钥 `.env`），固定四个工具 `skill_list` / `skill_show` /
+  `skill_call` / `skill_check`，不随服务涨；skill 由 agent 自己创建维护（`/skills` 看清单）
 - **主动性**：说"明早提醒我带作业""这事一会再说"，它自己排闹钟、到点开口（重启不丢，
   错过的合并补报）；说不说它自己定，不合适就沉默。配了 Jev 还有个便宜哨兵，
   觉得值得惦记才主动说一句（免打扰、不重复骚扰）
@@ -64,6 +69,7 @@ uv run python -m neoagent.run console    # 只开控制台（别名 tui），多
 ~/.neoagent/
 ├── config.yml        # model / memory / settle / jev / proactive / limits / advanced（带注释）
 ├── personality.md    # 人格（唯一用户可改的提示词，拼在内置提示词后进系统消息）
+├── skills/           # skill 包（agent 自己维护）：skill.md + skill.yml + scripts/ + .env
 ├── channels/         # 一个频道一个 yml：kind + enabled + 凭据（/connect 会生成）
 ├── logs/latest.log   # 技术日志（控制台不刷屏；/logs 50 现场调看）
 └── data/             # 账本、记忆、工作台、登录态、control.sock
@@ -89,11 +95,11 @@ IM 里的 LLM 等于拿着一台 shell，三道防线都在 `config.yml` 的 `ad
 
 ```
 neoagent/
-├── core/          MessageEvent / ChannelAdapter / LLM 客户端 / agent 循环 / Recorder / 指令注册表
+├── core/          MessageEvent / ChannelAdapter / LLM 客户端 / agent 循环 / Recorder / 指令注册表 / skill 内核
 ├── channels/
 │   ├── weixin/    iLink Bot API 协议层 + 适配器 + 扫码登录
 │   └── feishu/    lark-oapi 适配器
-├── tools/         工具注册表 + read_file / write_file / exec / record_memory / run_command / wake 工具组 / 记忆工具组
+├── tools/         工具注册表 + read_file / write_file / exec / record_memory / run_command / wake 工具组 / 记忆工具组 / skill 工具组
 ├── console/       控制台：渲染（朴素规则）/ 转录缓冲 / prompt_toolkit 客户端
 ├── control.py     控制协议（本机 socket：转录回放 + 实时事件 + 输入）
 ├── config.py      配置加载（yml + channels/*.yml + 保注释写回）
