@@ -13,7 +13,8 @@
   可连发多条、可干活中途先发一条；无块 = 静默；标签外文字 = 碎碎念，原样留存但不发送；
 - **/ 指令不进模型**：照常入账，指令解析器直接回 system 消息（见 core/commands.py）；
 - 工具流水（tool_call/tool_result）当轮即落消息库——事实层 = 完整上下文快照；
-- 内部消息（E/cron/jev）走 inject_internal() 注入时间线，本期恒空。
+- 内部消息走 inject_internal()（指令回执等，role=system）；自我唤醒（闹钟/哨兵）
+  走 inject_wake()（<wake> 块，role=user 的系统消息）。
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ from .events import Attachment, MessageEvent
 from .frames import (Bubble, attachment_notes, finalize_assistant, finalize_user,
                      recall_tag)
 from .ledger import (MessageLedger, TYPE_ASSISTANT, TYPE_INTERNAL, TYPE_TOOL_RESULT,
-                     TYPE_USER)
+                     TYPE_USER, TYPE_WAKE)
 from .llm import LLMClient
 from .render import render_messages
 
@@ -209,10 +210,25 @@ class AgentLoop:
                 pass
 
     def inject_internal(self, session_key: str, text: str) -> None:
-        """内部消息注入（E 的输出 / cron / jev 的提醒）。本期无人调用，接口留好。"""
+        """内部消息注入（指令回执等流程注记；role=system）。"""
         bid = self.ledger.alloc_bubbles(session_key, 1)[0]
         final = finalize_user(text, sender="system", bubble_id=bid, ts=time.time())
         self.ledger.add_turn(session_key=session_key, type=TYPE_INTERNAL, text=final)
+
+    def inject_wake(self, session_key: str, blocks_text: str,
+                    responder: Optional[Callable[..., Awaitable[Any]]] = None) -> None:
+        """自我唤醒注入（<wake> 块；一条消息可并列多块 = 补漏清单）+ 计入待答。
+
+        与 ingest 的关键区别：**不取消在飞模型**——唤醒不是用户插话，不打断
+        正在跑的轮；只落账 + input_gen++。开工时机由调用方定（SettleGate.push_wake：
+        会话在攒批窗口就随批一起 kick，否则即刻）。
+        """
+        st = self._states.setdefault(session_key, SessionState())
+        if responder is not None:
+            st.responder = responder
+        self.ledger.add_turn(session_key=session_key, type=TYPE_WAKE,
+                             text=blocks_text, timestamp=time.time())
+        st.input_gen += 1
 
     async def _handle_command(self, event: MessageEvent, session_key: str,
                               text: str, responder) -> None:
@@ -412,6 +428,10 @@ class AgentLoop:
         first = self.ledger.first_inbound(session_key)
         return first.platform if first else ""
 
+    def home_channel(self) -> str:
+        """home 频道（主动消息的默认出口）——主动出站/调度器用。"""
+        return self._home_channel(self.timeline_bucket or "main")
+
     def _outbound_chat(self, session_key: str, channel: str) -> str:
         """出站气泡的 chat 归属：该频道最近一次入站消息的 chat。"""
         hit = self.ledger.last_inbound(session_key, channel=channel)
@@ -472,7 +492,8 @@ class AgentLoop:
         """一轮模型输出：定稿入库（assistant 行 + 气泡行）→ 逐个气泡投递。
 
         返回 (assistant 行 seq|None, 实发条数)。思考草稿随 assistant 行入库
-        （回传锚点，一份/轮）；完全静默的轮不落行。"""
+        （回传锚点，一份/轮）；无正文、无工具、**连思考都没有**的轮才不落行——
+        有思考就落行（text 可空、气泡 0 条）：决定沉默也是决定，得留痕。"""
         ts = time.time()
         final, bubbles = finalize_assistant(
             result.content, ts=ts,
@@ -480,7 +501,7 @@ class AgentLoop:
             lookup=self._bubble_lookup(session_key),
             default_channel=self._default_channel(session_key),
             known_channels=self.known_channels)
-        if not final.strip() and not calls:
+        if not final.strip() and not calls and not result.reasoning:
             return None, 0
         seq = self.ledger.add_turn(
             session_key=session_key, type=TYPE_ASSISTANT, text=final,

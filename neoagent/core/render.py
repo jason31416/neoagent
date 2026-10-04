@@ -69,6 +69,8 @@ def _row_cost(r, counter) -> int:
     c = 12 + counter.count(r.text or "")
     for call in r.calls:
         c += 24 + counter.count(call.name) + counter.count(call.arguments)
+    if r.type == TYPE_ASSISTANT:            # 思考草稿要回传，成本得算上
+        c += counter.count(r.reasoning or "")
     c += counter.count_image() * sum(
         1 for a in r.attachments if a.kind == "image" and a.data)
     return c
@@ -185,7 +187,8 @@ def _assemble(r, counter, vision, include_reasoning: bool) -> Tuple[dict, int]:
             msg["reasoning_content"] = r.reasoning or _REASONING_PAD
         return msg, cost
 
-    # user / internal
+    # user / internal / wake：internal 是流程注记（role=system）；
+    # wake 是自我唤醒（role=user，正文是 <wake> 块）——都在消息流里
     role = "system" if r.type == TYPE_INTERNAL else "user"
     if parts:
         return {"role": role,

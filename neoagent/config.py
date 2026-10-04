@@ -107,10 +107,7 @@ class ExecConfig:
 class SettleConfig:
     """多消息攒批：消息到了不立刻开工，按"后面还有没有下文"等窗口到点再开工。"""
     enabled: bool = True
-    # Jev 决策模型（档位判定）；密钥也可以走环境变量 NEOAGENT_JEV_API_KEY
-    jev_api_key: str = ""
-    jev_base_url: str = "https://opencode.ai/zen/v1/systemone"
-    jev_model: str = "jev-1.13-free"
+    # 档位判定用 Jev——凭据在顶层 jev 组（旧键 settle.jev_* 加载时兼容映射）
     # 三档等待（秒）：明确 / 可能有补充 / 话头碎片
     wait_clear: float = 0
     wait_maybe: float = 4
@@ -120,6 +117,26 @@ class SettleConfig:
     wait_default_max: float = 4
     # 整批无论几条，最长等这么久（秒）
     wait_cap: float = 20
+
+
+@dataclass
+class JevConfig:
+    """Jev（System One 哑巴模型）凭据：攒批档位判定与主动哨兵共用。
+
+    没配 api_key = Jev 整个不启用：攒批走默认等待，主动性只剩闹钟。
+    密钥也可以走环境变量 NEOAGENT_JEV_API_KEY。"""
+    api_key: str = ""
+    base_url: str = "https://opencode.ai/zen/v1/systemone"
+    model: str = "jev-1.13-free"
+
+
+@dataclass
+class ProactiveConfig:
+    """主动性：唤醒（M 排的闹钟）+ 哨兵（Jev 自主探测，配了 jev 才有）。"""
+    enabled: bool = True
+    quiet_hours: str = ""            # 免打扰（如 "23:30-08:00"）：只管哨兵，闹钟照响
+    probe_active_min: float = 600    # 刚活跃后下次探测的间隔（秒）
+    probe_idle_max: float = 5400     # 静默渐稀到的最大间隔（秒）
 
 
 @dataclass
@@ -143,6 +160,8 @@ class Config:
     files: FilesConfig = field(default_factory=FilesConfig)
     exec: ExecConfig = field(default_factory=ExecConfig)
     settle: SettleConfig = field(default_factory=SettleConfig)
+    jev: JevConfig = field(default_factory=JevConfig)
+    proactive: ProactiveConfig = field(default_factory=ProactiveConfig)
     channels: List[ChannelConfig] = field(default_factory=list)
     fresh_install: bool = False      # 本次启动才生成的骨架（给首启指引用）
 
@@ -337,9 +356,6 @@ def load_config(home: Optional[Path] = None) -> Config:
                                             cfg.recorder.max_tool_rounds))
 
     cfg.settle.enabled = bool(_get(raw, "settle.enabled", cfg.settle.enabled))
-    cfg.settle.jev_api_key = str(_get(raw, "settle.jev_api_key", cfg.settle.jev_api_key) or "")
-    cfg.settle.jev_base_url = str(_get(raw, "settle.jev_base_url", cfg.settle.jev_base_url))
-    cfg.settle.jev_model = str(_get(raw, "settle.jev_model", cfg.settle.jev_model))
     cfg.settle.wait_clear = float(_get(raw, "settle.wait_clear", cfg.settle.wait_clear))
     cfg.settle.wait_maybe = float(_get(raw, "settle.wait_maybe", cfg.settle.wait_maybe))
     cfg.settle.wait_fragment = float(_get(raw, "settle.wait_fragment", cfg.settle.wait_fragment))
@@ -348,6 +364,23 @@ def load_config(home: Optional[Path] = None) -> Config:
     cfg.settle.wait_default_max = float(_get(raw, "settle.wait_default_max",
                                              cfg.settle.wait_default_max))
     cfg.settle.wait_cap = float(_get(raw, "settle.wait_cap", cfg.settle.wait_cap))
+
+    # Jev 凭据（顶层 jev 组）；旧键 settle.jev_* 兼容映射（弃用中）
+    cfg.jev.api_key = str(_get(raw, "jev.api_key",
+                               _get(raw, "settle.jev_api_key", cfg.jev.api_key)) or "")
+    cfg.jev.base_url = str(_get(raw, "jev.base_url",
+                                _get(raw, "settle.jev_base_url", cfg.jev.base_url)))
+    cfg.jev.model = str(_get(raw, "jev.model",
+                             _get(raw, "settle.jev_model", cfg.jev.model)))
+
+    # 主动性：唤醒（闹钟）+ 哨兵（Jev 自主探测）
+    cfg.proactive.enabled = bool(_get(raw, "proactive.enabled", cfg.proactive.enabled))
+    cfg.proactive.quiet_hours = str(_get(raw, "proactive.quiet_hours",
+                                         cfg.proactive.quiet_hours) or "")
+    cfg.proactive.probe_active_min = float(_get(raw, "proactive.probe_active_min",
+                                                cfg.proactive.probe_active_min))
+    cfg.proactive.probe_idle_max = float(_get(raw, "proactive.probe_idle_max",
+                                              cfg.proactive.probe_idle_max))
 
     cfg.agent.workspace = str(_get(raw, "advanced.workspace", cfg.agent.workspace))
     cfg.agent.modellog_dir = str(_get(raw, "advanced.modellog_dir", cfg.agent.modellog_dir))
@@ -393,7 +426,7 @@ def load_config(home: Optional[Path] = None) -> Config:
     cfg.llm.model = os.environ.get("NEOAGENT_LLM_MODEL", cfg.llm.model)
     cfg.llm.reasoning_effort = os.environ.get("NEOAGENT_LLM_THINKING", cfg.llm.reasoning_effort)
     cfg.asr.api_key = os.environ.get("NEOAGENT_ASR_API_KEY", cfg.asr.api_key)
-    cfg.settle.jev_api_key = os.environ.get("NEOAGENT_JEV_API_KEY", cfg.settle.jev_api_key)
+    cfg.jev.api_key = os.environ.get("NEOAGENT_JEV_API_KEY", cfg.jev.api_key)
     cfg.recorder.reasoning_effort = os.environ.get("NEOAGENT_MEMORY_TIDY_THINKING",
                                                    cfg.recorder.reasoning_effort)
     # 飞书凭据按 kind 覆盖到每个飞书频道（多开也吃得下）

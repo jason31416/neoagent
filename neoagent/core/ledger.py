@@ -5,8 +5,9 @@
   · user        用户消息（<message …> 标签定稿，图片字节在 blobs）
   · assistant   模型一次完整输出（气泡标签 + 标签外碎碎念，原样；calls=tool 调用数组；
                 reasoning=思考草稿——协议回传要，模型看不到）
-  · internal    系统内部注入（E/cron/jev，本期恒空）
+  · internal    系统内部注入（指令回执等）
   · tool_result 单个工具的返回（XML 原文，call_id 配对）
+  · wake        自我唤醒（<wake> 块：闹钟到点/哨兵叫醒/补漏清单）
   装配（render.py）几乎零加工：按 seq 顺序抄进 messages 数组即可。
 
 - **bubbles（平台消息表）**：投递的真相，一行 = 平台上真实出现的一个气泡：
@@ -38,6 +39,7 @@ TYPE_USER = "user"
 TYPE_ASSISTANT = "assistant"
 TYPE_INTERNAL = "internal"
 TYPE_TOOL_RESULT = "tool_result"
+TYPE_WAKE = "wake"        # 自我唤醒（<wake> 块；渲染 role=user 的系统消息）
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -50,7 +52,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS turns (
   seq_id      INTEGER NOT NULL,
   session_key TEXT NOT NULL,
-  type        TEXT NOT NULL,          -- user | assistant | internal | tool_result
+  type        TEXT NOT NULL,          -- user | assistant | internal | tool_result | wake
   text        TEXT,                   -- 定稿文本（净化/编号/recall 均已固化）
   reasoning   TEXT,                   -- assistant 思考草稿（回传用）
   calls       JSON,                   -- assistant 的 tool_calls 数组
@@ -85,8 +87,21 @@ CREATE TABLE IF NOT EXISTS kv (
   key   TEXT PRIMARY KEY,              -- 运行时设置（home 频道等），重启不丢
   value TEXT
 );
+CREATE TABLE IF NOT EXISTS wakes (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,  -- 对外 w<N>
+  session_key TEXT NOT NULL,
+  at          REAL NOT NULL,           -- 下次触发时刻（重复项触发后重算）
+  every       TEXT NOT NULL DEFAULT '',-- cron 表达式；空 = 一次性
+  note        TEXT NOT NULL,           -- M 给自己的便利贴（到点的理由）
+  status      TEXT NOT NULL DEFAULT 'pending',   -- pending | fired | cancelled
+  source      TEXT NOT NULL DEFAULT 'alarm',     -- alarm | probe | event
+  created_ts  REAL NOT NULL,
+  last_fired  REAL,
+  fired_count INTEGER NOT NULL DEFAULT 0
+);
 CREATE INDEX IF NOT EXISTS idx_bubbles_msgid ON bubbles(session_key, message_id);
 CREATE INDEX IF NOT EXISTS idx_turns_group ON turns(session_key, group_id);
+CREATE INDEX IF NOT EXISTS idx_wakes_due ON wakes(status, at);
 """
 
 
@@ -343,6 +358,86 @@ class MessageLedger:
             " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, str(value)))
         self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # wakes（自我唤醒表）：M 排的闹钟、调度器响，重启不丢
+    # ------------------------------------------------------------------
+    _WCOLS = ("id, session_key, at, every, note, status, source,"
+              " created_ts, last_fired, fired_count")
+
+    @staticmethod
+    def _wake(r) -> Any:
+        return SimpleNamespace(
+            id=int(r[0]), session_key=r[1], at=float(r[2] or 0), every=r[3] or "",
+            note=r[4] or "", status=r[5] or "", source=r[6] or "",
+            created_ts=float(r[7] or 0),
+            last_fired=float(r[8]) if r[8] else None,
+            fired_count=int(r[9] or 0))
+
+    def add_wake(self, *, session_key: str, at: float, note: str,
+                 every: str = "", source: str = "alarm") -> int:
+        """排一个唤醒（once 或 cron 重复），返回 w<N> 的 N。"""
+        cur = self._conn.execute(
+            "INSERT INTO wakes(session_key, at, every, note, status, source, created_ts)"
+            " VALUES(?,?,?,?, 'pending', ?, ?)",
+            (session_key, float(at), every or "", note, source, time.time()))
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def get_wake(self, wake_id: int) -> Optional[Any]:
+        row = self._conn.execute(
+            f"SELECT {self._WCOLS} FROM wakes WHERE id = ?", (int(wake_id),)).fetchone()
+        return self._wake(row) if row else None
+
+    def list_wakes(self, session_key: str, status: str = "") -> List[Any]:
+        """该会话的唤醒清单（按 at 升序）；status 空 = 全部。"""
+        sql = f"SELECT {self._WCOLS} FROM wakes WHERE session_key = ?"
+        args: list = [session_key]
+        if status:
+            sql += " AND status = ?"
+            args.append(status)
+        return [self._wake(r) for r in self._conn.execute(
+            sql + " ORDER BY at", args).fetchall()]
+
+    def due_wakes(self, now: Optional[float] = None) -> List[Any]:
+        """到点（含过点未补）的 pending 唤醒，按 at 升序。"""
+        ts = time.time() if now is None else float(now)
+        return [self._wake(r) for r in self._conn.execute(
+            f"SELECT {self._WCOLS} FROM wakes WHERE status = 'pending' AND at <= ?"
+            " ORDER BY at", (ts,)).fetchall()]
+
+    def mark_fired(self, wake_id: int, *, fired_at: Optional[float] = None,
+                   next_at: Optional[float] = None) -> None:
+        """触发记账：fired_count+1；重复项给 next_at 就续排，否则转 fired 回收。"""
+        ts = time.time() if fired_at is None else float(fired_at)
+        if next_at is not None:
+            self._conn.execute(
+                "UPDATE wakes SET fired_count = fired_count + 1, last_fired = ?, at = ?"
+                " WHERE id = ?", (ts, float(next_at), int(wake_id)))
+        else:
+            self._conn.execute(
+                "UPDATE wakes SET fired_count = fired_count + 1, last_fired = ?,"
+                " status = 'fired' WHERE id = ?", (ts, int(wake_id)))
+        self._conn.commit()
+
+    def reschedule_wake(self, wake_id: int, at: float) -> None:
+        """改期（pending 项挪到新的时刻）。"""
+        self._conn.execute("UPDATE wakes SET at = ? WHERE id = ?",
+                           (float(at), int(wake_id)))
+        self._conn.commit()
+
+    def cancel_wake(self, wake_id: int) -> str:
+        """作废一个唤醒；返回状态说明（幂等，好回给 M）。"""
+        row = self._conn.execute(
+            "SELECT status FROM wakes WHERE id = ?", (int(wake_id),)).fetchone()
+        if row is None:
+            return "没有这个唤醒"
+        if row[0] != "pending":
+            return f"已经是 {row[0]} 状态了，不能再取消"
+        self._conn.execute("UPDATE wakes SET status = 'cancelled' WHERE id = ?",
+                           (int(wake_id),))
+        self._conn.commit()
+        return "cancelled"
 
     # ------------------------------------------------------------------
     # 主表读取

@@ -32,6 +32,8 @@ class CommandContext:
     connect_channel: Optional[Callable[[str], str]] = None
     disconnect_channel: Optional[Callable[[str], str]] = None
     channels_info: Optional[Callable[[], Sequence[str]]] = None
+    # 唤醒清单（/wakes；每项一行）
+    wakes_info: Optional[Callable[[], Sequence[str]]] = None
     # 控制台视图钩子（view 指令用；agent/聊天上下文里没有 → 降级说明）
     tail_logs: Optional[Callable[[int], Sequence[str]]] = None
     reply_rows: Optional[Callable[[Sequence[dict]], None]] = None
@@ -176,6 +178,13 @@ def _channels(args: List[str], ctx: CommandContext) -> str:
     return "\n".join(lines) if lines else "（还没有频道：/connect weixin 之类建一个）"
 
 
+def _wakes(args: List[str], ctx: CommandContext) -> str:
+    if ctx.wakes_info is None:
+        return "这里看不了唤醒清单"
+    lines = list(ctx.wakes_info())
+    return "\n".join(lines) if lines else "唤醒清单是空的"
+
+
 def _connect(args: List[str], ctx: CommandContext) -> str:
     if not args:
         return _channels(args, ctx)      # 无参 = 列出可接的频道和状态
@@ -200,6 +209,7 @@ def _install_defaults() -> None:
     register("connect", "connect [频道]  连上频道（扫码/写自启；无参 = 列出频道）", _connect)
     register("disconnect", "disconnect <频道>  停用频道（登录态保留，再连免扫码）", _disconnect)
     register("channels", "列出频道与状态", _channels)
+    register("wakes", "唤醒清单（闹钟/自查；id 供 cancel_wake 用）", _wakes)
     # 控制台视图/管理指令（输出不落转录；agent 拿不到视图钩子会得到一句说明）
     register("logs", "logs [行数]  看最近的技术日志", _logs, surfaces=("console",), view=True)
     register("quiet", "隐藏/显示工作行（工具调用那些）", _quiet, surfaces=("console",), view=True)

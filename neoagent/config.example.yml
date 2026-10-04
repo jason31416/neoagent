@@ -31,10 +31,6 @@ memory:
 settle:
   # 多条消息攒批：消息到了不立刻开工，判定"后面还有没有下文"，等窗口到点再开工
   enabled: true
-  # 档位判定用 Jev 决策模型（免费）；密钥也可以走环境变量 NEOAGENT_JEV_API_KEY
-  jev_api_key: ""
-  jev_base_url: https://opencode.ai/zen/v1/systemone
-  jev_model: jev-1.13-free
   # 三档等待（秒）：明确指令/问题（判定一回来就开工）/ 可能有补充 / 话头碎片
   wait_clear: 0
   wait_maybe: 4
@@ -44,6 +40,23 @@ settle:
   wait_default_max: 4
   # 整批无论几条，最长等这么久（秒）
   wait_cap: 20
+
+jev:
+  # Jev 决策模型（System One 哑巴模型）：攒批档位判定 + 主动哨兵共用；
+  # 不配 api_key = Jev 整个不启用（攒批走默认等待，主动性只剩闹钟）
+  # 密钥也可以走环境变量 NEOAGENT_JEV_API_KEY
+  api_key: ""
+  base_url: https://opencode.ai/zen/v1/systemone
+  model: jev-1.13-free
+
+proactive:
+  # 主动性：M 自己排的闹钟（schedule_wake，到点注入 <wake>）+ Jev 哨兵（配了 jev 才有）
+  enabled: true
+  # 免打扰时段（如 "23:30-08:00"）：只管哨兵的自主探测，闹钟照响
+  quiet_hours: ""
+  # 哨兵探测的节奏（秒）：刚活跃后隔这么久探一次，静默越久越稀，最稀到 probe_idle_max
+  probe_active_min: 600
+  probe_idle_max: 5400
 
 limits:
   # 一次回复内最多连续调用多少轮工具（防失控）

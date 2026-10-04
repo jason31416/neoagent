@@ -46,7 +46,9 @@ class Bubble:
 def esc_body(text: str) -> str:
     """转义正文里的标签边界字面量，防止把定稿结构打乱。"""
     return (text or "").replace("</message>", "＜/message＞") \
-                       .replace("</recall>", "＜/recall＞")
+                       .replace("</recall>", "＜/recall＞") \
+                       .replace("</note>", "＜/note＞") \
+                       .replace("</wake>", "＜/wake＞")
 
 
 def esc_attr(s: str) -> str:
@@ -96,6 +98,19 @@ def finalize_user(text: str, *, sender: str, bubble_id: int, ts: float,
     ch_attr = f' channel="{esc_attr(channel)}"' if channel else ""
     return (f'{recall}<message sender="{esc_attr(sender)}"{ch_attr}'
             f' id="msg#{bubble_id}" time="{fmt_ts(ts)}">{body}</message>')
+
+
+def wake_block(wake_id: int, *, ts: float, source: str, at: float,
+               note: str, every: str = "") -> str:
+    """<wake> 块：自我唤醒的定稿形态——闹钟到点/哨兵叫醒/补漏清单长一个样。
+
+    系统填的属性：id="wN"（cancel_wake 用）、source=alarm|probe|event、
+    at=排定时刻、every=cron（一次性留空）、time=注入时刻。note 是 M 自己写的
+    便利贴（不是用户话）。多块直接并列在同一条消息里 = 补漏清单。"""
+    every_attr = f' every="{esc_attr(every)}"' if every else ""
+    return (f'<wake id="w{int(wake_id)}" source="{esc_attr(source)}"'
+            f' at="{fmt_ts(at)}"{every_attr} time="{fmt_ts(ts)}">'
+            f'<note>{esc_body((note or "").strip())}</note></wake>')
 
 
 def finalize_assistant(content: Optional[str], *, ts: float,

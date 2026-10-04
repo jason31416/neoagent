@@ -29,6 +29,7 @@ from .control import ClientConn, ControlServer, control_alive
 from .core import commands
 from .core.channel import ChannelAdapter
 from .core.events import Conversation, MessageEvent, SendResult, Sender
+from .core.proactive import WakeScheduler, wake_line
 from .core.settle import SettleGate
 from .log import bold_cyan, bold_green, gray, setup_logging
 from .providers.jev import JevClient
@@ -140,36 +141,52 @@ async def _run(mode: str, verbose: bool) -> None:
     agent.registry.observer = tool_observer
 
     # ---- 多消息攒批（settle）：判定"后面还有没有下文"，窗口到点才开工
-    jev = (JevClient(cfg.settle.jev_api_key, base_url=cfg.settle.jev_base_url,
-                     model=cfg.settle.jev_model)
-           if cfg.settle.jev_api_key else None)
+    jev = (JevClient(cfg.jev.api_key, base_url=cfg.jev.base_url, model=cfg.jev.model)
+           if cfg.jev.api_key else None)
     gate = SettleGate(agent, cfg.settle, jev=jev)
 
-    # ---- 消息进来：转录 + 入核心；回复经 responder 按气泡 channel 路由
-    async def on_message(event: MessageEvent) -> None:
-        logger.info("[%s] %s %s", event.channel, bold_cyan("<<"), (event.text or "")[:80])
-        last_events[event.channel] = event
-        server.broadcast(_inbound_ev(event))
-        adapter = by_name.get(event.channel)
+    # ---- 主动性：闹钟调度（M 排的 wake 到点注入 <wake>，说不说 M 自己定）。
+    # 出口就绪 = home 频道连上（不等所有平台）；没就绪先攒着，就绪后一条消息合并补漏。
+    connected: set[str] = set()
 
-        def quote_ref(quote_to: str | None, target: str) -> str:
-            """出站回复前缀素材：引用那条的正文摘要（拿不到就不挂）。"""
-            if not quote_to:
-                return ""
-            try:
-                hit = agent.ledger.find_bubble(agent.bucket_of(event), quote_to, channel=target)
-                if hit is not None and hit.content:
-                    clip = hit.content.replace("\n", " ")[:12]
-                    return clip + ("…" if len(hit.content) > 12 else "")
-            except Exception:
-                pass
+    def outbound_ready() -> bool:
+        home = agent.home_channel()
+        return home == "cli" or home in connected
+
+    def rebuild_event(target: str) -> MessageEvent | None:
+        """主动出站兜底：进程里还没有对话事件（刚重启）→ 从账本最近入站气泡重建。
+        chat_id 一路带过去：飞书 create 直发、微信凭它查 context_token 缓存。"""
+        hit = agent.ledger.last_inbound(agent.timeline_bucket or "main", channel=target)
+        if hit is None or not hit.chat_id:
+            return None
+        return MessageEvent(id=hit.message_id or "proactive", channel=target,
+                            sender=Sender(id=hit.chat_id, name=hit.sender or ""),
+                            conversation=Conversation(id=hit.chat_id, type="direct"),
+                            text="", timestamp=time.time(),
+                            metadata={"chat_id": hit.chat_id})
+
+    def quote_ref(quote_to: str | None, target: str) -> str:
+        """出站回复前缀素材：引用那条的正文摘要（拿不到就不挂）。"""
+        if not quote_to:
             return ""
+        try:
+            hit = agent.ledger.find_bubble(agent.timeline_bucket or "main",
+                                           quote_to, channel=target)
+            if hit is not None and hit.content:
+                clip = hit.content.replace("\n", " ")[:12]
+                return clip + ("…" if len(hit.content) > 12 else "")
+        except Exception:
+            pass
+        return ""
+
+    def make_responder(default_target) -> object:
+        """回复出口工厂：按气泡的 channel 路由（不写 = default_target 指的频道）。
+        入站回复用「来路频道」，主动出站用 home——同一个发送链。"""
 
         async def responder(text: str, quote_to: str | None = None,
-                            media: str | None = None, channel: str | None = None,
-                            _event=event):
-            """回复出口：按气泡的 channel 路由（不写 = 来的频道）。"""
-            target = channel or _event.channel
+                            media: str | None = None, channel: str | None = None):
+            target = channel or (default_target() if callable(default_target)
+                                 else default_target)
             reply = quote_ref(quote_to, target)
             body = text or f"（{Path(media).name}）" if media else text
             if target == "cli":
@@ -177,7 +194,7 @@ async def _run(mode: str, verbose: bool) -> None:
                                   "text": body, "reply": reply})
                 return SendResult(ok=True)
             ad = by_name.get(target)
-            ev = last_events.get(target)
+            ev = last_events.get(target) or rebuild_event(target)
             if ad is None or ev is None:
                 logger.warning("[%s] 频道还没有对话上下文，发不出去", target)
                 server.broadcast({"kind": "notice",
@@ -198,7 +215,28 @@ async def _run(mode: str, verbose: bool) -> None:
                 logger.error("[%s] 回复失败：%s", target, result.error)
                 server.broadcast({"kind": "notice",
                                   "text": f"{target} 回复失败：{result.error}"})
+                # 发不出去的事实进时间线：M 下次对话能看到、记得补一句（不重试轰炸）
+                agent.inject_internal(agent.timeline_bucket or "main",
+                                      f"（{target} 频道发送失败：{result.error}；"
+                                      "刚才的话没送达，下次对话记得补）")
             return result
+
+        return responder
+
+    # 主动出站走同一个发送链（默认发 home）：重启后 st.responder 没绑过也发得出
+    wake_scheduler = WakeScheduler(agent.ledger, gate,
+                                   bucket=agent.timeline_bucket or "main",
+                                   outbound_ready=outbound_ready,
+                                   responder=make_responder(agent.home_channel))
+    wake_task = asyncio.get_event_loop().create_task(wake_scheduler.run_forever())
+
+    # ---- 消息进来：转录 + 入核心；回复经 responder 按气泡 channel 路由
+    async def on_message(event: MessageEvent) -> None:
+        logger.info("[%s] %s %s", event.channel, bold_cyan("<<"), (event.text or "")[:80])
+        last_events[event.channel] = event
+        server.broadcast(_inbound_ev(event))
+        adapter = by_name.get(event.channel)
+        responder = make_responder(lambda: event.channel)
 
         await gate.push(event,
                         quote_fetcher=(adapter.fetch_message_text if adapter else None),
@@ -220,11 +258,13 @@ async def _run(mode: str, verbose: bool) -> None:
         server.broadcast({"kind": "notice", "text": f"{ch.name} 连接中…"})
         try:
             await adapter.connect()
+            connected.add(ch.name)          # 主动出站的就绪判据（home 连上即可发）
             server.broadcast({"kind": "notice", "text": f"{ch.name} 已连接"})
         except Exception as exc:
             logger.exception("[%s] 连接失败", ch.name)
             server.broadcast({"kind": "notice", "text": f"{ch.name} 连接失败：{exc}"})
             by_name.pop(ch.name, None)
+            connected.discard(ch.name)
 
     def _connecting(name: str) -> bool:
         t = conn_tasks.get(name)
@@ -258,6 +298,7 @@ async def _run(mode: str, verbose: bool) -> None:
         _reload_channels()
         ch = next((c for c in cfg.channels if c.name == name), None)
         ad = by_name.pop(name, None)
+        connected.discard(name)
         task = conn_tasks.pop(name, None)
         if ad is None and (task is None or task.done()):
             return f"{name} 没在跑"
@@ -314,6 +355,8 @@ async def _run(mode: str, verbose: bool) -> None:
             connect_channel=op_connect,
             disconnect_channel=op_disconnect,
             channels_info=op_channels,
+            wakes_info=lambda: [wake_line(w) for w in agent.ledger.list_wakes(
+                agent.timeline_bucket or "main")],
             tail_logs=tail_logs,
             reply_rows=lambda rows: server.reply_rows(conn, list(rows)),
             get_quiet=lambda: conn.quiet,
@@ -337,7 +380,7 @@ async def _run(mode: str, verbose: bool) -> None:
             return
         # 裸输入 = 以主人身份跟 neoagent 说话（入账 channel=cli；转录经 on_message）
         event = MessageEvent(id=uuid.uuid4().hex[:12], channel="cli",
-                             sender=Sender(id="cli-owner", name="主人"),
+                             sender=Sender(id="cli-owner", name="owner"),
                              conversation=Conversation(id="cli", type="direct"),
                              text=text, timestamp=time.time())
         await on_message(event)
@@ -380,6 +423,7 @@ async def _run(mode: str, verbose: bool) -> None:
     try:
         await stop_event.wait()
     finally:
+        wake_task.cancel()
         if console_task is not None and not console_task.done():
             console_task.cancel()
         for t in list(conn_tasks.values()):

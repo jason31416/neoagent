@@ -69,6 +69,21 @@ class SettleGate:
 
     # ---------------------------------------------------------------- 入口
 
+    def push_wake(self, session_key: str, blocks_text: str,
+                  responder: Optional[Callable] = None) -> None:
+        """自我唤醒入口（调度器/哨兵）：落 <wake> 账 + 放行开工。
+
+        与 push 的差别：无预处理、**不取消在飞模型**（唤醒不是用户插话）。
+        会话正开着攒批窗口 → 随批一起开工（用户的话和唤醒由同一轮消化），
+        否则即刻 kick。
+        """
+        self.agent.inject_wake(session_key, blocks_text, responder=responder)
+        in_window = any(c.bucket == session_key and c.timer is not None
+                        and not c.timer.done()
+                        for c in self._convs.values())
+        if not self.cfg.enabled or not in_window:
+            self.agent.kick(session_key)
+
     async def push(self, event: Any, *, quote_fetcher: Optional[Callable] = None,
                    responder: Optional[Callable] = None) -> None:
         raw = (event.text or "").strip()

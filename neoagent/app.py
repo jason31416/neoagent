@@ -13,6 +13,7 @@ from .core.agent_loop import AgentLoop
 from .core.commands import CommandContext
 from .core.ledger import MessageLedger
 from .core.llm import LLMClient
+from .core.proactive import wake_line
 from .core.recorder import Recorder, RecorderScheduler
 from .providers.asr import make_transcriber
 from .providers.tokens import HeuristicTokenCounter
@@ -22,6 +23,7 @@ from .tools.exec_tool import ExecPolicy, register_exec_tool
 from .tools.file_tools import FileScope, register_file_tools
 from .tools.memory_tools import register_record_memory
 from .tools.registry import ToolRegistry
+from .tools.wake_tools import register_wake_tools
 
 logger = logging.getLogger("neoagent.app")
 
@@ -115,9 +117,14 @@ def build_agent(cfg: Config) -> AgentLoop:
             set_thinking=lambda v: save_config_value("model.thinking", v, home=cfg.home),
             connect_channel=ops.get("connect"),
             disconnect_channel=ops.get("disconnect"),
-            channels_info=ops.get("info"))
+            channels_info=ops.get("info"),
+            wakes_info=lambda: [wake_line(w)
+                                for w in ledger.list_wakes(TIMELINE_BUCKET)])
 
     register_run_command(registry, ctx_factory=_cmd_ctx)
+
+    # M 的自我唤醒通道：schedule_wake 排闹钟（落 wakes 表），到点由调度器注入 <wake>
+    register_wake_tools(registry, ledger, session_key=TIMELINE_BUCKET)
 
     # R（Recorder）：记忆整理 + 上下文退役。与 M 共用 LLM 与预算，快慢同档。
     recorder = Recorder(llm, ledger, memory_dir,
