@@ -139,8 +139,12 @@ class FeishuAdapter(ChannelAdapter):
                         .build())
 
         # WS 长连接：事件处理器（同步签名是 SDK 要求，处理里再开 task）
+        # 没处理器的事件 SDK 会打 "processor not found" ERROR（丢弃无害但吵），
+        # 不用的事件用空处理器接住
         handler = (lark.EventDispatcherHandler.builder("", "")
                    .register_p2_im_message_receive_v1(self._on_message)
+                   .register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(
+                       self._on_p2p_entered)
                    .build())
         self._ws_client = lark.ws.Client(
             self.app_id, self.app_secret,
@@ -193,6 +197,11 @@ class FeishuAdapter(ChannelAdapter):
     # ------------------------------------------------------------------
     # 收消息
     # ------------------------------------------------------------------
+    def _on_p2p_entered(self, _data) -> None:
+        """用户进入单聊会话：不处理。空处理器只为接住事件——没处理器的话
+        SDK 会打 "processor not found" ERROR（丢弃无害但吵）。
+        将来做"用户进聊天就问候"可以从这接。"""
+
     def _on_message(self, data) -> None:
         """SDK 事件回调（在 SDK 线程里跑）。解析后送回主循环处理。"""
         try:
