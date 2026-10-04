@@ -34,6 +34,8 @@ class CommandContext:
     channels_info: Optional[Callable[[], Sequence[str]]] = None
     # 唤醒清单（/wakes；每项一行）
     wakes_info: Optional[Callable[[], Sequence[str]]] = None
+    # skill 名清单（/skills；只给名字）
+    skills_info: Optional[Callable[[], Sequence[str]]] = None
     # 控制台视图钩子（view 指令用；agent/聊天上下文里没有 → 降级说明）
     tail_logs: Optional[Callable[[int], Sequence[str]]] = None
     reply_rows: Optional[Callable[[Sequence[dict]], None]] = None
@@ -112,13 +114,13 @@ def _home(args: List[str], ctx: CommandContext) -> str:
     elif ctx.channel:
         target = ctx.channel
     else:
-        return "要指定频道：/home <channel>（如 /home weixin）"
+        return "需要指定频道：/home <channel>"
     if ctx.known_channels and target not in ctx.known_channels:
-        return (f"未知频道：{target}（可用：{'、'.join(ctx.known_channels)}）"
+        return (f"未知频道：{target}（可用：{', '.join(ctx.known_channels)}）"
                 f"；home 现在是 {ctx.home or '（未设置）'}")
     if ctx.set_home is not None:
         ctx.set_home(target)
-    return f"home 现在是 {target}（主动消息默认发这里）"
+    return f"成功将 home 设置为 {target}"
 
 
 def _status(args: List[str], ctx: CommandContext) -> str:
@@ -134,13 +136,13 @@ def _status(args: List[str], ctx: CommandContext) -> str:
 
 def _effort(args: List[str], ctx: CommandContext) -> str:
     if not args:
-        return f"思考档位：{ctx.thinking or '（服务端默认）'}（改法：/effort high）"
+        return f"当前思考强度：{ctx.thinking or '（默认）'}"
     value = args[0].lower()
     if value not in VALID_EFFORTS:
         return f"没有这个档位：{value}（可用：{'、'.join(VALID_EFFORTS)}）"
     if ctx.set_thinking is None or not ctx.set_thinking(value):
-        return f"思考档位没改成（配置写不进去），现在还是 {ctx.thinking or '（服务端默认）'}"
-    return f"思考档位现在是 {value}（下一条消息生效）"
+        return f"思考档位修改失败，现在还是 {ctx.thinking or '（默认）'}"
+    return f"思考档位现在是 {value}，下一条消息生效"
 
 
 def _int_arg(args: List[str], default: int) -> int:
@@ -152,37 +154,44 @@ def _int_arg(args: List[str], default: int) -> int:
 
 def _logs(args: List[str], ctx: CommandContext) -> str:
     if ctx.tail_logs is None:
-        return "这个指令只能在控制台用"
+        return "该指令只能在控制台使用"
     lines = ctx.tail_logs(_int_arg(args, 50))
     return "\n".join(lines) if lines else "（日志是空的）"
 
 
 def _quiet(args: List[str], ctx: CommandContext) -> str:
     if ctx.set_quiet is None:
-        return "这个指令只能在控制台用"
+        return "该指令只能在控制台使用"
     cur = bool(ctx.get_quiet()) if ctx.get_quiet is not None else False
     ctx.set_quiet(not cur)
-    return "工作行已隐藏（/quiet 放开）" if not cur else "工作行已显示"
+    return "工作行已隐藏" if not cur else "工作行已显示"
 
 
 def _stop(args: List[str], ctx: CommandContext) -> str:
     if ctx.request_stop is not None:
         ctx.request_stop()
-    return "正在停：等这一轮收完、频道断开，就退了"
+    return "已发送关闭请求"
 
 
 def _channels(args: List[str], ctx: CommandContext) -> str:
     if ctx.channels_info is None:
-        return "这个指令只能在控制台用"
+        return "该指令只能在控制台使用"
     lines = list(ctx.channels_info())
-    return "\n".join(lines) if lines else "（还没有频道：/connect weixin 之类建一个）"
+    return "\n".join(lines) if lines else "（还没有连接频道：可使用/connect进行连接）"
 
 
 def _wakes(args: List[str], ctx: CommandContext) -> str:
     if ctx.wakes_info is None:
-        return "这里看不了唤醒清单"
+        return "无法查看唤醒清单"
     lines = list(ctx.wakes_info())
-    return "\n".join(lines) if lines else "唤醒清单是空的"
+    return "\n".join(lines) if lines else "暂无计划的唤醒"
+
+
+def _skills(args: List[str], ctx: CommandContext) -> str:
+    if ctx.skills_info is None:
+        return "无法查看 skill 清单"
+    names = list(ctx.skills_info())
+    return "、".join(names) if names else "还没有 skill"
 
 
 def _connect(args: List[str], ctx: CommandContext) -> str:
@@ -209,11 +218,12 @@ def _install_defaults() -> None:
     register("connect", "connect [频道]  连上频道（扫码/写自启；无参 = 列出频道）", _connect)
     register("disconnect", "disconnect <频道>  停用频道（登录态保留，再连免扫码）", _disconnect)
     register("channels", "列出频道与状态", _channels)
-    register("wakes", "唤醒清单（闹钟/自查；id 供 cancel_wake 用）", _wakes)
+    register("wakes", "唤醒清单（闹钟/自查）", _wakes)
+    register("skills", "列出 skill 名", _skills)
     # 控制台视图/管理指令（输出不落转录；agent 拿不到视图钩子会得到一句说明）
     register("logs", "logs [行数]  看最近的技术日志", _logs, surfaces=("console",), view=True)
-    register("quiet", "隐藏/显示工作行（工具调用那些）", _quiet, surfaces=("console",), view=True)
-    register("stop", "停服务（等回合收完、断频道、退）", _stop, surfaces=("console",), agent_ok=False)
+    register("quiet", "隐藏/显示工作行（例如工具调用）", _quiet, surfaces=("console",), view=True)
+    register("stop", "停服务", _stop, surfaces=("console",), agent_ok=False)
 
 
 _install_defaults()

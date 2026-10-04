@@ -26,4 +26,5 @@ build-backend = "setuptools.build_meta"
 include = ["neoagent*"]
 
 [tool.setuptools.package-data]
-neoagent = ["config.example.yml", "prompts/*.md"]
+neoagent = ["config.example.yml", "prompts/*.md",
+            "assets/skill-dev/*", "assets/skill-dev/scripts/*"]

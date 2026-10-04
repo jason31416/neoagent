@@ -17,7 +17,7 @@ from .format import ToolOutput, error   # ToolOutput 从 format 再导出（老 
 
 logger = logging.getLogger(__name__)
 
-TOOL_RESULT_MAX = 20000   # 工具结果给模型的字符上限（M/R 同一上限）
+TOOL_RESULT_MAX = 30000   # 工具结果给模型的字符上限（与 skill_call 的 stdout 预算一致）
 
 
 def clip_tool_result(text: str) -> str:

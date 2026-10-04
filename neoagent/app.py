@@ -15,6 +15,7 @@ from .core.ledger import MessageLedger
 from .core.llm import LLMClient
 from .core.proactive import wake_line
 from .core.recorder import Recorder, RecorderScheduler
+from .core.skills import ensure_skill_dev, list_names
 from .providers.asr import make_transcriber
 from .providers.tokens import HeuristicTokenCounter
 from .providers.vision import make_vision
@@ -23,6 +24,7 @@ from .tools.exec_tool import ExecPolicy, register_exec_tool
 from .tools.file_tools import FileScope, register_file_tools
 from .tools.memory_tools import register_record_memory
 from .tools.registry import ToolRegistry
+from .tools.skill_tools import register_skill_tools
 from .tools.wake_tools import register_wake_tools
 
 logger = logging.getLogger("neoagent.app")
@@ -40,7 +42,12 @@ def build_agent(cfg: Config) -> AgentLoop:
     # 它是 agent 自己的地盘——自动并入 files/exec/media 的允许范围，不必再配 roots。
     workspace = resolve_path(cfg.home, cfg.agent.workspace)
     workspace.mkdir(parents=True, exist_ok=True)
-    file_roots = list(dict.fromkeys([*cfg.files.allowed_roots, str(workspace)]))
+    # skill 根目录（~/.neoagent/skills/）：neoagent 对外部服务的能力包，由它自己读写维护。
+    # file 工具放开该目录（读写）；skill-dev 种子只在缺失时拷，已存在绝不覆盖。
+    skills_dir = cfg.home / "skills"
+    ensure_skill_dev(skills_dir, PACKAGE_DIR / "assets" / "skill-dev")
+    file_roots = list(dict.fromkeys(
+        [*cfg.files.allowed_roots, str(workspace), str(skills_dir)]))
     exec_roots = list(dict.fromkeys([*cfg.exec.allowed_roots, str(workspace)]))
 
     # 模型请求上下文落盘（调试用；modellog_dir 置空关闭）
@@ -119,12 +126,17 @@ def build_agent(cfg: Config) -> AgentLoop:
             disconnect_channel=ops.get("disconnect"),
             channels_info=ops.get("info"),
             wakes_info=lambda: [wake_line(w)
-                                for w in ledger.list_wakes(TIMELINE_BUCKET)])
+                                for w in ledger.list_wakes(TIMELINE_BUCKET)],
+            skills_info=lambda: list_names(skills_dir))
 
     register_run_command(registry, ctx_factory=_cmd_ctx)
 
     # M 的自我唤醒通道：schedule_wake 排闹钟（落 wakes 表），到点由调度器注入 <wake>
     register_wake_tools(registry, ledger, session_key=TIMELINE_BUCKET)
+
+    # skill 工具：skill_list / skill_show / skill_call / skill_check（固定四个，
+    # 不随服务涨——服务是 skill 文件，不是新工具）
+    register_skill_tools(registry, skills_dir)
 
     # R（Recorder）：记忆整理 + 上下文退役。与 M 共用 LLM 与预算，快慢同档。
     recorder = Recorder(llm, ledger, memory_dir,
@@ -134,6 +146,7 @@ def build_agent(cfg: Config) -> AgentLoop:
                         effort_provider=lambda: cfg.recorder.reasoning_effort,
                         slow_lookback_days=cfg.recorder.slow_lookback_days)
     agent.recorder = recorder
+    agent.skills_dir = skills_dir            # 控制台 /skills 等入口用（skill 清单）
     agent.recorder_scheduler = RecorderScheduler(
         recorder, ledger,
         debounce_seconds=cfg.recorder.pause_debounce_seconds,

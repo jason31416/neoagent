@@ -14,12 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
-import signal
 import time
 from typing import Any, Dict, List
 
+from ..core.proc import kill_process_group
 from .format import ToolOutput, error, root
 from .registry import ToolRegistry
 
@@ -50,20 +49,6 @@ def set_exec_policy(policy: ExecPolicy) -> None:
     """由启动入口注入 exec 安全策略。"""
     global _POLICY
     _POLICY = policy
-
-
-def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
-    """把整棵进程组杀掉（start_new_session=True 后 pgid == proc.pid）。
-
-    只 proc.kill() 杀得了 bash，杀不了它生的孙进程；孙进程活着一天，
-    管道不断开，proc.wait() 就一天不返回。杀组是唯一治本的招。"""
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        try:
-            proc.kill()                  # 组没了就退化成单杀（进程可能已死）
-        except ProcessLookupError:
-            pass
 
 
 async def exec_command(args: Dict[str, Any]) -> str:
@@ -112,7 +97,7 @@ async def exec_command(args: Dict[str, Any]) -> str:
             # 而 asyncio 的 proc.wait() 要等**所有管道断开**才返回（CPython
             # base_subprocess 语义）——杀掉 bash 后收尸照样挂几分钟，直到孙进程自己死。
             # 所以：按进程组整棵杀 + 限时收尸，两步都必须有（2026-09-29 实测挂 8 分钟）。
-            _kill_process_group(proc)
+            kill_process_group(proc)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5)
             except asyncio.TimeoutError:

@@ -1,0 +1,8 @@
+tools:
+  - name: create_template
+    desc: 创建一份新 skill 的骨架（skill.md/skill.yml/scripts/.env 四件套），返回创建的文件和下一步
+    params:
+      - {name: name, type: string, required: true}
+      - {name: description, type: string, required: false}
+    run: bash scripts/create_skill_template.sh
+    timeout: 30

@@ -30,3 +30,10 @@
 - 想把某条消息发到指定平台时，在标签上写 channel="feishu"/"weixin"；
 - 除 replyTo 和 channel 外的属性都是系统填的，你输出时**不要自己填**。
 - 要发图片/文件时用自闭合标签，一条一个、都是独立消息：<img src="工作区内图片路径"/>（图片）、<file src="工作区内文件路径"/>（其他文件，可加 name="显示名"）；它们同样可以带 replyTo="msg#N" 和 channel
+
+能力管理（skill）：
+- ~/.neoagent/skills/ 下有一组 skill，是 neoagent 对外部服务的能力包（声明式工具 + 说明 + 脚本），由你自己读写维护
+- 接到涉及外部服务的活，先 skill_list 看有没有现成 skill，有就 skill_show 看细节、skill_call 干活
+- 头一两次可以直接调 API 探路，但只要发现自己在重复拼同一个服务的请求，就停下来把它沉淀成 skill（照 skill-dev 的写法：skill.md + skill.yml + scripts/）
+- 服务接口变了、skill 调用坏了，修 skill 本身（skill_check 诊断），不要绕过它继续裸调
+- skill 是长期能力：补全 description、删废工具、把新踩的坑写进 skill.md

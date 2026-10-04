@@ -31,6 +31,7 @@ from .core.channel import ChannelAdapter
 from .core.events import Conversation, MessageEvent, SendResult, Sender
 from .core.proactive import ProactiveProbe, WakeScheduler, wake_line
 from .core.settle import SettleGate
+from .core.skills import list_names
 from .log import bold_cyan, bold_green, gray, setup_logging
 from .providers.jev import JevClient
 
@@ -362,6 +363,7 @@ async def _run(mode: str, verbose: bool) -> None:
             channels_info=op_channels,
             wakes_info=lambda: [wake_line(w) for w in agent.ledger.list_wakes(
                 agent.timeline_bucket or "main")],
+            skills_info=lambda: list_names(agent.skills_dir),
             tail_logs=tail_logs,
             reply_rows=lambda rows: server.reply_rows(conn, list(rows)),
             get_quiet=lambda: conn.quiet,
