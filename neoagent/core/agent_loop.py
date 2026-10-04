@@ -73,7 +73,9 @@ class SessionState:
         self.tool_running: bool = False                 # 正在执行工具（steer 的判定）
         self.busy: bool = False                         # turn 进行中（含入库/插话窗口）
         self.done_at: Optional[float] = None            # 上次 turn 收工时刻（R 快整理锚点）
-        self.input_gen: int = 0                          # 输入代数（单调递增）
+        self.input_gen: int = 0                          # 输入代数（单调递增，落账即+1）
+        self.kicked_input_gen: int = 0                   # 已放行开工的输入代数（攒批屏障）
+        self.kick_event: asyncio.Event = asyncio.Event()  # kick 信号（每次 kick 换新事件）
         self.responder: Optional[Callable] = None       # 回复出口（绑定通道适配器）：
         #   调用 responder(text, quote_to=平台消息id|None) → SendResult（message_id 回填账）
 
@@ -138,11 +140,23 @@ class AgentLoop:
     async def submit(self, event: MessageEvent,
                      *, quote_fetcher: Optional[Callable[[str], Awaitable[Optional[str]]]] = None,
                      responder: Optional[Callable[..., Awaitable[Any]]] = None) -> None:
-        """提交一条入站消息（不等待回复；回复经 responder 送回通道）。
+        """提交一条入站消息并立即开工（不经攒批；指令与直连调用走这）。
 
-        空闲 → 开新 turn；忙 → steer/redirect 注入当前 turn（不起并行任务）。
+        拆两步：ingest（预处理+入账，忙时立即打断在飞模型）→ kick（放行开工）。
+        """
+        session_key = self.bucket_of(event)
+        await self.ingest(event, quote_fetcher=quote_fetcher, responder=responder)
+        self.kick(session_key)
+
+    async def ingest(self, event: MessageEvent,
+                     *, quote_fetcher: Optional[Callable[[str], Awaitable[Optional[str]]]] = None,
+                     responder: Optional[Callable[..., Awaitable[Any]]] = None) -> str:
+        """预处理 + 入账定稿（不开工）。指令顺带执行（照常入账、回系统消息）。
+
+        返回正文（语音已转写）。忙时收到新输入**立即取消在飞的模型请求**——
+        止血：不让基于旧理解的话发出去；工具不杀（跑完即停）。
+        重跑由 kick 放行：攒批场景等窗口，直连场景即刻。
         quote_fetcher：通道的"按 id 取消息文本"兜底（飞书 message.get）。
-        / 开头是指令：照常入账，执行后回系统消息，不触发模型回合。
         """
         session_key = self.bucket_of(event)
         raw_text = (event.text or "").strip()
@@ -162,24 +176,28 @@ class AgentLoop:
         if is_command:
             await self._ingest_user(event, session_key, raw_text, attachments, quote_fetcher)
             await self._handle_command(event, session_key, raw_text, responder)
-            return
+            return raw_text
 
         # 2) 入库定稿：引用解析（平台 id → 气泡）+ 净化/气泡编号/recall 固化
         await self._ingest_user(event, session_key, text, attachments, quote_fetcher)
+        st.input_gen += 1    # 新材料落账（turn 循环据此判断有没有没答的输入）
+        if st.model_task is not None and not st.model_task.done():
+            st.model_task.cancel()   # 立即打断（redirect 的取消动作提前到此刻）
+        return text or ""
 
-        st.input_gen += 1    # 新输入代数：turn 循环据此判断要不要再跑一轮
+    def kick(self, session_key: str) -> None:
+        """放行开工：本批已定（攒批窗口到点 / 直连即刻）。
 
+        空闲 → 起新 turn；忙 → 不用额外动作——打断已在 ingest 做过，
+        turn 循环的攒批屏障会在 kick 后放行，带着批内全部消息重渲染重跑
+        （连补几句只打断模型一次、只重跑一次）。
+        """
+        st = self._states.setdefault(session_key, SessionState())
+        st.kicked_input_gen = st.input_gen
+        st.kick_event.set()
+        st.kick_event = asyncio.Event()   # 换新：下一轮等待者听新事件
         if st.task is None or st.task.done():
             st.task = asyncio.get_event_loop().create_task(self._turn_loop(session_key))
-        else:
-            # 忙时输入（静默执行，不发回执）
-            if st.model_task is not None and not st.model_task.done():
-                # redirect：取消在飞的模型请求，重渲染重跑（不扣轮数）
-                st.model_task.cancel()
-            elif st.tool_running:
-                # steer：不杀工具，本轮工具跑完、下次渲染自然带上
-                pass
-            # 缝隙（两态都不在）：pending 已置，下次渲染自然带上
 
     async def wait_idle(self, session_key: str) -> None:
         """等该会话的活跃 turn 结束（CLI 顺序输入用）。"""
@@ -281,6 +299,11 @@ class AgentLoop:
         gen_at_render = st.input_gen
         compressed = False          # 紧急压缩一次 turn 最多试一次（R 没进展就走兜底）
         while rounds < self.max_tool_rounds:
+            # 攒批屏障：新材料已落账但 kick 未到（用户可能还有下文）→ 原地待命。
+            # 打断（取消在飞模型）在 ingest 就做了；这里等的是"带着新消息继续"的时机。
+            if st.input_gen > st.kicked_input_gen:
+                logger.info("[turn] 新消息在攒批，等窗口到点再继续")
+                await st.kick_event.wait()
             # 事实层现渲染（工具流水当轮已落库，渲染即含，不再另拼机器件——
             # 曾经的 turn_tool_msgs 暂存链会造成同一轮流水在请求里出现两次）。
             # 裁剪预算扣掉：工具 schema + 锚定残差（真值锚定）。
@@ -316,8 +339,8 @@ class AgentLoop:
             try:
                 result = await st.model_task
             except asyncio.CancelledError:
-                # redirect：被新消息取消 → 重渲染重跑；这一步不扣轮数、不落账
-                logger.info("[turn] 模型请求被转向，重渲染重跑（不扣轮数）")
+                # 被新消息打断（ingest 所为）：重渲染要等攒批屏障放行（kick 才继续）
+                logger.info("[turn] 模型请求被新消息打断，等攒批后重渲染（不扣轮数）")
                 st.model_task = None
                 continue
             st.model_task = None

@@ -29,7 +29,9 @@ from .control import ClientConn, ControlServer, control_alive
 from .core import commands
 from .core.channel import ChannelAdapter
 from .core.events import Conversation, MessageEvent, SendResult, Sender
+from .core.settle import SettleGate
 from .log import bold_cyan, bold_green, gray, setup_logging
+from .providers.jev import JevClient
 
 logger = logging.getLogger("neoagent")
 
@@ -137,6 +139,12 @@ async def _run(mode: str, verbose: bool) -> None:
 
     agent.registry.observer = tool_observer
 
+    # ---- 多消息攒批（settle）：判定"后面还有没有下文"，窗口到点才开工
+    jev = (JevClient(cfg.settle.jev_api_key, base_url=cfg.settle.jev_base_url,
+                     model=cfg.settle.jev_model)
+           if cfg.settle.jev_api_key else None)
+    gate = SettleGate(agent, cfg.settle, jev=jev)
+
     # ---- 消息进来：转录 + 入核心；回复经 responder 按气泡 channel 路由
     async def on_message(event: MessageEvent) -> None:
         logger.info("[%s] %s %s", event.channel, bold_cyan("<<"), (event.text or "")[:80])
@@ -192,9 +200,9 @@ async def _run(mode: str, verbose: bool) -> None:
                                   "text": f"{target} 回复失败：{result.error}"})
             return result
 
-        await agent.submit(event,
-                           quote_fetcher=(adapter.fetch_message_text if adapter else None),
-                           responder=responder)
+        await gate.push(event,
+                        quote_fetcher=(adapter.fetch_message_text if adapter else None),
+                        responder=responder)
 
     # ---- 频道管理：/connect //disconnect 热插拔（写回 enabled = 自启开关）
     async def start_channel(ch: ChannelConfig) -> None:

@@ -104,6 +104,25 @@ class ExecConfig:
 
 
 @dataclass
+class SettleConfig:
+    """多消息攒批：消息到了不立刻开工，按"后面还有没有下文"等窗口到点再开工。"""
+    enabled: bool = True
+    # Jev 决策模型（档位判定）；密钥也可以走环境变量 NEOAGENT_JEV_API_KEY
+    jev_api_key: str = ""
+    jev_base_url: str = "https://opencode.ai/zen/v1/systemone"
+    jev_model: str = "jev-1.13-free"
+    # 三档等待（秒）：明确 / 可能有补充 / 话头碎片
+    wait_clear: float = 0
+    wait_maybe: float = 4
+    wait_fragment: float = 15
+    # 没启用 Jev 时的固定等待（秒，区间内随机）
+    wait_default_min: float = 3
+    wait_default_max: float = 4
+    # 整批无论几条，最长等这么久（秒）
+    wait_cap: float = 20
+
+
+@dataclass
 class ChannelConfig:
     """一个频道（channels/<name>.yml）：文件名 = 频道名，kind = 通道类型。"""
     name: str
@@ -123,6 +142,7 @@ class Config:
     asr: AsrConfig = field(default_factory=AsrConfig)
     files: FilesConfig = field(default_factory=FilesConfig)
     exec: ExecConfig = field(default_factory=ExecConfig)
+    settle: SettleConfig = field(default_factory=SettleConfig)
     channels: List[ChannelConfig] = field(default_factory=list)
     fresh_install: bool = False      # 本次启动才生成的骨架（给首启指引用）
 
@@ -316,6 +336,19 @@ def load_config(home: Optional[Path] = None) -> Config:
     cfg.recorder.max_tool_rounds = int(_get(raw, "memory.tidy_tool_rounds",
                                             cfg.recorder.max_tool_rounds))
 
+    cfg.settle.enabled = bool(_get(raw, "settle.enabled", cfg.settle.enabled))
+    cfg.settle.jev_api_key = str(_get(raw, "settle.jev_api_key", cfg.settle.jev_api_key) or "")
+    cfg.settle.jev_base_url = str(_get(raw, "settle.jev_base_url", cfg.settle.jev_base_url))
+    cfg.settle.jev_model = str(_get(raw, "settle.jev_model", cfg.settle.jev_model))
+    cfg.settle.wait_clear = float(_get(raw, "settle.wait_clear", cfg.settle.wait_clear))
+    cfg.settle.wait_maybe = float(_get(raw, "settle.wait_maybe", cfg.settle.wait_maybe))
+    cfg.settle.wait_fragment = float(_get(raw, "settle.wait_fragment", cfg.settle.wait_fragment))
+    cfg.settle.wait_default_min = float(_get(raw, "settle.wait_default_min",
+                                             cfg.settle.wait_default_min))
+    cfg.settle.wait_default_max = float(_get(raw, "settle.wait_default_max",
+                                             cfg.settle.wait_default_max))
+    cfg.settle.wait_cap = float(_get(raw, "settle.wait_cap", cfg.settle.wait_cap))
+
     cfg.agent.workspace = str(_get(raw, "advanced.workspace", cfg.agent.workspace))
     cfg.agent.modellog_dir = str(_get(raw, "advanced.modellog_dir", cfg.agent.modellog_dir))
     cfg.agent.image_token_estimate = int(_get(raw, "advanced.image_token_estimate",
@@ -360,6 +393,7 @@ def load_config(home: Optional[Path] = None) -> Config:
     cfg.llm.model = os.environ.get("NEOAGENT_LLM_MODEL", cfg.llm.model)
     cfg.llm.reasoning_effort = os.environ.get("NEOAGENT_LLM_THINKING", cfg.llm.reasoning_effort)
     cfg.asr.api_key = os.environ.get("NEOAGENT_ASR_API_KEY", cfg.asr.api_key)
+    cfg.settle.jev_api_key = os.environ.get("NEOAGENT_JEV_API_KEY", cfg.settle.jev_api_key)
     cfg.recorder.reasoning_effort = os.environ.get("NEOAGENT_MEMORY_TIDY_THINKING",
                                                    cfg.recorder.reasoning_effort)
     # 飞书凭据按 kind 覆盖到每个飞书频道（多开也吃得下）
