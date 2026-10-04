@@ -29,7 +29,7 @@ from .control import ClientConn, ControlServer, control_alive
 from .core import commands
 from .core.channel import ChannelAdapter
 from .core.events import Conversation, MessageEvent, SendResult, Sender
-from .core.proactive import WakeScheduler, wake_line
+from .core.proactive import ProactiveProbe, WakeScheduler, wake_line
 from .core.settle import SettleGate
 from .log import bold_cyan, bold_green, gray, setup_logging
 from .providers.jev import JevClient
@@ -223,11 +223,16 @@ async def _run(mode: str, verbose: bool) -> None:
 
         return responder
 
-    # 主动出站走同一个发送链（默认发 home）：重启后 st.responder 没绑过也发得出
+    # 主动出站走同一个发送链（默认发 home）：重启后 st.responder 没绑过也发得出。
+    # 哨兵（Jev 自主探测）：配了 jev 才有；没配主动性只剩闹钟。
+    probe = (ProactiveProbe(agent, jev, cfg.proactive,
+                            bucket=agent.timeline_bucket or "main")
+             if jev is not None and cfg.proactive.enabled else None)
     wake_scheduler = WakeScheduler(agent.ledger, gate,
                                    bucket=agent.timeline_bucket or "main",
                                    outbound_ready=outbound_ready,
-                                   responder=make_responder(agent.home_channel))
+                                   responder=make_responder(agent.home_channel),
+                                   probe=probe)
     wake_task = asyncio.get_event_loop().create_task(wake_scheduler.run_forever())
 
     # ---- 消息进来：转录 + 入核心；回复经 responder 按气泡 channel 路由
