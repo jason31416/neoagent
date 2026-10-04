@@ -74,21 +74,11 @@ def register_wake_tools(registry: ToolRegistry, ledger, session_key: str) -> Non
     registry.register(
         "schedule_wake",
         "给未来的自己排一次唤醒（闹钟/自查/惦记）。到点时你会收到一条 <wake> 块消息，"
-        "由你决定说不说、说什么。\n"
-        "什么时候用：\n"
-        "- 用户要提醒：\"明早 8 点提醒我带作业\" → at=明早 8 点；\n"
-        "- 重复提醒：\"每天 9 点报下日程\" → every=cron；\n"
-        "- 用户说\"一会再说 / 回头再看 / 晚点弄 / 过两小时看下…\" → 排个 once，"
         "note 写清到点该干什么（如\"看下 xx 脚本跑完没，先用工具查一眼，再决定报不报\"）。\n"
-        "note 是你写给未来自己的便利贴，到点时它是唯一的线索：写你自己的备忘"
-        "（好：\"明早面试带作业，简历在桌面\"），不要写成用户的口吻或转述用户的话"
-        "（坏：\"提醒我带作业\"、\"用户让我提醒他\"）。\n"
+        "note 是你写给未来自己的便利贴，写你自己的备忘，不要写成用户的口吻或转述用户的话"
         "at 与 every 二选一（都给则以 every 为准）：\n"
-        "- at：一次性，本机时间的绝对时刻，格式 2026-02-24T08:30——\"明早 8 点\"这类"
-        "自然语言由你换算好再填，别把自然语言原样塞进来；\n"
-        f"- every：重复，cron 表达式。{CRON_HELP}\n"
-        "返回带下次触发时间，务必转告用户，让他能当场纠正。"
-        "改期 = cancel_wake 旧的 + schedule_wake 新的。",
+        "- at：一次性，本机时间的绝对时刻，格式 2026-02-24T08:30"
+        f"- every：重复，cron 表达式。{CRON_HELP}\n",
         {"type": "object",
          "properties": {
              "note": {"type": "string",
@@ -109,7 +99,7 @@ def register_wake_tools(registry: ToolRegistry, ledger, session_key: str) -> Non
 
     registry.register(
         "cancel_wake",
-        "取消一个还没触发的唤醒。用户说\"不用提醒了\"\"取消闹钟\"时用。",
+        "取消一个还没触发的唤醒。",
         {"type": "object",
          "properties": {
              "wake_id": {"type": "string", "description": "唤醒 id（w13 或 13）"},

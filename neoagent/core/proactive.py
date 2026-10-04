@@ -35,7 +35,7 @@ CRON_HELP = (
     "每个字段可写：*（任意）、数字、a-b（范围）、*/n（每隔 n）、a-b/n、逗号列表。"
     "例：\"0 9 * * *\"=每天 9:00；\"0 9 * * 1-5\"=工作日 9:00；\"0 10 1 * *\"=每月 1 号 10:00；"
     "\"*/15 9-18 * * *\"=9-18 点每 15 分钟。"
-    "注意：\"9 * * * *\"是每小时的第 9 分钟，不是 9 点；日与周都限定时，任一满足即触发。"
+    "日与周都限定时，任一满足即触发。"
 )
 
 # 字段名 → (下界, 上界)；周多收 7（=周日）
@@ -239,26 +239,23 @@ _PROBE_QUESTION = {
     "should_poke": {
         "type": "choice",
         "instructions": (
-            "判断现在值不值得叫醒 agent 主动给用户发一句话（每一句主动话都是打扰，宁可不发）。三选一：\n"
-            "- 不值得：没什么悬着的事；刚聊完正常收尾；用户明确说过不用管；"
+            "判断现在值不值得叫醒 agent 进行操作。\n"
+            "- 不值得唤醒：没什么悬着的事；刚聊完正常收尾；用户明确说过不用管"
             "agent 最近为此主动提过、用户没接（一两次没下文就撒手）。\n"
-            "- 值得提醒：用户提过\"一会再说/回头再看\"之类悬着的事，一直没下文，"
-            "而且唤醒清单里没有闹钟在管它。\n"
-            "- 值得关心跟进：用户透露的状态值得关心一句（例：\"又熬到两点\"）——最多一两次，"
-            "用户没接就别再提。\n"
-            "重要：唤醒清单（state 里有）里已排闹钟的事不要再叫醒——有人管了；"
-            "除非有新的增量（用户明显焦虑、事情临近却没准备）。"),
+            "- 值得提醒：用户提过\"一会再说/回头再看\"之类；记忆中悬着的事，一直没下文，"
+            "而且闹钟清单里没有闹钟在管它。\n"
+            "- 值得关心跟进：用户透露的状态值得关心一句"),
         "criteria": {"不值得": None, "值得提醒": None, "值得关心跟进": None},
     }
 }
 
 _POKE_LABELS = ("值得提醒", "值得关心跟进")
-_PROBE_WINDOW_ROWS = 60        # 流水窗口（行）
+_PROBE_WINDOW_ROWS = 120        # 流水窗口（行）
 _PROBE_LOOKBACK_DAYS = 3       # 统计回看（天）
 
 
 class ProactiveProbe:
-    """哨兵：周期性"看一眼值不值得叫醒 M"（Jev 便宜且沉默，哑轮询无害）。
+    """哨兵：周期性"看一眼值不值得叫醒 M"）。
 
     - 节奏自适应：刚活跃隔 probe_active_min，静默越久越稀（线性到 probe_idle_max）；
       忙时/免打扰时段不探；
@@ -314,33 +311,31 @@ class ProactiveProbe:
         return rows[-1].timestamp if rows else now
 
     def _state(self, now: float, silence: float) -> str:
-        parts = [f"# 现在 {datetime.fromtimestamp(now):%Y-%m-%d %H:%M}"
-                 f"（距上次收工静默 {int(silence // 60)} 分钟）"]
+        parts = [f"# 现在时间 {datetime.fromtimestamp(now):%Y-%m-%d %H:%M}"]
         mem = self._memory()
         if mem:
-            parts.append(f"# 记忆（R 维护）\n{mem}")
+            parts.append(f"# 记忆\n{mem}")
         pend = [wake_line(w) for w in self.ledger.list_wakes(self.bucket, status="pending")]
-        parts.append("# 唤醒清单（已排闹钟——有人管的事别再叫醒）\n"
+        parts.append("# 已有闹钟（下列内容你不需要进行唤醒）\n"
                      + ("\n".join(pend) if pend else "（空）"))
         hist = self.ledger.since_time(self.bucket, now - _PROBE_LOOKBACK_DAYS * 86400,
                                       limit=500)
         pokes = [r for r in hist if r.type == TYPE_WAKE and 'source="probe"' in (r.text or "")]
         replied = sum(1 for p in pokes
                       if any(r.type == TYPE_USER and r.seq_id > p.seq_id for r in hist))
-        parts.append(f"# 近{_PROBE_LOOKBACK_DAYS}天哨兵叫醒过 {len(pokes)} 次，"
-                     f"其后用户说过话的 {replied} 次（扑空多了就撒手）")
+        # parts.append(f"# 近{_PROBE_LOOKBACK_DAYS}天哨兵叫醒过 {len(pokes)} 次，"
+        #              f"其后用户说过话的 {replied} 次（扑空多了就撒手）")
         rows = self.ledger.visible(self.bucket, _PROBE_WINDOW_ROWS)
         lines = []
         for r in rows:
             if r.type == TYPE_TOOL_RESULT:
                 continue
             ts = datetime.fromtimestamp(r.timestamp).strftime("%m-%d %H:%M")
-            kind = {"user": "用户", "assistant": "neoagent",
-                    "internal": "系统", "wake": "唤醒"}.get(r.type, r.type)
+            kind = r.type
             body = (r.text or "").strip()[:240]
             if body:
                 lines.append(f"[{ts}] {kind}：{body}")
-        parts.append("# 最近流水（主表定稿原样，与 M 看到的一致；工具结果略）\n"
+        parts.append("# 最近消息（与 neoagent 看到的一致；工具略）\n"
                      + "\n".join(lines))
         return "\n\n".join(parts)
 
