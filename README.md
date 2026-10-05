@@ -19,6 +19,9 @@
 - **主动性**：说"明早提醒我带作业""这事一会再说"，它自己排闹钟、到点开口（重启不丢，
   错过的合并补报）；说不说它自己定，不合适就沉默。配了 Jev 还有个便宜哨兵，
   觉得值得惦记才主动说一句（免打扰、不重复骚扰）
+- **上下文自维护**：记忆整理器（R）每次整理都看得到上下文用量（token/预算/占比）；
+  占比超 90% 系统给建议清理点（保留 30%~50% 预算、尽量砍一天以前的聊天），R 自行裁量退役；
+  用户随时 `/compact` 强制压缩（跑完播报切点进展）
 - 干完把结果用聊天消息回给你（OpenAI 兼容 tool calling 循环，当前接 DeepSeek）
 
 ## 快速开始
@@ -37,7 +40,7 @@ uv run python -m neoagent.run serve      # 无头服务
 uv run python -m neoagent.run console    # 只开控制台（别名 tui），多终端可同时连
 ```
 
-控制台里 `/` 开头 = 指令（和聊天里同语法：`/help /home /status /effort /connect …`），
+控制台里 `/` 开头 = 指令（和聊天里同语法：`/help /home /status /effort /connect /skills /wakes /compact …`），
 裸输入 = 跟它说话；`/stop` 停服务，Ctrl-C 在 attach 的控制台里只是断开自己。
 
 ## 架构
