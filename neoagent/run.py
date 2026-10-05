@@ -350,6 +350,10 @@ async def _run(mode: str, verbose: bool) -> None:
                 return []
             return lines[-n:]
 
+        async def notify_cli(text: str) -> None:
+            server.broadcast({"kind": "msg", "channel": "cli", "speaker": "neoagent",
+                              "text": text})
+
         return commands.CommandContext(
             surface="console", channel="cli",
             home=agent.ledger.get_setting("home"),
@@ -364,6 +368,9 @@ async def _run(mode: str, verbose: bool) -> None:
             wakes_info=lambda: [wake_line(w) for w in agent.ledger.list_wakes(
                 agent.timeline_bucket or "main")],
             skills_info=lambda: list_names(agent.skills_dir),
+            compact=(lambda: agent.recorder.compact(agent.timeline_bucket or "main"))
+            if getattr(agent, "recorder", None) else None,
+            notify=notify_cli,
             tail_logs=tail_logs,
             reply_rows=lambda rows: server.reply_rows(conn, list(rows)),
             get_quiet=lambda: conn.quiet,

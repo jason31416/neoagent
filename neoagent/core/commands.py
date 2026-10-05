@@ -9,8 +9,9 @@ agent 跑指令走同一注册表、同一权限档（agent_ok），是工具调
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 # 思考档位合法值（OpenAI 标准 reasoning_effort；"" = 不传用服务端默认）
 VALID_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max")
@@ -36,6 +37,9 @@ class CommandContext:
     wakes_info: Optional[Callable[[], Sequence[str]]] = None
     # skill 名清单（/skills；只给名字）
     skills_info: Optional[Callable[[], Sequence[str]]] = None
+    # 强制压缩（/compact）：跑 R 清理上下文；notify = 跑完的异步播报口
+    compact: Optional[Callable[[], Awaitable[str]]] = None
+    notify: Optional[Callable[[str], Awaitable[None]]] = None
     # 控制台视图钩子（view 指令用；agent/聊天上下文里没有 → 降级说明）
     tail_logs: Optional[Callable[[int], Sequence[str]]] = None
     reply_rows: Optional[Callable[[Sequence[dict]], None]] = None
@@ -194,6 +198,29 @@ def _skills(args: List[str], ctx: CommandContext) -> str:
     return "、".join(names) if names else "还没有 skill"
 
 
+def _compact(args: List[str], ctx: CommandContext) -> str:
+    """强制压缩上下文：后台跑 R（先落记忆再退役），完成后播报切点简报。"""
+    if ctx.compact is None:
+        return "无法压缩（没有接记忆整理器）"
+
+    async def _run() -> None:
+        try:
+            report = await ctx.compact()
+        except Exception as e:                  # 压缩炸了也得有回音
+            report = f"压缩失败：{e}"
+        if ctx.notify is not None:
+            try:
+                await ctx.notify(report)
+            except Exception:
+                pass
+
+    try:
+        asyncio.get_running_loop().create_task(_run())
+    except RuntimeError:
+        return "压缩需要在服务运行时触发"
+    return "开始压缩上下文（完成后播报）"
+
+
 def _connect(args: List[str], ctx: CommandContext) -> str:
     if not args:
         return _channels(args, ctx)      # 无参 = 列出可接的频道和状态
@@ -220,6 +247,8 @@ def _install_defaults() -> None:
     register("channels", "列出频道与状态", _channels)
     register("wakes", "唤醒清单（闹钟/自查）", _wakes)
     register("skills", "列出 skill 名", _skills)
+    register("compact", "强制压缩上下文（跑 R 清理到建议保留点）", _compact,
+             agent_ok=False)
     # 控制台视图/管理指令（输出不落转录；agent 拿不到视图钩子会得到一句说明）
     register("logs", "logs [行数]  看最近的技术日志", _logs, surfaces=("console",), view=True)
     register("quiet", "隐藏/显示工作行（例如工具调用）", _quiet, surfaces=("console",), view=True)

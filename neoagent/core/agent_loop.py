@@ -40,7 +40,7 @@ from .frames import (Bubble, attachment_notes, finalize_assistant, finalize_user
 from .ledger import (MessageLedger, TYPE_ASSISTANT, TYPE_INTERNAL, TYPE_TOOL_RESULT,
                      TYPE_USER, TYPE_WAKE)
 from .llm import LLMClient
-from .render import render_messages
+from .render import ContextStats, render_messages
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +129,8 @@ class AgentLoop:
         self.recorder = recorder                # R（Recorder）：紧急压缩钩子用（可空）
         self._states: Dict[str, SessionState] = {}
         self._anchors: Dict[str, TokenAnchor] = {}    # 每会话真值锚定（token 预估）
+        # 每会话渲染用量（R 整理时读：上下文 token 数/预算/占比）
+        self.context_stats: Dict[str, ContextStats] = {}
         self._tools_est: Optional[int] = None        # 工具 schema 估算（常量，算一次）
 
     # ------------------------------------------------------------------
@@ -234,6 +236,16 @@ class AgentLoop:
                               text: str, responder) -> None:
         """指令执行 + 系统回执：回执是 internal 行 + **真气泡**（可被引用），
         发到指令来的频道，不触发模型回合。"""
+        recorder = self.recorder
+
+        async def _notify(text: str) -> None:
+            """异步完成播报（如 /compact 压缩完）：普通系统消息，不落账。"""
+            if responder is not None:
+                try:
+                    await responder(text, channel=event.channel)
+                except Exception:
+                    logger.exception("异步播报发送失败")
+
         receipt = commands.execute(text, commands.CommandContext(
             surface="chat",
             channel=event.channel,
@@ -241,7 +253,10 @@ class AgentLoop:
             known_channels=self.known_channels,
             set_home=lambda ch: self.ledger.set_setting("home", ch),
             thinking=self.effort_provider() if callable(self.effort_provider) else "",
-            set_thinking=self.effort_setter))
+            set_thinking=self.effort_setter,
+            compact=(lambda: recorder.compact(session_key))
+            if recorder is not None else None,
+            notify=_notify))
         logger.info("[command] %s → %s", text, receipt)
         ts = time.time()
         bid = self.ledger.alloc_bubbles(session_key, 1)[0]
@@ -739,6 +754,9 @@ class AgentLoop:
                     u.get("reasoning_tokens", 0), predicted, est_total)
         if u.get("prompt_tokens"):
             self._anchors[session_key].update(u["prompt_tokens"], est_total)
+        self.context_stats[session_key] = ContextStats(
+            tokens=est_total, predicted=predicted or 0,
+            budget=self.token_budget, ts=time.time())
 
     async def _execute_tool(self, name: str, arguments_json: str) -> tuple:
         """执行一个工具调用，返回 (文字结果, 图片路径列表)；错误也转成字符串回给模型自纠。"""

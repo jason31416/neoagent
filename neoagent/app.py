@@ -144,7 +144,9 @@ def build_agent(cfg: Config) -> AgentLoop:
                         token_budget=cfg.agent.history_token_budget,
                         max_tool_rounds=cfg.recorder.max_tool_rounds,
                         effort_provider=lambda: cfg.recorder.reasoning_effort,
-                        slow_lookback_days=cfg.recorder.slow_lookback_days)
+                        slow_lookback_days=cfg.recorder.slow_lookback_days,
+                        # R 看"当前上下文多满"：读 M 渲染用量（缺则现算兜底）
+                        stats_provider=lambda session: agent.context_stats.get(session))
     agent.recorder = recorder
     agent.skills_dir = skills_dir            # 控制台 /skills 等入口用（skill 清单）
     agent.recorder_scheduler = RecorderScheduler(

@@ -25,6 +25,8 @@ from ..tools.registry import ToolOutput, clip_tool_result
 from . import modellog
 from .ledger import TYPE_ASSISTANT, TYPE_TOOL_RESULT, MessageLedger
 from .llm import LLMClient
+from .render import (LIVE_ROWS_LIMIT, PRESSURE_PCT, ContextStats, rows_cost,
+                     suggest_cut)
 from ..providers.tokens import HeuristicTokenCounter, TokenCounter
 
 logger = logging.getLogger("neoagent.recorder")
@@ -48,6 +50,10 @@ _CYCLE_NOTES = {
 上下文切点一般不在这次判断。""",
 }
 
+_COMPACT_NOTE = """## 本次是用户强制压缩（/compact）
+目标：把上下文切点推进到建议保留点——先把该记的记忆记掉，再退役；
+能推就推（set_cut_point 只进不退，拿不准可以少清，但别一点不清）。"""
+
 _TIME_FMT = "%Y-%m-%d %H:%M"
 
 
@@ -59,7 +65,8 @@ class Recorder:
                  token_budget: int = 250_000,
                  max_tool_rounds: int = 90,
                  effort_provider: Optional[Callable[[], str]] = None,
-                 slow_lookback_days: int = 7) -> None:
+                 slow_lookback_days: int = 7,
+                 stats_provider: Optional[Callable[[str], Optional[ContextStats]]] = None) -> None:
         self.llm = llm
         self.ledger = ledger
         self.memory_dir = Path(memory_dir)
@@ -69,6 +76,7 @@ class Recorder:
         self.max_tool_rounds = int(max_tool_rounds)
         self.effort_provider = effort_provider or (lambda: "medium")
         self.slow_lookback_days = int(slow_lookback_days)
+        self.stats_provider = stats_provider        # 渲染用量（agent_loop 落；缺则现算兜底）
         self._system = _load_system()          # 提示词随包（不开放用户配置）
         self._lock = asyncio.Lock()            # 整理跑互斥（停顿调度/紧急压缩不并发）
 
@@ -83,21 +91,44 @@ class Recorder:
     # ------------------------------------------------------------------
     # 一次整理跑
     # ------------------------------------------------------------------
-    async def run(self, session_key: str, cycle: str = "fast") -> str:
-        """跑一次整理，返回工作简报（只进日志）。"""
+    async def run(self, session_key: str, cycle: str = "fast",
+                  compact: bool = False) -> str:
+        """跑一次整理，返回工作简报（只进日志）。
+        compact=True：用户强制压缩（/compact）——建议清理点必给，且明确要求推进切点。"""
         async with self._lock:
-            return await self._run_locked(session_key, cycle)
+            return await self._run_locked(session_key, cycle, compact)
 
-    async def _run_locked(self, session_key: str, cycle: str) -> str:
+    async def compact(self, session_key: str) -> str:
+        """用户强制压缩（/compact）：跑一次压缩整理，回报切点进展（简报给人看）。"""
+        _, cut_before = self.ledger.get_recorder_state(session_key)
+        await self.run(session_key, "fast", compact=True)
+        _, cut_after = self.ledger.get_recorder_state(session_key)
+        advice = suggest_cut(self.ledger, session_key,
+                             budget=self.token_budget, counter=self.token_counter)
+        if cut_after > cut_before:
+            dropped = [r for r in self.ledger.since(session_key, cut_before - 1,
+                                                    limit=LIVE_ROWS_LIMIT)
+                       if r.seq_id < cut_after]
+            freed = rows_cost(dropped, self.token_counter)
+            return (f"压缩完成：切点 seq#{cut_before}→seq#{cut_after}，"
+                    f"释放约 {freed:,} token（现活行约 {advice.total:,}）")
+        if not advice.needed:
+            return f"无需压缩（当前活行约 {advice.total:,} token，占比不高）"
+        return (f"压缩未推进切点（R 拿不准，欠一次压缩；现活行约 {advice.total:,} token）")
+
+    async def _run_locked(self, session_key: str, cycle: str,
+                          compact: bool = False) -> str:
         rows = self._window(session_key, cycle)
         if not rows and cycle == "fast":
             return "（无待整理流水）"
 
         registry = build_memory_registry(self.ledger, session_key, self.memory_dir)
         _, cut_before = self.ledger.get_recorder_state(session_key)
+        note = _CYCLE_NOTES.get(cycle, "") + ("\n" + _COMPACT_NOTE if compact else "")
         msgs = [
-            {"role": "system", "content": self._system + "\n" + _CYCLE_NOTES.get(cycle, "")},
-            {"role": "user", "content": self._context(session_key, cycle, rows)},
+            {"role": "system", "content": self._system + "\n" + note},
+            {"role": "user", "content": self._context(session_key, cycle, rows,
+                                                     compact=compact)},
         ]
 
         report = ""
@@ -155,10 +186,12 @@ class Recorder:
     # 窗口与上下文构造
     # ------------------------------------------------------------------
     def _window(self, session_key: str, cycle: str) -> list:
-        """快周期 = 切点～现在（= M 当前跨度）；慢周期 = 回看起点～现在。"""
+        """快周期 = 切点～现在（= M 当前跨度）；慢周期 = 回看起点～现在。
+        快周期窗口 = 切点之后**全部**流水（不设行数帽）。"""
         _, cut = self.ledger.get_recorder_state(session_key)
         if cycle == "fast":
-            rows = self.ledger.since(session_key, max(cut - 1, 0))
+            rows = self.ledger.since(session_key, max(cut - 1, 0),
+                                     limit=LIVE_ROWS_LIMIT)
         else:
             ts_min = time.time() - self.slow_lookback_days * 86400
             rows = self.ledger.since_time(session_key, ts_min)
@@ -170,7 +203,8 @@ class Recorder:
             rows = rows[len(rows) // 10 or 1:]
         return rows
 
-    def _context(self, session_key: str, cycle: str, rows: list) -> str:
+    def _context(self, session_key: str, cycle: str, rows: list,
+                 compact: bool = False) -> str:
         r_seen, cut = self.ledger.get_recorder_state(session_key)
         now = time.strftime(_TIME_FMT)
         records = [r for r in rows
@@ -178,9 +212,13 @@ class Recorder:
                    and any(getattr(c, "name", "") == RECORD_NAME for c in r.calls)]
         head = [
             f"# 记忆整理 · {'快' if cycle == 'fast' else '慢'}周期 · {now}",
+            self._usage_line(session_key),
             f"# 切点 seq#{cut} · 已整理到 seq#{r_seen} · 未处理委托 {len(records)} 条"
             + (f"（{', '.join(f'seq#{r.seq_id}' for r in records)}）" if records else ""),
         ]
+        advice_line = self._advice_line(session_key, compact)
+        if advice_line:
+            head.append(advice_line)
         if rows:
             head.append(f"# 流水 seq#{rows[0].seq_id}～seq#{rows[-1].seq_id}"
                         "（工具结果已略；图片不附本体）")
@@ -196,6 +234,39 @@ class Recorder:
             if line:
                 parts.append(line)
         return "\n\n".join(parts)
+
+    def _usage(self, session_key: str):
+        """(tokens, predicted, budget, advice)：tokens 优先读 agent_loop 落的渲染用量，
+        缺数据（如刚重启没渲染过）按活行成本现算兜底；预算统一用与 M 共用的配置值
+        （pct 与建议点同分母，不拿 stats 里的重复预算当运算输入）。"""
+        advice = suggest_cut(self.ledger, session_key,
+                             budget=self.token_budget, counter=self.token_counter)
+        stats = self.stats_provider(session_key) if self.stats_provider else None
+        if stats is not None and stats.tokens:
+            return stats.tokens, stats.predicted, self.token_budget, advice
+        return advice.total, 0, self.token_budget, advice
+
+    def _usage_line(self, session_key: str) -> str:
+        """常驻数字行：当前上下文 token 数 / 预算 / 占比（估算，锚定预测另标）。"""
+        tokens, predicted, budget, _ = self._usage(session_key)
+        pct = tokens / budget if budget else 0.0
+        line = f"# 上下文用量：{tokens:,}/{budget:,} token（{pct:.0%}"
+        if predicted:
+            line += f"；锚定预测 {predicted:,}"
+        return line + "）"
+
+    def _advice_line(self, session_key: str, compact: bool) -> str:
+        """条件提示：占比严格超 90% 或强制压缩才提清理（平时只给数字，不没事找事）。"""
+        tokens, _, budget, advice = self._usage(session_key)
+        pct = tokens / budget if budget else 0.0
+        if not compact and pct <= PRESSURE_PCT:
+            return ""
+        if not advice.needed:
+            return "# 强制压缩：当前占比不高，无可清（拿不准就不动）" if compact else ""
+        ts_str = time.strftime(_TIME_FMT, time.localtime(advice.ts))
+        what = "强制压缩" if compact else "上下文快满了"
+        return (f"# {what}（{pct:.0%}）：尽量丢弃 {ts_str} 以前的上下文"
+                f"（建议保留最新约 {advice.keep_pct:.0%} 预算；{advice.reason}）")
 
     def _memory_files(self) -> List[tuple]:
         """记忆文件全量（old/ 除外），(相对路径, 内容)。只收文本（记忆库是文本世界）。"""
