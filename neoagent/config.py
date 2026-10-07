@@ -91,6 +91,15 @@ class AsrConfig:
 
 
 @dataclass
+class SearchConfig:
+    """联网搜索（web_search 工具）：Exa / Tavily，auto = 取第一个配了密钥的。"""
+    provider: str = "auto"       # auto | exa | tavily
+    exa_api_key: str = ""
+    tavily_api_key: str = ""
+    max_results: int = 8         # 默认条数（调用时可传 count 覆盖，上限 20）
+
+
+@dataclass
 class FilesConfig:
     allowed_roots: List[str] = field(default_factory=lambda: ["~"])
 
@@ -157,6 +166,7 @@ class Config:
     recorder: RecorderConfig = field(default_factory=RecorderConfig)
     media: MediaConfig = field(default_factory=MediaConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)
+    search: SearchConfig = field(default_factory=SearchConfig)
     files: FilesConfig = field(default_factory=FilesConfig)
     exec: ExecConfig = field(default_factory=ExecConfig)
     settle: SettleConfig = field(default_factory=SettleConfig)
@@ -407,6 +417,12 @@ def load_config(home: Optional[Path] = None) -> Config:
     cfg.asr.max_audio_seconds = int(_get(raw, "advanced.asr.max_audio_seconds",
                                          cfg.asr.max_audio_seconds))
 
+    cfg.search.provider = str(_get(raw, "search.provider", cfg.search.provider))
+    cfg.search.exa_api_key = str(_get(raw, "search.exa_api_key", cfg.search.exa_api_key) or "")
+    cfg.search.tavily_api_key = str(_get(raw, "search.tavily_api_key",
+                                         cfg.search.tavily_api_key) or "")
+    cfg.search.max_results = int(_get(raw, "search.max_results", cfg.search.max_results))
+
     if _get(raw, "advanced.safety.files_roots") is not None:
         cfg.files.allowed_roots = list(_get(raw, "advanced.safety.files_roots"))
     if _get(raw, "advanced.safety.exec_roots") is not None:
@@ -427,6 +443,10 @@ def load_config(home: Optional[Path] = None) -> Config:
     cfg.llm.reasoning_effort = os.environ.get("NEOAGENT_LLM_THINKING", cfg.llm.reasoning_effort)
     cfg.asr.api_key = os.environ.get("NEOAGENT_ASR_API_KEY", cfg.asr.api_key)
     cfg.jev.api_key = os.environ.get("NEOAGENT_JEV_API_KEY", cfg.jev.api_key)
+    cfg.search.provider = os.environ.get("NEOAGENT_SEARCH_PROVIDER", cfg.search.provider)
+    cfg.search.exa_api_key = os.environ.get("NEOAGENT_SEARCH_EXA_API_KEY", cfg.search.exa_api_key)
+    cfg.search.tavily_api_key = os.environ.get("NEOAGENT_SEARCH_TAVILY_API_KEY",
+                                               cfg.search.tavily_api_key)
     cfg.recorder.reasoning_effort = os.environ.get("NEOAGENT_MEMORY_TIDY_THINKING",
                                                    cfg.recorder.reasoning_effort)
     # 飞书凭据按 kind 覆盖到每个飞书频道（多开也吃得下）

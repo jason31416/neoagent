@@ -24,6 +24,7 @@ from .tools.exec_tool import ExecPolicy, register_exec_tool
 from .tools.file_tools import FileScope, register_file_tools
 from .tools.memory_tools import register_record_memory
 from .tools.registry import ToolRegistry
+from .tools.search_tool import register_search_tool
 from .tools.skill_tools import register_skill_tools
 from .tools.wake_tools import register_wake_tools
 
@@ -137,6 +138,9 @@ def build_agent(cfg: Config) -> AgentLoop:
     # skill 工具：skill_list / skill_show / skill_call / skill_check（固定四个，
     # 不随服务涨——服务是 skill 文件，不是新工具）
     register_skill_tools(registry, skills_dir)
+
+    # 联网搜索：一个 web_search 工具吃所有搜索服务（Exa/Tavily 由 config 的 search 段决定）
+    register_search_tool(registry, cfg.search)
 
     # R（Recorder）：记忆整理 + 上下文退役。与 M 共用 LLM 与预算，快慢同档。
     recorder = Recorder(llm, ledger, memory_dir,

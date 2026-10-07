@@ -58,6 +58,15 @@ proactive:
   probe_active_min: 600
   probe_idle_max: 5400
 
+search:
+  # 联网搜索（web_search 工具）：auto = 按 exa→tavily 取第一个配了密钥的
+  provider: auto
+  # 密钥也可以不落盘：环境变量 NEOAGENT_SEARCH_EXA_API_KEY / NEOAGENT_SEARCH_TAVILY_API_KEY
+  exa_api_key: ""
+  tavily_api_key: ""
+  # 单次搜索默认返回条数（调用时可传 count 覆盖，上限 20）
+  max_results: 8
+
 limits:
   # 一次回复内最多连续调用多少轮工具（防失控）
   max_tool_rounds: 90
