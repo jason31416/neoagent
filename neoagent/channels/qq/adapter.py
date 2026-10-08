@@ -76,6 +76,7 @@ class QQAdapter(ChannelAdapter):
         self._client: Optional[OneBotClient] = None
         self._session = None            # 附件下载用 aiohttp（connect 时建）
         self._self_id = ""
+        self._group_names: Dict[str, str] = {}   # 群名缓存（事件不带群名，得查 API）
         self._seen: Dict[str, float] = {}   # message_id 去重（重连/上游重发兜底）
 
     # ------------------------------------------------------------------
@@ -95,7 +96,9 @@ class QQAdapter(ChannelAdapter):
         except Exception as exc:
             self._self_id = self._client.self_id
             logger.warning("[qq] get_login_info 失败（不影响收消息）：%s", exc)
-        logger.info("[qq] 已连接，self_id=%s", self._self_id or "未知")
+        await self._refresh_group_names()
+        logger.info("[qq] 已连接，self_id=%s，群名缓存 %d 个",
+                    self._self_id or "未知", len(self._group_names))
 
     async def disconnect(self) -> None:
         if self._client is not None:
@@ -104,6 +107,37 @@ class QQAdapter(ChannelAdapter):
         if self._session is not None and not self._session.closed:
             await self._session.close()
         logger.info("[qq] 已断开")
+
+    async def _refresh_group_names(self) -> None:
+        """群名缓存：get_group_list 一把拉全；失败不碍事（记录里显示群 id）。"""
+        if self._client is None:
+            return
+        try:
+            groups = await self._client.call("get_group_list")
+            for g in groups or []:
+                gid = str(g.get("group_id") or "")
+                name = str(g.get("group_name") or "").strip()
+                if gid and name:
+                    self._group_names[gid] = name
+        except Exception as exc:
+            logger.warning("[qq] 拉群名失败（不影响收消息）：%s", exc)
+
+    def _group_title(self, group_id: str) -> str:
+        """群名：缓存里有就带上（群记录/list_groups 显示群名）；没有现查一次。"""
+        name = self._group_names.get(group_id, "")
+        if not name and self._client is not None:
+            asyncio.get_event_loop().create_task(self._fetch_group_name(group_id))
+        return name
+
+    async def _fetch_group_name(self, group_id: str) -> None:
+        try:
+            info = await self._client.call("get_group_info",
+                                           {"group_id": _num(group_id)})
+            name = str(info.get("group_name") or "").strip()
+            if name:
+                self._group_names[group_id] = name
+        except Exception as exc:
+            logger.debug("[qq] 查群名失败 %s：%s", group_id, exc)
 
     # ------------------------------------------------------------------
     # 收消息：事件 → MessageEvent
@@ -135,7 +169,8 @@ class QQAdapter(ChannelAdapter):
             sender=Sender(id=sender_id, name=short_id(sender_id)),
             conversation=Conversation(
                 id=group_id if is_group else sender_id,
-                type="group" if is_group else "direct"),
+                type="group" if is_group else "direct",
+                title=self._group_title(group_id) if is_group else ""),
             text=text,
             timestamp=float(evt.get("time") or time.time()),
             attachments=atts,
