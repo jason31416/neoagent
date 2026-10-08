@@ -252,6 +252,13 @@ async def _run(mode: str, verbose: bool) -> None:
         ch = next((c for c in cfg.channels if c.name == channel), None)
         return str(ch.params.get("owner_id") or "") if ch is not None else ""
 
+    def is_owner_ev(event: MessageEvent) -> bool:
+        """发送者是不是主人（下载闸跑在 on_message 之前，不能依赖 event.is_owner）。"""
+        if event.channel == "cli":
+            return True
+        owner_id = owner_id_of(event.channel)
+        return bool(owner_id) and event.sender.id == owner_id
+
     def claim_owner(channel: str, sender_id: str) -> None:
         """配对成功：该频道的 owner_id 槽位换成它（每频道一个槽位，只换本频道）。"""
         _reload_channels()
@@ -284,9 +291,7 @@ async def _run(mode: str, verbose: bool) -> None:
 
     async def on_message(event: MessageEvent) -> None:
         logger.info("[%s] %s %s", event.channel, bold_cyan("<<"), (event.text or "")[:80])
-        owner_id = owner_id_of(event.channel)
-        event.is_owner = event.channel == "cli" or (
-            bool(owner_id) and event.sender.id == owner_id)
+        event.is_owner = is_owner_ev(event)
 
         # 非主人私聊：配对码是唯一豁免；其余完全忽略（不入账不回应不提示）
         if event.conversation.type == "direct" and not event.is_owner:
@@ -326,11 +331,12 @@ async def _run(mode: str, verbose: bool) -> None:
                         responder=responder)
 
     # ---- 频道管理：/connect //disconnect 热插拔（写回 enabled = 自启开关）
-    # 附件按需下载：活跃群的 chatagent / 主人私聊才拉字节；其余零 API
-    def download_gate(event: MessageEvent) -> bool:
+    # 附件按需下载（按类型）：群里只有图片值得下载（进 chatagent 上下文），
+    # 文件/语音/视频只留元数据不落盘；私聊只下载主人的（附件是干活原料）。
+    def download_gate(event: MessageEvent, kind: str) -> bool:
         if event.conversation.type == "group":
-            return agent.chatagents.is_active(event.conversation.id)
-        return event.is_owner
+            return kind == "image" and agent.chatagents.is_active(event.conversation.id)
+        return is_owner_ev(event)
 
     async def group_sender(chat_id: str, text: str,
                            quote_to: str | None = None, media: str | None = None):

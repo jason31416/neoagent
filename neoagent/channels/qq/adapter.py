@@ -185,9 +185,11 @@ class QQAdapter(ChannelAdapter):
                       "group_id": group_id if is_group else "",
                       "at_bot": at_bot, "at": at_labels},
         )
-        # 按需下载：download_gate 说不（休眠群/非主人私聊）就零下载
-        if self.download_gate is None or self.download_gate(event):
-            await self._download_resources(message_id or event.id, resources)
+        # 按需下载：逐附件问闸（群里只下图片、文件/语音/视频不落盘；私聊只下主人的）
+        todo = [r for r in resources
+                if self.download_gate is None or self.download_gate(event, r[0].kind)]
+        if todo:
+            await self._download_resources(message_id or event.id, todo)
         await self._dispatch(event)
 
     def _is_duplicate(self, message_id: str) -> bool:

@@ -219,12 +219,14 @@ class FeishuAdapter(ChannelAdapter):
                        resources: List[Tuple[Attachment, str, str]]) -> None:
         """主循环里跑：补群名 → 下载资源落盘 → 交给核心。
 
-        按需下载：download_gate 说不（比如休眠群/非主人私聊）就零下载零 API——
-        附件只剩元数据，记录里出 [图] 占位。"""
+        按需下载：逐附件问 download_gate（群里只下图片、文件/语音/视频不落盘；
+        私聊只下主人的）——说不的附件零下载零 API，只剩元数据，记录里出 [图] 占位。"""
         if event.conversation.type == "group" and not event.conversation.title:
             event.conversation.title = await self._ensure_chat_title(event.conversation.id)
-        if self.download_gate is None or self.download_gate(event):
-            await self._download_resources(event.id, resources)
+        todo = [r for r in resources
+                if self.download_gate is None or self.download_gate(event, r[0].kind)]
+        if todo:
+            await self._download_resources(event.id, todo)
         await self._dispatch(event)
 
     async def _ensure_chat_title(self, chat_id: str) -> str:
