@@ -116,11 +116,13 @@ class ChatAgentManager:
             self.ledger.set_setting(f"group_title:{chat_id}", title)
 
         # ① 群记录：一条不少（文字原样；图等非文字只记占位）
+        # （占位词典拎出来写：f-string 表达式跨行是 3.12+ 语法，下限是 3.10）
         atts = event.attachments or []
         kind = "text" if (event.text or "").strip() else (
             atts[0].kind if atts else "text")
-        text = (event.text or "").strip() or f"[{ {'image': '图', 'file': '文件',
-                'audio': '语音', 'video': '视频'}.get(kind, '附件') }]"
+        word = {"image": "图", "file": "文件",
+                "audio": "语音", "video": "视频"}.get(kind, "附件")
+        text = (event.text or "").strip() or f"[{word}]"
         self.ledger.log_group_message(
             chat_id=chat_id, sender=event.sender.id, is_owner=event.is_owner,
             kind=kind, text=text, message_id=event.id, timestamp=event.timestamp)

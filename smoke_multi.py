@@ -141,6 +141,21 @@ async def main() -> None:
     mem = Path(tmp) / "MEMORY.md"
     sent = Collector()
 
+    # ── 0. 语法下限（pyproject 声明 requires-python >= 3.10）──
+    # f-string 跨行表达式这类 3.12+ 语法在开发机（3.13）上跑得欢，
+    # 到 3.10 的机器上直接 import 炸——按 3.10 语法档先过一遍。
+    print("=== 0. 语法下限（3.10）===")
+    import ast as _ast
+    srcs = sorted(Path(__file__).parent.joinpath("neoagent").rglob("*.py")) \
+        + [Path(__file__).resolve()]
+    bad = []
+    for p in srcs:
+        try:
+            _ast.parse(p.read_text(encoding="utf-8"), filename=str(p), feature_version=10)
+        except SyntaxError as e:
+            bad.append(f"{p.name}:{e.lineno} {e.msg}")
+    check(not bad, f"全包按 3.10 语法可解析（{len(srcs)} 文件）{bad if bad else ''}")
+
     # ── 1. 入库定稿（净化 / 气泡编号 / recall 固化）──
     print("=== 1. 入库定稿 ===")
     fake_hit = SimpleNamespace(bubble_id=3, sender="jason31416", timestamp=_TS,
