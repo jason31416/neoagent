@@ -143,5 +143,4 @@ class SettleGate:
         conv.texts = []
         conv.first_at = 0.0
         conv.timer = None
-        logger.info("[settle] 攒批 %d 条到点，开工", n)
         self.agent.kick(conv.bucket)
