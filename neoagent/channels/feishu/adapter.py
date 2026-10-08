@@ -31,7 +31,7 @@ try:
     from lark_oapi.api.im.v1 import (
         CreateFileRequest, CreateFileRequestBody,
         CreateImageRequest, CreateImageRequestBody,
-        GetMessageRequest, GetMessageResourceRequest,
+        GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
         CreateMessageRequest, CreateMessageRequestBody,
         P2ImMessageReceiveV1, ReplyMessageRequest, ReplyMessageRequestBody,
     )
@@ -125,6 +125,7 @@ class FeishuAdapter(ChannelAdapter):
         self._ws_client = None       # lark WS 客户端（收消息用）
         self._loop = None            # 主事件循环（connect 时记录）
         self._ws_loop = None         # WS 线程专用事件循环（disconnect 时停它）
+        self._chat_titles: dict = {}  # 群名缓存（事件不带群名，首次见到查一次）
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -216,13 +217,36 @@ class FeishuAdapter(ChannelAdapter):
 
     async def _process(self, event: MessageEvent,
                        resources: List[Tuple[Attachment, str, str]]) -> None:
-        """主循环里跑：先下载资源落盘，再交给核心。
+        """主循环里跑：补群名 → 下载资源落盘 → 交给核心。
 
         按需下载：download_gate 说不（比如休眠群/非主人私聊）就零下载零 API——
         附件只剩元数据，记录里出 [图] 占位。"""
+        if event.conversation.type == "group" and not event.conversation.title:
+            event.conversation.title = await self._ensure_chat_title(event.conversation.id)
         if self.download_gate is None or self.download_gate(event):
             await self._download_resources(event.id, resources)
         await self._dispatch(event)
+
+    async def _ensure_chat_title(self, chat_id: str) -> str:
+        """群名：缓存里有就带；没有查一次 chat.get（只查一次，失败不挡消息）。"""
+        name = self._chat_titles.get(chat_id, "")
+        if name:
+            return name
+        try:
+            name = await asyncio.to_thread(self._get_chat_name, chat_id)
+            self._chat_titles[chat_id] = name
+            logger.info("[feishu] 群名 %s = %s", chat_id, name or "（没查到）")
+        except Exception as exc:
+            logger.warning("[feishu] 查群名失败 %s：%s", chat_id, exc)
+        return name
+
+    def _get_chat_name(self, chat_id: str) -> str:
+        """同步查群名（SDK 是同步 API，外面包了 to_thread）。"""
+        request = GetChatRequest.builder().chat_id(chat_id).build()
+        resp = self._client.im.v1.chat.get(request)
+        if not resp.success():
+            raise RuntimeError(f"chat.get 失败 code={resp.code} msg={resp.msg}")
+        return str(getattr(getattr(resp, "data", None), "name", "") or "")
 
     @staticmethod
     def _render_mentions(text: str, mentions) -> tuple:

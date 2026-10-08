@@ -85,11 +85,17 @@ class QQAdapter(ChannelAdapter):
     async def connect(self) -> None:
         if not self._ws_url:
             raise RuntimeError("qq 通道未配置 ws_url（napcat 的 OneBot 11 WebSocket 地址）")
-        # 下载 session 先建：事件在首连那一刻就会涌进来，附件下载不能踩空
+        # 下载 session 先建：事件在首连那一刻就会涌进来，附件下载不能踩空。
+        # 连接失败要把 session 收干净（否则泄漏到 GC 才报 Unclosed client session）
         self._session = aiohttp.ClientSession(trust_env=True)
-        self._client = OneBotClient(self._ws_url, self._token,
-                                    on_event=self._on_event)
-        await self._client.start()
+        try:
+            self._client = OneBotClient(self._ws_url, self._token,
+                                        on_event=self._on_event)
+            await self._client.start()
+        except Exception:
+            await self._session.close()
+            self._session = None
+            raise
         try:
             info = await self._client.call("get_login_info")
             self._self_id = str(info.get("user_id") or "") or self._client.self_id

@@ -335,6 +335,9 @@ class RecorderScheduler:
                 now = time.time()
                 slow_due = now - last_slow >= self.slow_interval
                 for key in self.ledger.session_keys():
+                    if key.startswith("group:"):
+                        continue   # 群桶是 chatagent 的（自己静默压缩），R 不插手：
+                        # 别把群聊内容写进主记忆、别跟它的压缩抢切点
                     if self._settled(key, now) and self.recorder.pending(key):
                         await self.recorder.run(key, "fast")
                     if slow_due:

@@ -110,6 +110,10 @@ class OneBotClient:
         self._running = False
         self._ready = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
+        self._consumer: Optional[asyncio.Task] = None
+        # 事件队列：收包循环只管读帧（回包按 echo 对号），事件交给消费者顺序处理。
+        # 不解耦的话，事件处理里的同步 call() 会等回包、回包又等收包循环——死锁。
+        self._events: asyncio.Queue = asyncio.Queue()
         self.self_id = ""          # 登录后从事件/回包里认出的机器人 qq
 
     # ---------------------------------------------------------------- 生命周期
@@ -121,6 +125,7 @@ class OneBotClient:
         self._running = True
         self._ready.clear()
         self._task = asyncio.get_event_loop().create_task(self._run())
+        self._consumer = asyncio.get_event_loop().create_task(self._consume())
         # 等首连（15s 连不上就算失败，让 /connect 的回执如实报）
         try:
             await asyncio.wait_for(self._ready.wait(), timeout=15)
@@ -130,13 +135,15 @@ class OneBotClient:
 
     async def close(self) -> None:
         self._running = False
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._task = None
+        for task in (self._task, self._consumer):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._task = None
+        self._consumer = None
         ws, self._ws = self._ws, None
         if ws is not None and not ws.closed:
             await ws.close()
@@ -196,12 +203,21 @@ class OneBotClient:
             if fut is not None and not fut.done():
                 fut.set_result(frame)
             return
-        # 事件帧：认出 self_id（get_login_info 之外的兜底），转给上层
+        # 事件帧：认出 self_id（get_login_info 之外的兜底），丢队列给消费者
         if frame.get("self_id"):
             self.self_id = self.self_id or str(frame["self_id"])
-        if self.on_event is not None:
+        self._events.put_nowait(frame)
+
+    async def _consume(self) -> None:
+        """事件消费者：顺序处理（保序），且不占收包循环——处理里发消息才不会死锁。"""
+        while True:
+            frame = await self._events.get()
+            if self.on_event is None:
+                continue
             try:
                 await self.on_event(frame)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.exception("[qq] 事件处理出错")
 

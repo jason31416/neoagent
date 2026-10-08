@@ -71,8 +71,11 @@ def render(ev: Dict, color: bool = True) -> str:
         if ev.get("reply"):
             body = gray(f"回复 {ev['reply']}：") + body
         parts = [ts]
-        if ev.get("channel"):
-            parts.append(cyan(ev["channel"]))
+        loc = ev.get("channel", "")
+        if ev.get("chat"):                    # 群聊带群名：qq·小窝（私聊没有）
+            loc = f"{loc}·{ev['chat']}" if loc else str(ev["chat"])
+        if loc:
+            parts.append(cyan(loc))
         parts.append(f"{speaker}: {body}")
         return " ".join(parts)
     finally:

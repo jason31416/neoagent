@@ -72,6 +72,8 @@ def _inbound_ev(event: MessageEvent) -> dict:
     ev = {"kind": "msg", "channel": event.channel,
           "speaker": "你" if event.channel == "cli" else (event.sender.name or event.sender.id),
           "text": text}
+    if event.conversation.type == "group":
+        ev["chat"] = event.conversation.title or event.conversation.id   # 群名（转录里认群）
     if event.reply_to is not None and event.reply_to.sender_name:
         ev["reply"] = event.reply_to.sender_name
     return ev
@@ -244,6 +246,8 @@ async def _run(mode: str, verbose: bool) -> None:
     # ---- 消息进来：转录 + 入核心；回复经 responder 按气泡 channel 路由
     # 身份层：owner 判定在代码层（sender.id 与频道配置的 owner_id 精确比对），
     # 判定结果灌进 event.is_owner（定稿写 owner="1"、指令闸用它）。
+    # 群消息：全量落群记录；转录/TUI 只放行活跃群（不然大群刷屏），
+    # 群→频道的归属记 kv（group_channel:<chat_id>），发回该群要认频道（群 id 是平台局部的）。
     def owner_id_of(channel: str) -> str:
         ch = next((c for c in cfg.channels if c.name == channel), None)
         return str(ch.params.get("owner_id") or "") if ch is not None else ""
@@ -298,13 +302,21 @@ async def _run(mode: str, verbose: bool) -> None:
                 logger.info("[%s] 非主人私聊忽略 %s", event.channel, event.sender.id)
             return
 
-        last_events[event.channel] = event
-        server.broadcast(_inbound_ev(event))
-
         # 群聊：全量落群记录 + 活跃群的 chatagent（主 agent 侧只读查询，不进 main 桶）
         if event.conversation.type == "group":
+            chat_id = event.conversation.id
+            agent.ledger.set_setting(f"group_channel:{chat_id}", event.channel)
+            title = (event.conversation.title
+                     or agent.ledger.get_setting(f"group_title:{chat_id}"))
+            if title:
+                event.conversation.title = title
+            if agent.chatagents.is_active(chat_id):
+                server.broadcast(_inbound_ev(event))   # 只放行活跃群，不然刷屏
             await agent.chatagents.on_group_message(event)
             return
+
+        last_events[event.channel] = event
+        server.broadcast(_inbound_ev(event))
 
         adapter = by_name.get(event.channel)
         responder = make_responder(lambda: event.channel)
@@ -322,22 +334,38 @@ async def _run(mode: str, verbose: bool) -> None:
 
     async def group_sender(chat_id: str, text: str,
                            quote_to: str | None = None, media: str | None = None):
-        """chatagent 的发群出口：按群找频道适配器原路发回。"""
+        """chatagent 的发群出口：按群的频道归属原路发回。
+
+        群 id 是平台局部的（QQ 群号撞飞书 chat_id 有可能），发去哪个频道
+        由 group_channel:<chat_id> 认领（群消息入账时记）；认不出来就报错，
+        绝不猜频道硬发（猜错 = 把群消息投进别人的会话）。"""
         title = agent.ledger.get_setting(f"group_title:{chat_id}")
-        for name, ad in list(by_name.items()):
-            ev = last_events.get(name)
-            # 找该群最近一次入站消息的频道做回复载体；没有就造一个最小载体
-            if ev is None or ev.conversation.id != chat_id:
-                ev = MessageEvent(
-                    id="chatagent-send", channel=name,
-                    sender=Sender(id="chatagent", name="chatagent"),
-                    conversation=Conversation(id=chat_id, type="group",
-                                              title=title),
-                    text="", metadata={"chat_id": chat_id})
-            if media:
-                return await ad.send_media(ev, media, quote_to=quote_to)
-            return await ad.send_reply(ev, text, quote_to=quote_to)
-        return SendResult(ok=False, error="没有已连接的频道")
+        name = agent.ledger.get_setting(f"group_channel:{chat_id}")
+        ad = by_name.get(name)
+        if ad is None:
+            logger.warning("[groups] 群 %s 找不到所属频道（%s），丢弃：%s",
+                           chat_id, name or "没记过", text[:40])
+            return SendResult(ok=False,
+                              error=f"群 {chat_id} 的所属频道不在线（{name or '没记过'}）")
+        ev = MessageEvent(
+            id="chatagent-send", channel=name,
+            sender=Sender(id="chatagent", name="chatagent"),
+            conversation=Conversation(id=chat_id, type="group", title=title),
+            text="", metadata={"chat_id": chat_id, "group_id": chat_id})
+        if media:
+            result = await ad.send_media(ev, media, quote_to=quote_to)
+        else:
+            result = await ad.send_reply(ev, text, quote_to=quote_to)
+        # 群里的发言也进转录（跟私聊同流，带上群名）；失败进通知流
+        if result.ok:
+            body = text or (f"（{Path(media).name}）" if media else "")
+            server.broadcast({"kind": "msg", "channel": name, "chat": title,
+                              "speaker": "neoagent", "text": body})
+        else:
+            logger.error("[groups] 群 %s 发送失败：%s", chat_id, result.error)
+            server.broadcast({"kind": "notice",
+                              "text": f"群 {title or chat_id} 回复失败：{result.error}"})
+        return result
 
     agent.chatagents.set_sender(group_sender)
 
