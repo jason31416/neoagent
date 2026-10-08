@@ -9,6 +9,8 @@
 
 - 在**微信**里和它说话（腾讯官方 iLink Bot API，扫码登录，无封号风险）
 - 在**飞书**里和它说话（官方 lark-oapi SDK，WebSocket 长连接）
+- 在**QQ**里和它说话（NapCat / OneBot 11 WebSocket，neoagent 连 napcat 的 ws server；
+  群聊直接复用 chatagent 群友机制，@机器人 的判定精确到 qq 号）
 - 在**控制台**里和它说话、看它干活（全频道对话 + 每次工具调用一行，转录只存内存、重启即清）
 - 它能调用工具干活：`read_file`（读文件）/ `write_file`（写文件）/ `exec`（跑命令）
   / `web_search`（联网搜索）/ `run_command`（跑 neoagent 自己的指令）
@@ -54,6 +56,7 @@ uv run python -m neoagent.run console    # 只开控制台（别名 tui），多
 ```
 微信用户 ──iLink Bot API(官方)──► weixin-adapter ─┐
 飞书用户 ──lark-oapi SDK(WS)───► feishu-adapter ─┼─► MessageEvent 归一化
+QQ 用户 ──OneBot 11 WS(NapCat)──► qq-adapter ────┤        │
 控制台   ──control.sock（转录/实时流，可 attach）─┘        │
                                                           ▼
                                                    agent 循环（DeepSeek / OpenAI 兼容）
@@ -110,7 +113,8 @@ neoagent/
 ├── core/          MessageEvent / ChannelAdapter / LLM 客户端 / agent 循环 / Recorder / 指令注册表 / skill 内核
 ├── channels/
 │   ├── weixin/    iLink Bot API 协议层 + 适配器 + 扫码登录
-│   └── feishu/    lark-oapi 适配器
+│   ├── feishu/    lark-oapi 适配器
+│   └── qq/        OneBot 11 WebSocket 协议层 + NapCat 适配器
 ├── tools/         工具注册表 + read_file / write_file / exec / web_search / record_memory / run_command / wake 工具组 / 记忆工具组 / skill 工具组 / 群工具组（list_groups/read_group_chat/tell_chatagent）+ chatagent 工具组（memory/tell_neoagent）
 ├── console/       控制台：渲染（朴素规则）/ 转录缓冲 / prompt_toolkit 客户端
 ├── control.py     控制协议（本机 socket：转录回放 + 实时事件 + 输入）

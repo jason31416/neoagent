@@ -115,5 +115,6 @@ advanced:
       - ":\\(\\)\\s*\\{"
 
 # 频道在 channels/ 目录里，一个频道一个文件（聊天/控制台里 /connect 会自动生成）。
+# qq 频道要在 yml 里填 ws_url（napcat 的 OneBot 11 WebSocket 地址）和 token。
 # 配对码：/connect 后去对应频道私聊发配对码，发码的人自动成为该频道的主人
 # （owner_id 写进频道配置，不用手填；换主人重新 /connect）。

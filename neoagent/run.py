@@ -48,6 +48,11 @@ def _make_adapter(ch: ChannelConfig, cfg: Config) -> ChannelAdapter | None:
         return FeishuAdapter(str(ch.params.get("app_id") or ""),
                              str(ch.params.get("app_secret") or ""),
                              data_dir=cfg.data_dir, max_bytes=cfg.media.max_bytes)
+    if ch.kind == "qq":
+        from .channels.qq.adapter import QQAdapter
+        return QQAdapter(str(ch.params.get("ws_url") or ""),
+                         str(ch.params.get("token") or ""),
+                         data_dir=cfg.data_dir, max_bytes=cfg.media.max_bytes)
     logger.warning("未知的频道类型 %s（%s.yml），跳过", ch.kind, ch.name)
     return None
 
@@ -390,8 +395,8 @@ async def _run(mode: str, verbose: bool) -> None:
         _reload_channels()
         ch = next((c for c in cfg.channels if c.name == name), None)
         if ch is None:
-            if name not in ("weixin", "feishu"):
-                return f"未知频道类型：{name}（可用：weixin、feishu）"
+            if name not in ("weixin", "feishu", "qq"):
+                return f"未知频道类型：{name}（可用：weixin、feishu、qq）"
             ch = ChannelConfig(name=name, kind=name, enabled=True, params={"owner": ""})
             save_channel(ch)              # /connect 顺手生成配置
             cfg.channels.append(ch)
@@ -403,6 +408,10 @@ async def _run(mode: str, verbose: bool) -> None:
                     f"发码的人成为主人（顶掉原主人）")
         if ch.kind == "feishu" and not (ch.params.get("app_id") and ch.params.get("app_secret")):
             return f"飞书要先填凭据：编辑 {ch.path} 的 app_id/app_secret，再来 /connect {name}"
+        if ch.kind == "qq" and not ch.params.get("ws_url"):
+            return (f"QQ 要先填 ws_url（napcat 的 OneBot 11 WebSocket 地址，"
+                    f"如 ws://1.2.3.4:32159，token 填 napcat 那边配的）："
+                    f"编辑 {ch.path}，再来 /connect {name}")
         ch.enabled = True
         save_channel(ch)                  # 写入自启
         conn_tasks[name] = asyncio.get_event_loop().create_task(start_channel(ch))
