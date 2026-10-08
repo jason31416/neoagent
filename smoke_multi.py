@@ -51,10 +51,12 @@ class StubLLM:
         self.script = list(script)
         self.seen = []          # 每次调用的 messages（渲染检查用）
         self.efforts = []       # 每次调用的 reasoning_effort
+        self.sessions = []      # 每次调用的会话标识（x-opencode-session 用）
 
-    async def chat(self, messages, tools=None, reasoning_effort=None):
+    async def chat(self, messages, tools=None, reasoning_effort=None, session=None):
         self.seen.append(messages)
         self.efforts.append(reasoning_effort)
+        self.sessions.append(session)
         r = self.script.pop(0)
         if not hasattr(r, "reasoning"):
             r.reasoning = None
@@ -81,7 +83,8 @@ class Collector:
         self.media = []      # (path, quote_to)
         self.ok = ok
 
-    async def __call__(self, text: str, quote_to: str | None = None, media: str | None = None):
+    async def __call__(self, text: str, quote_to: str | None = None,
+                       media: str | None = None, channel: str | None = None):
         if media:
             self.media.append((media, quote_to))
         else:
@@ -476,13 +479,15 @@ async def main() -> None:
     print("=== 15. effort 热调整（config 改了即生效）===")
     import time as _time
     from neoagent.config import ReasoningEffortSource
-    cfg_path = Path(tmp) / "effort.toml"
-    cfg_path.write_text('[llm]\nreasoning_effort = "none"\n', encoding="utf-8")
-    src = ReasoningEffortSource(cfg_path, initial="medium")
+    effort_home = Path(tmp) / "effort_home"
+    effort_home.mkdir()
+    effort_cfg = effort_home / "config.yml"
+    effort_cfg.write_text("model:\n  thinking: none\n", encoding="utf-8")
+    src = ReasoningEffortSource(effort_home, initial="medium")
     check(src.get() == "none", "改配置即生效（none）")
     check(callable(src) and src() == "none", "effort_provider 契约：实例可直接调用")
     _time.sleep(0.02)
-    cfg_path.write_text('[llm]\nreasoning_effort = "high"\n', encoding="utf-8")
+    effort_cfg.write_text("model:\n  thinking: high\n", encoding="utf-8")
     check(src.get() == "high", "再改再生效（high）")
 
     print("=== 16. 图片落库与协议角色 ===")
@@ -539,7 +544,8 @@ async def main() -> None:
     check(isinstance(out, ToolOutput) and out.images == [str(img.resolve())]
           and "图像内容如下" in out.text, "read_file 图片 → ToolOutput（图像随工具结果进上下文）")
     out2 = await kit.read_file({"path": str(rf_dir / "blob.bin")})
-    check(isinstance(out2, str) and "二进制文件读不出文本" in out2, "非图二进制明确拒绝，不吐乱码")
+    check(isinstance(out2, ToolOutput) and "二进制文件读不出文本" in out2.text,
+          "非图二进制明确拒绝，不吐乱码")
     out3 = await kit.read_file({"path": str(rf_dir / "t.txt")})
     check(isinstance(out3, ToolOutput) and "hello 文本" in out3.text
           and out3.stat == "读 1 行", "文本文件照常读（stat=读 N 行）")
@@ -618,17 +624,17 @@ async def main() -> None:
     check("已修改" in txt(patched) and patched.stat == "+2 -1 行",
           f"patch_file 精确替换（stat={getattr(patched, 'stat', '?')}）")
     check("456" in (memdir / "memory.md").read_text(), "patch_file 落盘生效")
-    check("允许范围" in await regm.call("move_file", {"src": "memory.md", "dst": "/etc/x"}),
+    check("允许范围" in txt(await regm.call("move_file", {"src": "memory.md", "dst": "/etc/x"})),
           "move 越界拒绝（src/dst 都查）")
-    check("已移动" in await regm.call("move_file", {"src": "old/旧.md", "dst": "old/新.md"})
+    check("已移动" in txt(await regm.call("move_file", {"src": "old/旧.md", "dst": "old/新.md"}))
           and (memdir / "old/新.md").exists(), "move 归档移动")
-    check("已删除" in await regm.call("delete_file", {"path": "old/新.md"})
+    check("已删除" in txt(await regm.call("delete_file", {"path": "old/新.md"}))
           and not (memdir / "old/新.md").exists(), "delete 真删")
     for i in range(3):
         add_user(ledger, "cli:r", f"第 {i} 句")
-    check("已推进" in await regm.call("set_cut_point", {"msg_seq": 3})
-          and "未变" in await regm.call("set_cut_point", {"msg_seq": 1})
-          and "不存在" in await regm.call("set_cut_point", {"msg_seq": 99}),
+    check("已推进" in txt(await regm.call("set_cut_point", {"msg_seq": 3}))
+          and "未变" in txt(await regm.call("set_cut_point", {"msg_seq": 1}))
+          and "不存在" in txt(await regm.call("set_cut_point", {"msg_seq": 99})),
           "切点单调只进不退、msg# 验真（工具层反馈 + 账本层强制）")
     check(ledger.get_recorder_state("cli:r")[1] == 3, "切点落库（吸附协议组边界）")
 
@@ -672,7 +678,7 @@ async def main() -> None:
 
     # ---- 22. record_memory 回执 + 紧急压缩钩子 ----
     print("=== 22. record_memory 与紧急压缩 ===")
-    check("已记下" in await record_memory({"content": "x"}), "record_memory 固定回执")
+    check("已记下" in txt(await record_memory({"content": "x"})), "record_memory 固定回执")
     reg_m = ToolRegistry()
     register_record_memory(reg_m)
     check("record_memory" in [s["function"]["name"] for s in reg_m.schemas()],

@@ -311,7 +311,7 @@ class ChatAgentManager:
             return
         kept = rows[-COMPACT_KEEP:]
         try:
-            summary = await self._summarize(rows)
+            summary = await self._summarize(rows, key)
         except Exception as exc:
             logger.warning("[chatagent] 总结调用失败，跳过压缩 %s：%s", chat_id, exc)
             return
@@ -326,7 +326,7 @@ class ChatAgentManager:
         logger.info("[chatagent] 压缩 %s：留 %d 条 + 备忘，回收图 %d",
                     chat_id, len(kept), gone)
 
-    async def _summarize(self, rows) -> str:
+    async def _summarize(self, rows, session: str = "") -> str:
         """打包行（文字 + 图）跑一次总结调用（思考关）。"""
         content: list = [{"type": "text",
                           "text": "\n".join(r.text for r in rows if r.text)}]
@@ -340,7 +340,8 @@ class ChatAgentManager:
                         n += 1
         msgs = [{"role": "system", "content": COMPACT_PROMPT},
                 {"role": "user", "content": content}]
-        result = await self.llm.chat(msgs, reasoning_effort="none")
+        result = await self.llm.chat(msgs, reasoning_effort="none",
+                                     session=session)
         return (result.content or "").strip()
 
 

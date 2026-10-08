@@ -139,7 +139,8 @@ class Recorder:
             modellog.dump("r", session_key, {
                 "cycle": cycle, "round": rnd, "messages": msgs})
             result = await self.llm.chat(msgs, tools=registry.schemas(),
-                                         reasoning_effort=effort)
+                                         reasoning_effort=effort,
+                                         session=session_key)
             report = result.content or report
             last_usage = result.usage or last_usage
             if not result.tool_calls:

@@ -390,7 +390,8 @@ class AgentLoop:
             effort = self.effort_provider()
             modellog.dump("m", session_key, {"round": rounds, "messages": messages})
             st.model_task = asyncio.get_event_loop().create_task(
-                self.llm.chat(messages, tools=tools, reasoning_effort=effort))
+                self.llm.chat(messages, tools=tools, reasoning_effort=effort,
+                              session=session_key))
             try:
                 result = await st.model_task
             except asyncio.CancelledError:
@@ -444,7 +445,8 @@ class AgentLoop:
         effort = self.effort_provider()
         modellog.dump("m", session_key, {
             "round": rounds, "phase": "max_tool_rounds", "messages": messages})
-        result = await self.llm.chat(messages, reasoning_effort=effort)
+        result = await self.llm.chat(messages, reasoning_effort=effort,
+                                     session=session_key)
         self._anchor_and_log(session_key, result, est_total, predicted)
         await self._emit_round(session_key, st, result, None, bubbles_sent)
         return gen_at_render

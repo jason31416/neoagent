@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -24,6 +25,20 @@ for _var in ("NO_PROXY", "no_proxy"):
 from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
+
+# 自报家门（别用 SDK 默认的 OpenAI/Python UA）；opencode 网关明确要求客户端
+# 用自己的 user agent（docs/go/#where-can-i-use-it）
+USER_AGENT = "neoagent/0.1"
+
+
+def session_header(session: Optional[str]) -> str:
+    """会话 → x-opencode-session 头值（头只能塞 ASCII，做个消音）。
+
+    opencode（Go/Zen 网关）要求每会话一个**稳定**的 session id，做路由亲和与
+    提示词缓存；不带这头直接 400 MissingSessionID。我们用账本的桶名
+    （main / group:<群id>）——天然每会话一个、跨请求稳定。"""
+    s = re.sub(r"[^\w.:+-]", "_", str(session or ""))[:64]
+    return s or "neoagent"
 
 
 @dataclass
@@ -53,17 +68,21 @@ class LLMClient:
         # "none"=关思考；"minimal/low/medium/high/xhigh/ultra/max"=开思考；""=不传（服务端默认，
         # ⚠️ DeepSeek 默认是**开**思考）。per-request 可覆盖 → 混用思考/非思考。
         self._effort = reasoning_effort
-        self._client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+        self._client = AsyncOpenAI(base_url=base_url, api_key=api_key,
+                                   default_headers={"User-Agent": USER_AGENT})
 
     async def chat(self, messages: List[Dict[str, Any]],
                    tools: Optional[List[Dict[str, Any]]] = None,
-                   reasoning_effort: Optional[str] = None) -> ChatResult:
+                   reasoning_effort: Optional[str] = None,
+                   session: Optional[str] = None) -> ChatResult:
         """跑一轮模型调用。tools 传 OpenAI function-calling 格式的 schema 列表。
-        reasoning_effort 覆盖默认档位（None = 用构造时的默认）。"""
+        reasoning_effort 覆盖默认档位（None = 用构造时的默认）。
+        session 是会话标识（账本桶名），出 x-opencode-session 头（opencode 兼容）。"""
         effort = self._effort if reasoning_effort is None else reasoning_effort
         kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
+            "extra_headers": {"x-opencode-session": session_header(session)},
         }
         if tools:
             kwargs["tools"] = tools
