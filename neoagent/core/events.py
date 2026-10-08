@@ -68,6 +68,7 @@ class MessageEvent:
     text        纯文本内容（语音已被转写拼入）
     timestamp   Unix 时间戳（秒）
     metadata    通道私有信息，例如微信的 context_token（回复时必须回带）
+    is_owner    发送者是不是主人（代码层按频道 owner_id 比对后填；判定不靠模型认人）
     """
     id: str
     channel: str
@@ -78,6 +79,7 @@ class MessageEvent:
     attachments: List[Attachment] = field(default_factory=list)
     reply_to: Optional[ReplyRef] = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    is_owner: bool = False
 
     def session_key(self) -> str:
         """会话键：同一通道同一会话共享一段对话历史。"""

@@ -24,6 +24,7 @@ class CommandContext:
     channel: str = ""                                       # 指令来自哪个频道（/home 无参的目标）
     home: str = ""                                          # 当前 home
     known_channels: Sequence[str] = ()
+    sender_id: str = ""                                     # 发送者 id（/id 回它）
     set_home: Optional[Callable[[str], None]] = None
     thinking: str = ""                                      # 当前思考档位
     set_thinking: Optional[Callable[[str], bool]] = None     # 落盘改档（保注释写 config.yml）
@@ -110,6 +111,10 @@ def execute(text: str, ctx: CommandContext) -> str:
 
 def _help(args: List[str], ctx: CommandContext) -> str:
     return "可用指令：\n" + usage(ctx)
+
+
+def _id(args: List[str], ctx: CommandContext) -> str:
+    return f"你的 id：{ctx.sender_id or '（拿不到）'}"
 
 
 def _home(args: List[str], ctx: CommandContext) -> str:
@@ -239,6 +244,7 @@ def _disconnect(args: List[str], ctx: CommandContext) -> str:
 
 def _install_defaults() -> None:
     register("help", "列出可用指令", _help)
+    register("id", "回你的账号 id（配对/配置用）", _id)
     register("home", "home [channel]  设置 home 频道（主动消息默认发这里；无参 = 设为当前频道）", _home)
     register("status", "看看状态（思考档位 / home / 频道）", _status)
     register("effort", "effort [档位]  看/调思考档位（none/low/medium/high/…）", _effort)

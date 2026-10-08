@@ -10,6 +10,7 @@ from .config import (PACKAGE_DIR, Config, ReasoningEffortSource, resolve_path,
                      save_config_value)
 from .core import modellog
 from .core.agent_loop import AgentLoop
+from .core.chatagents import ChatAgentManager
 from .core.commands import CommandContext
 from .core.ledger import MessageLedger
 from .core.llm import LLMClient
@@ -22,6 +23,7 @@ from .providers.vision import make_vision
 from .tools.command_tool import register_run_command
 from .tools.exec_tool import ExecPolicy, register_exec_tool
 from .tools.file_tools import FileScope, register_file_tools
+from .tools.group_tools import register_group_tools
 from .tools.memory_tools import register_record_memory
 from .tools.registry import ToolRegistry
 from .tools.search_tool import register_search_tool
@@ -141,6 +143,17 @@ def build_agent(cfg: Config) -> AgentLoop:
 
     # 联网搜索：一个 web_search 工具吃所有搜索服务（Exa/Tavily 由 config 的 search 段决定）
     register_search_tool(registry, cfg.search)
+
+    # 群里的子 agent（chatagent）+ 主 agent 的群工具：list_groups / read_group_chat /
+    # tell_chatagent（M-only，R 不动）。manager 管各群 chatagent 的生命周期与消息路由，
+    # 发群出口由 run.py 注入。
+    chatagents = ChatAgentManager(main=agent, ledger=ledger, llm=llm,
+                                  home=cfg.home, vision=vision,
+                                  transcriber=transcriber,
+                                  token_counter=token_counter,
+                                  known_channels=cfg.channel_names())
+    agent.chatagents = chatagents             # run.py 的消息分流用
+    register_group_tools(registry, ledger=ledger, manager=chatagents)
 
     # R（Recorder）：记忆整理 + 上下文退役。与 M 共用 LLM 与预算，快慢同档。
     recorder = Recorder(llm, ledger, memory_dir,

@@ -67,6 +67,10 @@ search:
   # 单次搜索默认返回条数（调用时可传 count 覆盖，上限 20）
   max_results: 8
 
+groups:
+  # 群聊天记录保留天数（read_group_chat 查得到的范围；到期自动清）
+  log_retention_days: 30
+
 limits:
   # 一次回复内最多连续调用多少轮工具（防失控）
   max_tool_rounds: 90
@@ -111,3 +115,5 @@ advanced:
       - ":\\(\\)\\s*\\{"
 
 # 频道在 channels/ 目录里，一个频道一个文件（聊天/控制台里 /connect 会自动生成）。
+# 配对码：/connect 后去对应频道私聊发配对码，发码的人自动成为该频道的主人
+# （owner_id 写进频道配置，不用手填；换主人重新 /connect）。

@@ -55,6 +55,12 @@ def esc_attr(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
 
 
+def short_id(s: str) -> str:
+    """id 的短码显示（身份判定用全码，上下文/记录显示用短码；不做显示名）。"""
+    s = s or ""
+    return s if len(s) <= 12 else "…" + s[-8:]
+
+
 def fmt_ts(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
 
@@ -82,21 +88,24 @@ def attachment_notes(atts) -> str:
 
 
 def recall_tag(bubble_id: Optional[int], sender: str, ts: float, text: str,
-               channel: str = "") -> str:
+               channel: str = "", owner: bool = False) -> str:
     """引用快照：<recall> 独立标签，贴在被引消息自己标签的前面。"""
     id_attr = f' id="msg#{bubble_id}"' if bubble_id else ""
     ch_attr = f' channel="{esc_attr(channel)}"' if channel else ""
+    owner_attr = ' owner="1"' if owner else ""
     return (f'<recall{id_attr} sender="{esc_attr(sender)}"'
-            f'{ch_attr} time="{fmt_ts(ts)}">{esc_body((text or "").strip())}</recall>')
+            f'{ch_attr}{owner_attr} time="{fmt_ts(ts)}">{esc_body((text or "").strip())}</recall>')
 
 
 def finalize_user(text: str, *, sender: str, bubble_id: int, ts: float,
-                  recall: str = "", channel: str = "") -> str:
+                  recall: str = "", channel: str = "", owner: bool = False) -> str:
     """用户/系统消息定稿：<message sender channel id time>正文</message>
-    （recall 快照贴前面）。channel = 这条消息所在/落地的频道（系统填）。"""
+    （recall 快照贴前面）。channel = 这条消息所在/落地的频道（系统填）。
+    owner = 发送者是主人（系统按 id 比对后填，模型写不算数）。"""
     body = esc_body(text or "")
     ch_attr = f' channel="{esc_attr(channel)}"' if channel else ""
-    return (f'{recall}<message sender="{esc_attr(sender)}"{ch_attr}'
+    owner_attr = ' owner="1"' if owner else ""
+    return (f'{recall}<message sender="{esc_attr(sender)}"{ch_attr}{owner_attr}'
             f' id="msg#{bubble_id}" time="{fmt_ts(ts)}">{body}</message>')
 
 
@@ -137,7 +146,8 @@ def finalize_assistant(content: Optional[str], *, ts: float,
             return ""
         hit = lookup(target)
         return recall_tag(target, hit.sender, hit.timestamp, hit.content,
-                          channel=getattr(hit, "platform", "")) if hit else ""
+                          channel=getattr(hit, "platform", ""),
+                          owner=getattr(hit, "is_owner", False)) if hit else ""
 
     def _channel_of(raw_attrs: str) -> str:
         c = _CHANNEL_RE.search(raw_attrs)

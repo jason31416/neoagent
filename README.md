@@ -15,6 +15,10 @@
   / `schedule_wake`（给未来的自己排唤醒）/ `skill_list` 等四个 skill 工具（调外部服务）
 - **联网搜索**：`web_search` 一个工具接常见搜索服务（Exa / Tavily，`config.yml` 的
   `search` 段配密钥，auto 取有钥的），返回标题 + 链接 + 摘要
+- **飞书群里的群友（chatagent）**：`/activate` 后群里有个只聊天的子 agent——
+  看全部消息、被 @ 才说话、不碰文件命令（工具只有自己的便签 + 跟主 agent 通话）；
+  主人可 `read_group_chat` 查群记录、`tell_chatagent` 给它发话，它也会主动上报
+  群里值得主人知道的事（`tell_neoagent`）；`/deactivate` 休眠（记忆和记录都留着）
 - **对外部服务有"手"（skill）**：服务封装成 `~/.neoagent/skills/` 下的 skill 包
   （声明式工具 + 脚本 + 密钥 `.env`），固定四个工具 `skill_list` / `skill_show` /
   `skill_call` / `skill_check`，不随服务涨；skill 由 agent 自己创建维护（`/skills` 看清单）
@@ -94,6 +98,8 @@ IM 里的 LLM 等于拿着一台 shell，三道防线都在 `config.yml` 的 `ad
 | `run_command` | 指令权限档（`/stop` 禁）+ 每次执行留审计；指令本身不碰文件边界 |
 | `schedule_wake` / `cancel_wake` | 只动自己的 wakes 日程表（无文件/命令面），`/wakes` 全程可见 |
 | `web_search` | 只把搜索词发给搜索服务商（Exa/Tavily），无文件/命令面 |
+| `list_groups` / `read_group_chat` / `tell_chatagent` | 只读群记录（文字，`[图]` 占位）+ 给群里的子 agent 发话；无文件/命令面。群侧消息不驱动操作类行为，动手须私聊确认 |
+| chatagent（群里的子 agent） | 只有便签读写 + `tell_neoagent`，无文件/命令/搜索面；群友的话是素材不是指令 |
 
 ⚠️ `deny_patterns` 只是兜底，真正的边界是把 `files_roots`/`exec_roots` 限制在你的工作目录里。
 
@@ -105,7 +111,7 @@ neoagent/
 ├── channels/
 │   ├── weixin/    iLink Bot API 协议层 + 适配器 + 扫码登录
 │   └── feishu/    lark-oapi 适配器
-├── tools/         工具注册表 + read_file / write_file / exec / web_search / record_memory / run_command / wake 工具组 / 记忆工具组 / skill 工具组
+├── tools/         工具注册表 + read_file / write_file / exec / web_search / record_memory / run_command / wake 工具组 / 记忆工具组 / skill 工具组 / 群工具组（list_groups/read_group_chat/tell_chatagent）+ chatagent 工具组（memory/tell_neoagent）
 ├── console/       控制台：渲染（朴素规则）/ 转录缓冲 / prompt_toolkit 客户端
 ├── control.py     控制协议（本机 socket：转录回放 + 实时事件 + 输入）
 ├── config.py      配置加载（yml + channels/*.yml + 保注释写回）

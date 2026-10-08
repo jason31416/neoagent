@@ -237,10 +237,70 @@ async def _run(mode: str, verbose: bool) -> None:
     wake_task = asyncio.get_event_loop().create_task(wake_scheduler.run_forever())
 
     # ---- 消息进来：转录 + 入核心；回复经 responder 按气泡 channel 路由
+    # 身份层：owner 判定在代码层（sender.id 与频道配置的 owner_id 精确比对），
+    # 判定结果灌进 event.is_owner（定稿写 owner="1"、指令闸用它）。
+    def owner_id_of(channel: str) -> str:
+        ch = next((c for c in cfg.channels if c.name == channel), None)
+        return str(ch.params.get("owner_id") or "") if ch is not None else ""
+
+    def claim_owner(channel: str, sender_id: str) -> None:
+        """配对成功：该频道的 owner_id 槽位换成它（每频道一个槽位，只换本频道）。"""
+        _reload_channels()
+        ch = next((c for c in cfg.channels if c.name == channel), None)
+        if ch is not None:
+            ch.params["owner_id"] = sender_id
+            save_channel(ch)
+        agent.ledger.set_setting(f"pair_code:{channel}", "")
+
+    def new_pair_code(channel: str) -> str:
+        """/connect 发一次性配对码（kv 存 10 分钟；重连顶掉旧码）。"""
+        code = uuid.uuid4().hex[:6].upper()
+        agent.ledger.set_setting(f"pair_code:{channel}",
+                                 f"{code}|{time.time() + 600}")
+        return code
+
+    def try_pair(event: MessageEvent) -> bool:
+        """私聊里的配对码比对（非主人私聊的唯一豁免；管道层完成不入账）。"""
+        raw = agent.ledger.get_setting(f"pair_code:{event.channel}")
+        if not raw:
+            return False
+        code, _, exp = raw.partition("|")
+        if (event.text or "").strip() != code.strip():
+            return False
+        if time.time() >= float(exp or 0):
+            agent.ledger.set_setting(f"pair_code:{event.channel}", "")
+            return False            # 过期码：当普通私聊忽略
+        claim_owner(event.channel, event.sender.id)
+        return True
+
     async def on_message(event: MessageEvent) -> None:
         logger.info("[%s] %s %s", event.channel, bold_cyan("<<"), (event.text or "")[:80])
+        owner_id = owner_id_of(event.channel)
+        event.is_owner = event.channel == "cli" or (
+            bool(owner_id) and event.sender.id == owner_id)
+
+        # 非主人私聊：配对码是唯一豁免；其余完全忽略（不入账不回应不提示）
+        if event.conversation.type == "direct" and not event.is_owner:
+            if try_pair(event):
+                last_events[event.channel] = event
+                responder = make_responder(lambda: event.channel)
+                await responder("配对完成，你是主人")
+                server.broadcast({"kind": "notice",
+                                  "text": f"{event.channel} 配对成功："
+                                          f"{event.sender.id} 成为主人"})
+                logger.info("[%s] 配对成功，主人 = %s", event.channel, event.sender.id)
+            else:
+                logger.info("[%s] 非主人私聊忽略 %s", event.channel, event.sender.id)
+            return
+
         last_events[event.channel] = event
         server.broadcast(_inbound_ev(event))
+
+        # 群聊：全量落群记录 + 活跃群的 chatagent（主 agent 侧只读查询，不进 main 桶）
+        if event.conversation.type == "group":
+            await agent.chatagents.on_group_message(event)
+            return
+
         adapter = by_name.get(event.channel)
         responder = make_responder(lambda: event.channel)
 
@@ -249,6 +309,47 @@ async def _run(mode: str, verbose: bool) -> None:
                         responder=responder)
 
     # ---- 频道管理：/connect //disconnect 热插拔（写回 enabled = 自启开关）
+    # 附件按需下载：活跃群的 chatagent / 主人私聊才拉字节；其余零 API
+    def download_gate(event: MessageEvent) -> bool:
+        if event.conversation.type == "group":
+            return agent.chatagents.is_active(event.conversation.id)
+        return event.is_owner
+
+    async def group_sender(chat_id: str, text: str,
+                           quote_to: str | None = None, media: str | None = None):
+        """chatagent 的发群出口：按群找频道适配器原路发回。"""
+        title = agent.ledger.get_setting(f"group_title:{chat_id}")
+        for name, ad in list(by_name.items()):
+            ev = last_events.get(name)
+            # 找该群最近一次入站消息的频道做回复载体；没有就造一个最小载体
+            if ev is None or ev.conversation.id != chat_id:
+                ev = MessageEvent(
+                    id="chatagent-send", channel=name,
+                    sender=Sender(id="chatagent", name="chatagent"),
+                    conversation=Conversation(id=chat_id, type="group",
+                                              title=title),
+                    text="", metadata={"chat_id": chat_id})
+            if media:
+                return await ad.send_media(ev, media, quote_to=quote_to)
+            return await ad.send_reply(ev, text, quote_to=quote_to)
+        return SendResult(ok=False, error="没有已连接的频道")
+
+    agent.chatagents.set_sender(group_sender)
+
+    # ---- 群记录保留期清扫（每日一次，超期行删掉；文字之外本就没存）
+    async def group_log_gc() -> None:
+        days = max(1, int(cfg.groups.log_retention_days))
+        while True:
+            await asyncio.sleep(24 * 3600)
+            try:
+                n = agent.ledger.gc_group_log(time.time() - days * 86400)
+                if n:
+                    logger.info("[groups] 群记录清扫 %d 条（保留 %d 天）", n, days)
+            except Exception:
+                logger.exception("[groups] 群记录清扫出错")
+
+    asyncio.get_event_loop().create_task(group_log_gc())
+
     async def start_channel(ch: ChannelConfig) -> None:
         adapter = _make_adapter(ch, cfg)
         if adapter is None:
@@ -257,6 +358,9 @@ async def _run(mode: str, verbose: bool) -> None:
             return
         adapter.name = ch.name            # 频道名 = channels/<name>.yml 的文件名
         adapter.set_message_handler(on_message)
+        adapter.download_gate = download_gate   # 附件按需下载（休眠群/非主人零 API）
+        if hasattr(adapter, "fetch_message_text"):
+            agent.chatagents.set_quote_fetcher(adapter.fetch_message_text)
         if hasattr(adapter, "notice"):    # 扫码等提示 → 控制台通知流
             adapter.notice = (lambda s, _n=ch.name: server.broadcast(
                 {"kind": "notice", "text": f"{_n} {s}"}))
@@ -292,13 +396,20 @@ async def _run(mode: str, verbose: bool) -> None:
             save_channel(ch)              # /connect 顺手生成配置
             cfg.channels.append(ch)
         if name in by_name or _connecting(name):
-            return f"{name} 已经在跑了"
+            # 已在跑：/connect 的另一半用途是换主人——照发新码（旧码自动作废）
+            code = new_pair_code(name)
+            return (f"{name} 已经在跑了\n"
+                    f"配对码 {code}：在 {name} **私聊**发给我（10 分钟内有效）——"
+                    f"发码的人成为主人（顶掉原主人）")
         if ch.kind == "feishu" and not (ch.params.get("app_id") and ch.params.get("app_secret")):
             return f"飞书要先填凭据：编辑 {ch.path} 的 app_id/app_secret，再来 /connect {name}"
         ch.enabled = True
         save_channel(ch)                  # 写入自启
         conn_tasks[name] = asyncio.get_event_loop().create_task(start_channel(ch))
-        return f"{name} 连接中（要扫码的话二维码马上来）"
+        code = new_pair_code(name)        # 一次性配对码：谁先私聊发来谁是主人
+        return (f"{name} 连接中（要扫码的话二维码马上来）\n"
+                f"配对码 {code}：连上后在 {name} **私聊**发给我（10 分钟内有效）——"
+                f"发码的人成为主人（每频道一个槽位，/connect 重来可换人）")
 
     def op_disconnect(name: str) -> str:
         _reload_channels()

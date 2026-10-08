@@ -87,6 +87,16 @@ CREATE TABLE IF NOT EXISTS kv (
   key   TEXT PRIMARY KEY,              -- 运行时设置（home 频道等），重启不丢
   value TEXT
 );
+CREATE TABLE IF NOT EXISTS group_messages (
+  chat_id    TEXT NOT NULL,            -- 群 id（平台局部）
+  message_id TEXT,                     -- 平台消息 id（引用解析用）
+  sender     TEXT NOT NULL DEFAULT '', -- 发送者 id（身份只认 id）
+  is_owner   INTEGER NOT NULL DEFAULT 0, -- 主人标记（代码层比对后落这）
+  kind       TEXT NOT NULL DEFAULT 'text', -- text | image | file | audio
+  text       TEXT NOT NULL DEFAULT '', -- 文字；非文字为占位（[图] 等）
+  ts         REAL
+);
+CREATE INDEX IF NOT EXISTS idx_group_messages_ts ON group_messages(chat_id, ts);
 CREATE TABLE IF NOT EXISTS wakes (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,  -- 对外 w<N>
   session_key TEXT NOT NULL,
@@ -244,7 +254,7 @@ class MessageLedger:
     # 气泡读取（recall 快照 / 引用解析）
     # ------------------------------------------------------------------
     _BCOLS = ("bubble_id, seq_id, direction, platform, chat_id, message_id,"
-              " kind, content, sender, ts")
+              " kind, content, sender, ts, meta")
 
     def get_bubble(self, session_key: str, bubble_id: int) -> Optional[Any]:
         row = self._conn.execute(
@@ -296,11 +306,16 @@ class MessageLedger:
 
     @staticmethod
     def _bubble(r) -> Any:
+        meta = {}
+        try:
+            meta = json.loads(r[10]) if len(r) > 10 and r[10] else {}
+        except Exception:
+            meta = {}
         return SimpleNamespace(
             bubble_id=int(r[0]), seq_id=int(r[1]), direction=r[2] or "",
             platform=r[3] or "", chat_id=r[4] or "", message_id=r[5] or "",
             kind=r[6] or "text", content=r[7] or "", sender=r[8] or "",
-            timestamp=float(r[9] or 0),
+            timestamp=float(r[9] or 0), is_owner=bool(meta.get("owner")),
         )
 
     # ------------------------------------------------------------------
@@ -358,6 +373,116 @@ class MessageLedger:
             " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, str(value)))
         self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # 群记录（group_messages）：所有群消息的流水，谁都能查（read_group_chat），
+    # 与任何 agent 的上下文无关——30 天保留，只存文字（图 = [图] 占位）。
+    # ------------------------------------------------------------------
+    _GCOLS = ("chat_id, message_id, sender, is_owner, kind, text, ts")
+
+    @staticmethod
+    def _group_msg(r) -> Any:
+        return SimpleNamespace(
+            chat_id=r[0] or "", message_id=r[1] or "", sender=r[2] or "",
+            is_owner=bool(r[3]), kind=r[4] or "text", text=r[5] or "",
+            timestamp=float(r[6] or 0),
+        )
+
+    def log_group_message(self, *, chat_id: str, sender: str, text: str,
+                          kind: str = "text", is_owner: bool = False,
+                          message_id: str = "",
+                          timestamp: Optional[float] = None) -> None:
+        """落一条群记录（图片等非文字传 kind + 占位 text）。"""
+        self._conn.execute(
+            "INSERT INTO group_messages(chat_id, message_id, sender, is_owner,"
+            " kind, text, ts) VALUES(?,?,?,?,?,?,?)",
+            (chat_id, message_id or "", sender or "", 1 if is_owner else 0,
+             kind or "text", text or "",
+             timestamp if timestamp is not None else time.time()))
+        self._conn.commit()
+
+    def group_log_range(self, chat_id: str, *, start: float = 0.0,
+                        end: float = 0.0, query: str = "",
+                        limit: int = 200, desc: bool = False) -> List[Any]:
+        """[start, end] 区间的群记录（默认旧→新；desc=True 新→旧）。"""
+        sql = f"SELECT {self._GCOLS} FROM group_messages WHERE chat_id = ?"
+        args: list = [chat_id]
+        if start > 0:
+            sql += " AND ts >= ?"
+            args.append(float(start))
+        if end > 0:
+            sql += " AND ts <= ?"
+            args.append(float(end))
+        if query:
+            sql += " AND text LIKE ?"
+            args.append(f"%{query}%")
+        sql += " ORDER BY ts " + ("DESC" if desc else "ASC") + " LIMIT ?"
+        args.append(max(1, int(limit)))
+        return [self._group_msg(r) for r in self._conn.execute(sql, args)]
+
+    def group_log_count(self, chat_id: str, *, start: float = 0.0,
+                        end: float = 0.0, query: str = "") -> int:
+        """区间内总条数（头尾截断时算"中间省略 N 条"用）。"""
+        sql = "SELECT COUNT(*) FROM group_messages WHERE chat_id = ?"
+        args: list = [chat_id]
+        if start > 0:
+            sql += " AND ts >= ?"
+            args.append(float(start))
+        if end > 0:
+            sql += " AND ts <= ?"
+            args.append(float(end))
+        if query:
+            sql += " AND text LIKE ?"
+            args.append(f"%{query}%")
+        return int(self._conn.execute(sql, args).fetchone()[0])
+
+    def group_log_chats(self) -> List[str]:
+        """有记录的群 id 清单（list_groups 用）。"""
+        return [r[0] for r in self._conn.execute(
+            "SELECT DISTINCT chat_id FROM group_messages ORDER BY chat_id")]
+
+    def gc_group_log(self, before_ts: float) -> int:
+        """删 before_ts 之前的群记录（保留期清扫），返回删除条数。"""
+        cur = self._conn.execute(
+            "DELETE FROM group_messages WHERE ts < ?", (float(before_ts),))
+        self._conn.commit()
+        return cur.rowcount
+
+    # ------------------------------------------------------------------
+    # blob 回收：删"只被该会话切点以下的行"引用的图（chatagent 压缩即销毁）。
+    # 内容寻址跨会话共享——有任何其他行（别的会话、或本会话切点以上）引用
+    # 就不删，主 agent 在上下文里的图不受影响。
+    # ------------------------------------------------------------------
+    def reclaim_blobs(self, session_key: str) -> int:
+        """回收该会话已裁掉的图；返回删除个数。"""
+        _, cut = self.get_recorder_state(session_key)
+        rows = self._conn.execute(
+            "SELECT seq_id, meta FROM turns WHERE session_key = ?"
+            " AND seq_id < ? AND meta LIKE '%image_sha%'",
+            (session_key, int(cut))).fetchall()
+        gone = 0
+        for seq_id, meta in rows:
+            try:
+                atts = (json.loads(meta) or {}).get("attachments", [])
+            except Exception:
+                continue
+            for a in atts:
+                sha = a.get("image_sha")
+                if not sha:
+                    continue
+                # 谁还在引用它？排除"本会话切点以下"的引用，其余都算活引用
+                refs = self._conn.execute(
+                    "SELECT t.seq_id, t.session_key, s.cut_seq FROM turns t"
+                    " JOIN sessions s ON s.session_key = t.session_key"
+                    " WHERE t.meta LIKE ?", (f"%{sha}%",)).fetchall()
+                alive = any(not (sk == session_key and sq < cut)
+                            for sq, sk, _c in refs)
+                if not alive:
+                    self._conn.execute("DELETE FROM blobs WHERE sha256 = ?", (sha,))
+                    gone += 1
+        if gone:
+            self._conn.commit()
+        return gone
 
     # ------------------------------------------------------------------
     # wakes（自我唤醒表）：M 排的闹钟、调度器响，重启不丢

@@ -85,7 +85,7 @@ class AgentLoop:
     """一个核心循环实例服务所有通道、所有会话。"""
 
     def __init__(self, llm: LLMClient, registry: ToolRegistry, ledger: MessageLedger,
-                 memory_file: Path, *, identity_file: Optional[Path] = None,
+                 memory_file: Optional[Path] = None, *, identity_file: Optional[Path] = None,
                  personality_file: Optional[Path] = None,
                  vision=None, transcriber=None, token_counter: Optional[TokenCounter] = None,
                  max_tool_rounds: int = 90, token_budget: int = 250_000,
@@ -102,7 +102,7 @@ class AgentLoop:
         self.llm = llm
         self.registry = registry
         self.ledger = ledger
-        self.memory_file = Path(memory_file)
+        self.memory_file = Path(memory_file) if memory_file else None
         self.identity_file = Path(identity_file) if identity_file else None
         self.personality_file = Path(personality_file) if personality_file else None
         self.vision = vision
@@ -188,6 +188,17 @@ class AgentLoop:
             st.model_task.cancel()   # 立即打断（redirect 的取消动作提前到此刻）
         return text or ""
 
+    async def ingest_quiet(self, event: MessageEvent,
+                           *, quote_fetcher=None) -> str:
+        """群聊噪音入账：预处理 + 定稿落账，但**不打断在飞模型、不计待答**。
+
+        群消息流是连续的，照搬 ingest 的 redirect 语义（取消在飞请求）会让
+        chatagent 永远答不完一句；安静入账的行会在下次 kick 的重渲染里自然进上下文。"""
+        session_key = self.bucket_of(event)
+        text, attachments = await self._preprocess(event)
+        await self._ingest_user(event, session_key, text, attachments, quote_fetcher)
+        return text or ""
+
     def kick(self, session_key: str) -> None:
         """放行开工：本批已定（攒批窗口到点 / 直连即刻）。
 
@@ -235,7 +246,15 @@ class AgentLoop:
     async def _handle_command(self, event: MessageEvent, session_key: str,
                               text: str, responder) -> None:
         """指令执行 + 系统回执：回执是 internal 行 + **真气泡**（可被引用），
-        发到指令来的频道，不触发模型回合。"""
+        发到指令来的频道，不触发模型回合。
+
+        指令闸：chat 面的指令只认主人（/id 例外，它只回发送者自己的 id）；
+        非主人发指令**静默忽略**——不回执不提示，别教人试。"""
+        cmd_name = text.strip().split()[0].lstrip("/").lower() if text.strip() else ""
+        if not event.is_owner and cmd_name != "id":
+            logger.info("[command] 非主人指令静默忽略：%s（%s）", cmd_name,
+                        event.sender.id)
+            return
         recorder = self.recorder
 
         async def _notify(text: str) -> None:
@@ -251,6 +270,7 @@ class AgentLoop:
             channel=event.channel,
             home=self.ledger.get_setting("home"),
             known_channels=self.known_channels,
+            sender_id=event.sender.id,
             set_home=lambda ch: self.ledger.set_setting("home", ch),
             thinking=self.effort_provider() if callable(self.effort_provider) else "",
             set_thinking=self.effort_setter,
@@ -304,6 +324,10 @@ class AgentLoop:
             st.tool_running = False
             st.busy = False
             st.done_at = time.time()      # 任务收工：R 快整理从这一刻起算静默
+
+    def states_of(self, session_key: str) -> SessionState:
+        """取（必要时建）会话运行态——外部注入消息要 bump input_gen 时用。"""
+        return self._states.setdefault(session_key, SessionState())
 
     def turn_state(self, session_key: str) -> tuple:
         """(是否正忙, 上次 turn 收工时刻)——R 快周期调度的判据。
@@ -472,7 +496,8 @@ class AgentLoop:
                                           channel=event.channel)
             if hit is not None:
                 recall = recall_tag(hit.bubble_id, hit.sender, hit.timestamp,
-                                    hit.content, channel=hit.platform)
+                                    hit.content, channel=hit.platform,
+                                    owner=getattr(hit, "is_owner", False))
             else:
                 # 库没有：通道内联文本 / 通道 API 兜底（飞书 message.get）
                 if not ref.text and quote_fetcher is not None:
@@ -491,7 +516,7 @@ class AgentLoop:
         bid = self.ledger.alloc_bubbles(session_key, 1)[0]
         final = finalize_user(body, sender=sender, bubble_id=bid,
                               ts=event.timestamp, recall=recall,
-                              channel=event.channel)
+                              channel=event.channel, owner=event.is_owner)
         seq = self.ledger.add_turn(session_key=session_key, type=TYPE_USER,
                                    text=final, attachments=atts,
                                    timestamp=event.timestamp)
@@ -500,7 +525,8 @@ class AgentLoop:
         self.ledger.add_bubble(
             session_key=session_key, bubble_id=bid, seq_id=seq, direction="in",
             platform=event.channel, chat_id=event.conversation.id, message_id=event.id,
-            kind=kind, content=text or "", sender=sender, timestamp=event.timestamp)
+            kind=kind, content=text or "", sender=sender, timestamp=event.timestamp,
+            meta={"owner": True} if event.is_owner else None)
 
     async def _emit_round(self, session_key: str, st: SessionState, result,
                           calls: Optional[List[dict]], already: int) -> tuple:
@@ -697,7 +723,9 @@ class AgentLoop:
     # ------------------------------------------------------------------
     def _memory_text(self) -> str:
         """【记忆】段：记忆文件全文（R 维护、M 只读；子文件按需经 read_file 的
-        memory:// 口读，空文件整段省略）。"""
+        memory:// 口读，空文件整段省略）。chatagent 无记忆文件（便签自己用工具读）。"""
+        if self.memory_file is None:
+            return ""
         try:
             return self.memory_file.read_text(encoding="utf-8") if self.memory_file.exists() else ""
         except OSError as exc:

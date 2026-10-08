@@ -21,6 +21,7 @@ from typing import List, Optional, Tuple
 
 from ...core.channel import ChannelAdapter
 from ...core.events import Attachment, Conversation, MessageEvent, ReplyRef, SendResult, Sender
+from ...core.frames import short_id
 
 logger = logging.getLogger(__name__)
 
@@ -215,9 +216,30 @@ class FeishuAdapter(ChannelAdapter):
 
     async def _process(self, event: MessageEvent,
                        resources: List[Tuple[Attachment, str, str]]) -> None:
-        """主循环里跑：先下载资源落盘，再交给核心。"""
-        await self._download_resources(event.id, resources)
+        """主循环里跑：先下载资源落盘，再交给核心。
+
+        按需下载：download_gate 说不（比如休眠群/非主人私聊）就零下载零 API——
+        附件只剩元数据，记录里出 [图] 占位。"""
+        if self.download_gate is None or self.download_gate(event):
+            await self._download_resources(event.id, resources)
         await self._dispatch(event)
+
+    @staticmethod
+    def _render_mentions(text: str, mentions) -> tuple:
+        """@_user_N 占位符 → @短码（mention 免费带名则顺手用名）。
+
+        返回 (文本, 被 @ 名单)；at_bot 先降级"有 mention 即算 @"，
+        探针拿到机器人自己的 open_id 后再收紧。"""
+        out = text or ""
+        labels: list = []
+        for m in mentions or []:
+            name = str(getattr(m, "name", "") or "")
+            uid = getattr(m, "id", None)
+            open_id = str(getattr(uid, "open_id", "") or "")
+            label = name or short_id(open_id or f"u_{m.key}")
+            labels.append(label)
+            out = out.replace(f"@_user_{m.key}", f"@{label}")
+        return out, labels
 
     def _parse_event(self, data) -> Tuple[Optional[MessageEvent], list]:
         """把 P2ImMessageReceiveV1 归一化成 MessageEvent + 待下载资源清单。"""
@@ -235,25 +257,17 @@ class FeishuAdapter(ChannelAdapter):
             text = ""
             resources: List[Tuple[Attachment, str, str]] = []  # (att, file_key, res_type)
             mtype = msg.message_type
+            at_labels: list = []
 
             if mtype == "text":
                 text = str(content.get("text", "")).strip()
-                # 群聊里只有 @机器人 才响应；去掉 @_user_N 占位符
-                if msg.chat_type == "group":
-                    if not (msg.mentions or []):
-                        return None, []
-                    for m in msg.mentions:
-                        text = text.replace(f"@_user_{m.key}", "").strip()
+                text, at_labels = self._render_mentions(text, msg.mentions)
             elif mtype == "post":
                 # 富文本：逐段展开成纯文本；内嵌图当图片资源下载
                 text = ""
                 for para in _parse_post(content, resources):
                     text += para + "\n"
-                text = text.strip()
-                for m in msg.mentions or []:
-                    text = text.replace(f"@_user_{m.key}", "").strip()
-                if msg.chat_type == "group" and not (msg.mentions or []):
-                    return None, []
+                text, at_labels = self._render_mentions(text.strip(), msg.mentions)
             elif mtype == "image":
                 key = str(content.get("image_key", ""))
                 if key:
@@ -291,7 +305,8 @@ class FeishuAdapter(ChannelAdapter):
             event = MessageEvent(
                 id=msg.message_id,
                 channel=self.name,
-                sender=Sender(id=sender_id or "unknown", name=sender_id or ""),
+                sender=Sender(id=sender_id or "unknown",
+                              name=short_id(sender_id or "unknown")),
                 conversation=Conversation(
                     id=msg.chat_id,
                     type="group" if msg.chat_type == "group" else "direct"),
@@ -299,7 +314,9 @@ class FeishuAdapter(ChannelAdapter):
                 timestamp=_ms_to_sec(msg.create_time),
                 attachments=[a for a, _k, _t in resources],
                 reply_to=reply_to,
-                metadata={"message_id": msg.message_id, "chat_id": msg.chat_id},
+                metadata={"message_id": msg.message_id, "chat_id": msg.chat_id,
+                          "at_bot": bool(at_labels),   # 降级：有 mention 即算
+                          "at": at_labels},
             )
             return event, resources
         except Exception:

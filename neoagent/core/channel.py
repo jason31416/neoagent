@@ -31,6 +31,9 @@ class ChannelAdapter(abc.ABC):
 
     def __init__(self) -> None:
         self._handler: Optional[MessageHandler] = None
+        # 按需下载钩子：返回 False 的事件零附件下载（休眠群/非主人私聊省 API）。
+        # None = 全下载（默认）。
+        self.download_gate: Optional[Callable[[MessageEvent], bool]] = None
 
     def set_message_handler(self, handler: MessageHandler) -> None:
         """注册消息回调。核心启动时把 agent_loop.handle 挂进来。"""

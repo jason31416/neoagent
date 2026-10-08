@@ -100,6 +100,12 @@ class SearchConfig:
 
 
 @dataclass
+class GroupsConfig:
+    """群聊：记录保留期（chatagent 上下文压缩不受它管）。"""
+    log_retention_days: int = 30
+
+
+@dataclass
 class FilesConfig:
     allowed_roots: List[str] = field(default_factory=lambda: ["~"])
 
@@ -167,6 +173,7 @@ class Config:
     media: MediaConfig = field(default_factory=MediaConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
+    groups: GroupsConfig = field(default_factory=GroupsConfig)
     files: FilesConfig = field(default_factory=FilesConfig)
     exec: ExecConfig = field(default_factory=ExecConfig)
     settle: SettleConfig = field(default_factory=SettleConfig)
@@ -422,6 +429,9 @@ def load_config(home: Optional[Path] = None) -> Config:
     cfg.search.tavily_api_key = str(_get(raw, "search.tavily_api_key",
                                          cfg.search.tavily_api_key) or "")
     cfg.search.max_results = int(_get(raw, "search.max_results", cfg.search.max_results))
+
+    cfg.groups.log_retention_days = int(_get(raw, "groups.log_retention_days",
+                                             cfg.groups.log_retention_days))
 
     if _get(raw, "advanced.safety.files_roots") is not None:
         cfg.files.allowed_roots = list(_get(raw, "advanced.safety.files_roots"))
