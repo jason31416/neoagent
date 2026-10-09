@@ -451,15 +451,16 @@ async def execute_tool(skill: Skill, tool: SkillTool,
 
 
 # ----------------------------------------------------------------------
-# skill-dev 种子（教 neoagent 自己创建/维护 skill 的默认 skill）
+# 内置 skill 种子（skill-dev 教创建 skill；neoagent 是自说明书）
 # ----------------------------------------------------------------------
 
-def ensure_skill_dev(skills_dir: Path, seed_dir: Path) -> bool:
-    """skill-dev 缺失才从包内种子拷贝；已存在绝不覆盖（用户可能改过）。"""
-    target = skills_dir / "skill-dev"
+def ensure_seed_skill(skills_dir: Path, seed_dir: Path) -> bool:
+    """内置 skill 缺失才从包内种子拷贝（目标名 = 种子目录名）；已存在绝不覆盖
+    （用户可能改过——覆盖会吃掉用户改动）。"""
+    target = skills_dir / seed_dir.name
     if target.exists() or not seed_dir.is_dir():
         return False
     skills_dir.mkdir(parents=True, exist_ok=True)
     shutil.copytree(seed_dir, target)
-    logger.info("已植入默认 skill：%s", target)
+    logger.info("已植入内置 skill：%s", target)
     return True

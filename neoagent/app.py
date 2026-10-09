@@ -16,7 +16,7 @@ from .core.ledger import MessageLedger
 from .core.llm import LLMClient
 from .core.proactive import wake_line
 from .core.recorder import Recorder, RecorderScheduler
-from .core.skills import ensure_skill_dev, list_names
+from .core.skills import ensure_seed_skill, list_names
 from .providers.asr import make_transcriber
 from .providers.tokens import HeuristicTokenCounter
 from .providers.vision import make_vision
@@ -48,7 +48,9 @@ def build_agent(cfg: Config) -> AgentLoop:
     # skill 根目录（~/.neoagent/skills/）：neoagent 对外部服务的能力包，由它自己读写维护。
     # file 工具放开该目录（读写）；skill-dev 种子只在缺失时拷，已存在绝不覆盖。
     skills_dir = cfg.home / "skills"
-    ensure_skill_dev(skills_dir, PACKAGE_DIR / "assets" / "skill-dev")
+    # 内置种子 skill：缺失才拷、已存在不覆盖（skill-dev 教写 skill；neoagent 是自说明书）
+    ensure_seed_skill(skills_dir, PACKAGE_DIR / "assets" / "skill-dev")
+    ensure_seed_skill(skills_dir, PACKAGE_DIR / "assets" / "neoagent")
     file_roots = list(dict.fromkeys(
         [*cfg.files.allowed_roots, str(workspace), str(skills_dir)]))
     exec_roots = list(dict.fromkeys([*cfg.exec.allowed_roots, str(workspace)]))

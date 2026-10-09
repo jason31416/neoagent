@@ -1,0 +1,5 @@
+tools:
+  - name: status
+    desc: 看本机 neoagent 部署状态（home 布局 / 配置齐不齐 / 记忆与数据 / 已装 skill），只读
+    run: bash scripts/status.sh
+    timeout: 15

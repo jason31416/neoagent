@@ -40,11 +40,17 @@ tools:
       - {name: keyword, type: string, required: false}   # 参数语义写在本文件正文
     run: bash scripts/list_instances.sh
     timeout: 30
+  - name: echo_message
+    desc: 返回输入的内容
+    params:
+      - {name: message, type: string, required: true}
+    run: echo ${MESSAGE}
+    timeout: 30
 ```
 
 - 顶层只有 env / tools，不写 desc（描述在 skill.md，别重复）
 - params 的 type：string / number / bool / json；required 和 default 二选一按需
-- run 就是一段 shell：简单的内联 curl 一行也行，复杂的 run: bash scripts/xxx.sh
+- run 就是一段 shell：简单的一行命令就选择内联 curl，足够复杂的可以用: bash scripts/xxx.sh
 
 ## 什么时候沉淀 skill
 

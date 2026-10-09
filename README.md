@@ -23,7 +23,9 @@
   群里值得主人知道的事（`tell_neoagent`）；`/deactivate` 休眠（记忆和记录都留着）
 - **对外部服务有"手"（skill）**：服务封装成 `~/.neoagent/skills/` 下的 skill 包
   （声明式工具 + 脚本 + 密钥 `.env`），固定四个工具 `skill_list` / `skill_show` /
-  `skill_call` / `skill_check`，不随服务涨；skill 由 agent 自己创建维护（`/skills` 看清单）
+  `skill_call` / `skill_check`，不随服务涨；skill 由 agent 自己创建维护（`/skills` 看清单），
+  内置两个种子：skill-dev（怎么写 skill）与 neoagent（自我说明书：功能/配置/现状，
+  帮它了解自己）
 - **主动性**：说"明早提醒我带作业""这事一会再说"，它自己排闹钟、到点开口（重启不丢，
   错过的合并补报）；说不说它自己定，不合适就沉默。配了 Jev 还有个便宜哨兵，
   觉得值得惦记才主动说一句（免打扰、不重复骚扰）

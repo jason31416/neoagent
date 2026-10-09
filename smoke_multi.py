@@ -894,6 +894,29 @@ async def main() -> None:
     check("锚定预测 15.0k" in agent_s.context_line("cli:st"),
           f"上下文带锚定预测（实际 {agent_s.context_line('cli:st')}）")
 
+    # ---- 25. 内置 skill 种子（skill-dev / neoagent 自说明书） ----
+    print("=== 25. 内置 skill 种子 ===")
+    from neoagent.core.skills import check_skill, ensure_seed_skill, load_skill
+    assets = Path(__file__).parent / "neoagent" / "assets"
+    for name in ("skill-dev", "neoagent"):
+        sk0 = load_skill(assets / name)
+        bad = [r for r in check_skill(sk0) if not r[0]]
+        check(not sk0.problems and not bad,
+              f"{name} 种子解析+体检通过（{sk0.problems or bad}）")
+    sk_self = load_skill(assets / "neoagent")
+    md_text = sk_self.md_path.read_text(encoding="utf-8")
+    check("不要改自己的代码" in md_text and "覆盖" in md_text,
+          "自说明书带红线：不改自己代码（更新会覆盖）")
+    check(bool(sk_self.description) and sk_self.tool("status") is not None,
+          "自说明书：frontmatter description + status 工具声明在")
+    sdir = Path(tmp) / "skills"
+    check(ensure_seed_skill(sdir, assets / "neoagent")
+          and (sdir / "neoagent" / "skill.md").is_file(), "缺失时植入内置 skill")
+    (sdir / "neoagent" / "skill.md").write_text("改过了", encoding="utf-8")
+    check(not ensure_seed_skill(sdir, assets / "neoagent")
+          and (sdir / "neoagent" / "skill.md").read_text(encoding="utf-8") == "改过了",
+          "已存在不覆盖（用户改动保留）")
+
     ledger.close()
     print("=== 全部通过 ===")
 
