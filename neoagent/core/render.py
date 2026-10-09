@@ -37,7 +37,7 @@ def render_messages(ledger, session_key: str, *, identity: str, memory_text: str
     """装配一次请求的 messages。
 
     返回 (messages, 时间线估算 token, 是否被迫裁剪)。
-    cut_seq   上下文切点（R 的 set_cut_point）：低于它的行不装配（记录不动）。
+    cut_seq   上下文切点（压缩时机械推进）：低于它的行不装配（记录不动）。
     include_reasoning  协议消息是否带 reasoning_content；碰到见这个字段就拒收的
               严格供应商（Mistral/Groq 等）关掉。
     """
@@ -151,15 +151,9 @@ def _truncate_text(text: str, max_tokens: int, counter) -> str:
 
 
 # ----------------------------------------------------------------------
-# 上下文压力：用量统计 + 建议清理点（R 的压缩参考，M 不参与）
+# 上下文用量：统计（R 整理读）+ 行成本（压缩报告算释放量）
 # ----------------------------------------------------------------------
-# 基准：只留最新 30% 预算；刀口不够老（砍龄 <1 天）就挪到一天前；
-# 保留量 50% 封顶——挪到一天前会留超 50% 就停在 50% 刀口，不追求砍够一天。
-KEEP_PCT = 0.30
-KEEP_PCT_CAP = 0.50
-CUT_AGE_DAY = 86400.0
-PRESSURE_PCT = 0.90      # 占比严格超过它才跟 R 提"上下文快满了"
-LIVE_ROWS_LIMIT = 1_000_000   # 活行扫描不设行数帽（R 的窗口=切点后全部）
+LIVE_ROWS_LIMIT = 1_000_000   # 活行扫描不设行数帽（整理/压缩的窗口自管封顶）
 
 
 @dataclass
@@ -171,57 +165,9 @@ class ContextStats:
     ts: float = field(default_factory=time.time)
 
 
-@dataclass
-class CutAdvice:
-    """建议清理点：丢弃 ts 以前的活行（R 仍自行裁量落 set_cut_point）。"""
-    needed: bool = False   # 有没有可清的（活行总量 > 30% 预算）
-    ts: float = 0.0        # 建议丢弃此时间戳以前
-    keep_pct: float = 0.0  # 预计保留量（占预算比例）
-    reason: str = ""       # 这个点是怎么选的
-    total: int = 0         # 活行成本合计（估算 token）
-
-
 def rows_cost(rows, counter) -> int:
     """一批行的渲染成本合计（与预算口径一致，含工具结果/思考草稿）。"""
     return sum(_row_cost(r, counter) for r in rows)
-
-
-def suggest_cut(ledger, session_key: str, *, budget: int, counter,
-                now: Optional[float] = None) -> CutAdvice:
-    """翻账本算建议清理点（30%~50%/一天规则，% 均按预算口径）。
-
-    活行 = 切点之后全部行（与 R 的快周期窗口同口径，含工具结果/思考草稿）。
-    """
-    now = time.time() if now is None else now
-    _, cut = ledger.get_recorder_state(session_key)
-    rows = ledger.since(session_key, max(cut - 1, 0), limit=LIVE_ROWS_LIMIT)
-    if not rows:
-        return CutAdvice()
-    costs = [_row_cost(r, counter) for r in rows]
-    total = sum(costs)
-    if total <= budget * KEEP_PCT:
-        return CutAdvice(total=total)          # 本来就 ≤30%：无可清
-
-    def _keep_edge(target: float) -> float:
-        """从最新往回累计到 target：返回'保留的最老一行'的时间戳。"""
-        acc = 0
-        for r, c in zip(reversed(rows), reversed(costs)):
-            acc += c
-            if acc >= target:
-                return r.timestamp
-        return rows[0].timestamp
-
-    ts30 = _keep_edge(budget * KEEP_PCT)
-    if ts30 <= now - CUT_AGE_DAY:
-        return CutAdvice(True, ts30, KEEP_PCT,
-                         "30% 点已在一天以前", total)
-    ts1d = now - CUT_AGE_DAY
-    keep1d = sum(c for r, c in zip(rows, costs) if r.timestamp >= ts1d)
-    if keep1d > budget * KEEP_PCT_CAP:
-        return CutAdvice(True, _keep_edge(budget * KEEP_PCT_CAP), KEEP_PCT_CAP,
-                         "一天前会留超过 50%，改用 50% 点", total)
-    edge = next(r.timestamp for r in rows if r.timestamp >= ts1d)   # 吸到行边界
-    return CutAdvice(True, edge, keep1d / budget, "推到一天前", total)
 
 
 # ----------------------------------------------------------------------

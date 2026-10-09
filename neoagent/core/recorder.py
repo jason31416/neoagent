@@ -2,9 +2,13 @@
 
 职责（设计-R记忆海马体.md）：
 - 记忆的唯一写者：维护 data/memory/（memory.md + 子文件 + old/ 归档）；
-- 上下文退役的判断者：set_cut_point（只进不退）；
-- 双周期：快周期（查漏补缺/修正/判断切点）、慢周期（长期归纳/归档清理/合并重排），
+- 双周期：快周期（查漏补缺/修正）、慢周期（长期归纳/归档清理/合并重排），
   差异只在提示词一节，工具与预算完全一致。
+
+上下文压缩不归 R 管：切点由 core/compaction.py 机械推进（撞限/强制才动）。
+R 与压缩并发时各用各的口径——压缩那边随便推切点，R 这边整跑钉着**开跑时刻**的
+切点快照（run_retiring，由调用方在触发时刻取好传入），把要退役的整段该记的记掉
+（"先落记忆再退役"）。
 
 上下文 = system + 一条 user（`#` 元数据注释 + <file> 记忆文件全量 + 流水）；
 流水与 M 同消息协议，工具调用与结果一律略去，唯 record_memory 委托内联 <record>。
@@ -25,8 +29,7 @@ from ..tools.registry import ToolOutput, clip_tool_result
 from . import modellog
 from .ledger import TYPE_ASSISTANT, TYPE_TOOL_RESULT, MessageLedger
 from .llm import LLMClient
-from .render import (LIVE_ROWS_LIMIT, PRESSURE_PCT, ContextStats, rows_cost,
-                     suggest_cut)
+from .render import LIVE_ROWS_LIMIT, ContextStats, rows_cost
 from ..providers.tokens import HeuristicTokenCounter, TokenCounter
 
 logger = logging.getLogger("neoagent.recorder")
@@ -42,19 +45,35 @@ def _load_system() -> str:
 _CYCLE_NOTES = {
     "fast": """## 本次是快周期整理
 侧重：修正记忆；
-一般以增加为主、删除为辅。上下文的丢弃判断可以在这次做（拿不准就先不动）。
+一般以增加为主、删除为辅。
 快周期的常态是什么也不做，没有值得记或者只是“或许值得记”的就不要硬记。""",
     "slow": """## 本次是慢周期整理
 侧重：更大幅度的整理——用户习惯、neoagent 的经验这类需要长期推演的归纳；
-对过时或暂时用不到的记忆做归档/清理；对记忆内容做合并与重排。
-上下文切点一般不在这次判断。""",
+对过时或暂时用不到的记忆做归档/清理；对记忆内容做合并与重排。""",
 }
 
-_COMPACT_NOTE = """## 本次是用户强制压缩（/compact）
-目标：把上下文切点推进到建议保留点——先把该记的记忆记掉，再退役；
-能推就推（set_cut_point 只进不退，拿不准可以少清，但别一点不清）。"""
+_RETIRE_SCAN_NOTE = """## 本次是压缩同跑的退役前扫描
+上下文马上要压缩退役（切点会推进），这是退役前对整段的最后一次记忆扫描：
+把该记的都记掉，宁多勿漏。上下文丢弃不归你管，不用判断切点。"""
 
 _TIME_FMT = "%Y-%m-%d %H:%M"
+
+
+def row_line(r) -> str:
+    """一行 → 流水视图的一条（主表定稿原样，和 M 看到的完全一致）。
+    工具调用与结果剥除，唯 record_memory 委托随轮内联。"""
+    if r.type == TYPE_TOOL_RESULT:
+        return ""
+    lines = []
+    if r.text:
+        lines.append(r.text)          # <message>/<recall>/<compact> 等标签都已固化在文里
+    if r.type == TYPE_ASSISTANT:      # record_memory 委托随轮内联（工具行不进流水）
+        ts = time.strftime(_TIME_FMT, time.localtime(r.timestamp))
+        for c in r.calls:
+            if getattr(c, "name", "") == RECORD_NAME:
+                payload = record_payload({"arguments": getattr(c, "arguments", "")})
+                lines.append(f'<record time="{ts}">{_esc(payload)}</record>')
+    return "\n".join(lines)
 
 
 class Recorder:
@@ -78,7 +97,7 @@ class Recorder:
         self.slow_lookback_days = int(slow_lookback_days)
         self.stats_provider = stats_provider        # 渲染用量（agent_loop 落；缺则现算兜底）
         self._system = _load_system()          # 提示词随包（不开放用户配置）
-        self._lock = asyncio.Lock()            # 整理跑互斥（停顿调度/紧急压缩不并发）
+        self._lock = asyncio.Lock()            # 整理跑互斥（停顿调度/压缩同跑不并发）
 
     # ------------------------------------------------------------------
     # 调度器接口
@@ -91,44 +110,43 @@ class Recorder:
     # ------------------------------------------------------------------
     # 一次整理跑
     # ------------------------------------------------------------------
-    async def run(self, session_key: str, cycle: str = "fast",
-                  compact: bool = False) -> str:
-        """跑一次整理，返回工作简报（只进日志）。
-        compact=True：用户强制压缩（/compact）——建议清理点必给，且明确要求推进切点。"""
-        async with self._lock:
-            return await self._run_locked(session_key, cycle, compact)
+    async def run(self, session_key: str, cycle: str = "fast", *,
+                  cut_snapshot: Optional[int] = None,
+                  note: str = "") -> str:
+        """跑一次整理，返回工作简报（只进日志/压缩简报）。
 
-    async def compact(self, session_key: str) -> str:
-        """用户强制压缩（/compact）：跑一次压缩整理，回报切点进展（简报给人看）。"""
-        _, cut_before = self.ledger.get_recorder_state(session_key)
-        await self.run(session_key, "fast", compact=True)
-        _, cut_after = self.ledger.get_recorder_state(session_key)
-        advice = suggest_cut(self.ledger, session_key,
-                             budget=self.token_budget, counter=self.token_counter)
-        if cut_after > cut_before:
-            dropped = [r for r in self.ledger.since(session_key, cut_before - 1,
-                                                    limit=LIVE_ROWS_LIMIT)
-                       if r.seq_id < cut_after]
-            freed = rows_cost(dropped, self.token_counter)
-            return (f"压缩完成：切点 seq#{cut_before}→seq#{cut_after}，"
-                    f"释放约 {freed:,} token（现活行约 {advice.total:,}）")
-        if not advice.needed:
-            return f"无需压缩（当前活行约 {advice.total:,} token，占比不高）"
-        return (f"压缩未推进切点（R 拿不准，欠一次压缩；现活行约 {advice.total:,} token）")
+        cut_snapshot：切点快照（压缩同跑用）——整跑用它取"要退役的整段"，
+        不回读账本里的活切点（压缩那边会并发推进，回读就把段读腰斩了）。
+        """
+        async with self._lock:
+            return await self._run_locked(session_key, cycle,
+                                          cut_snapshot=cut_snapshot, note=note)
+
+    async def run_retiring(self, session_key: str, cut0: int) -> str:
+        """压缩同跑：退役前对 [cut0, 现在] 整段做最后一次记忆扫描。
+
+        cut0 必须是调用方在**触发时刻**取的快照——那时的切点才是退役段的起点；
+        即使排队轮到本跑时切点已被压缩推走，整跑也钉着 cut0（记忆不漏）。"""
+        return await self.run(session_key, "fast", cut_snapshot=cut0,
+                              note=_RETIRE_SCAN_NOTE)
 
     async def _run_locked(self, session_key: str, cycle: str,
-                          compact: bool = False) -> str:
-        rows = self._window(session_key, cycle)
+                          cut_snapshot: Optional[int] = None,
+                          note: str = "") -> str:
+        rows = self._window(session_key, cycle, cut_snapshot)
         if not rows and cycle == "fast":
             return "（无待整理流水）"
 
-        registry = build_memory_registry(self.ledger, session_key, self.memory_dir)
-        _, cut_before = self.ledger.get_recorder_state(session_key)
-        note = _CYCLE_NOTES.get(cycle, "") + ("\n" + _COMPACT_NOTE if compact else "")
+        registry = build_memory_registry(self.memory_dir)
+        r_seen, cut = self.ledger.get_recorder_state(session_key)
+        cut0 = int(cut_snapshot) if cut_snapshot is not None else cut   # 钉住：整跑用它
+        notes = _CYCLE_NOTES.get(cycle, "")
+        if note:
+            notes = notes + "\n" + note if notes else note
         msgs = [
-            {"role": "system", "content": self._system + "\n" + note},
+            {"role": "system", "content": self._system + ("\n" + notes if notes else "")},
             {"role": "user", "content": self._context(session_key, cycle, rows,
-                                                     compact=compact)},
+                                                     cut=cut0)},
         ]
 
         report = ""
@@ -169,44 +187,54 @@ class Recorder:
             logger.warning("[recorder] 整理达到工具轮上限 %d，提前收束 session=%s",
                            self.max_tool_rounds, session_key)
 
-        # 推进增量游标（委托随之算已消化——"委托不丢"靠切点不越未消化行保证）
+        # 推进增量游标（=本次窗口的末行，只进不退）；委托随之算已消化。
+        # 记忆不漏的底：常规快周期窗口从 r_seen 起，压缩退役的段也会被 run_retiring
+        # 扫到——就算某次被跳过/失败，下次常规整理仍会补上。
         if rows:
-            self.ledger.set_recorder_state(session_key, r_seen_seq=rows[-1].seq_id)
-        _, cut_after = self.ledger.get_recorder_state(session_key)
-        cut_note = (f"切点 seq#{cut_before}→seq#{cut_after}" if cut_after != cut_before
-                    else f"切点 seq#{cut_after} 未动")
-        logger.info("[recorder] %s整理完成 session=%s 流水 %s～%s %s%s",
+            self.ledger.set_recorder_state(
+                session_key, r_seen_seq=max(r_seen, rows[-1].seq_id))
+        logger.info("[recorder] %s整理完成 session=%s 流水 %s～%s%s",
                     "快" if cycle == "fast" else "慢", session_key,
                     f"msg#{rows[0].seq_id}" if rows else "（空）",
                     f"msg#{rows[-1].seq_id}" if rows else "（空）",
-                    cut_note,
                     f" prompt={last_usage.get('prompt_tokens')}" if last_usage else "")
         return report or "（静默收工）"
 
     # ------------------------------------------------------------------
     # 窗口与上下文构造
     # ------------------------------------------------------------------
-    def _window(self, session_key: str, cycle: str) -> list:
-        """快周期 = 切点～现在（= M 当前跨度）；慢周期 = 回看起点～现在。
-        快周期窗口 = 切点之后**全部**流水（不设行数帽）。"""
-        _, cut = self.ledger.get_recorder_state(session_key)
+    def _window(self, session_key: str, cycle: str,
+                cut_snapshot: Optional[int] = None) -> list:
+        """取本次整理的流水窗口。
+
+        快周期（常规）= 未消化段（r_seen 之后）——切点很少动，从切点读起会每次都
+        重读大段已消化的行；
+        快周期（压缩同跑，cut_snapshot）= 切点快照～现在（要退役的整段，最后扫描）；
+        慢周期 = 回看起点～现在。
+        预算封顶：从最旧端取装得下的前缀——不丢行，没装下的下轮续上。"""
         if cycle == "fast":
-            rows = self.ledger.since(session_key, max(cut - 1, 0),
-                                     limit=LIVE_ROWS_LIMIT)
+            if cut_snapshot is not None:
+                start = max(int(cut_snapshot) - 1, 0)     # 含切点行（seq >= cut0）
+            else:
+                start, _ = self.ledger.get_recorder_state(session_key)   # seq > r_seen
+            rows = self.ledger.since(session_key, start, limit=LIVE_ROWS_LIMIT)
         else:
             ts_min = time.time() - self.slow_lookback_days * 86400
             rows = self.ledger.since_time(session_key, ts_min)
-        # 预算封顶（视图已砍工具内容，一般远够）：超了丢最老的
-        while len(rows) > 2:
-            est = sum(self.token_counter.count(self._row_line(r)) for r in rows) + 2000
-            if est <= self.token_budget * 0.9:
+        out: list = []
+        est = 2000
+        for r in rows:
+            c = self.token_counter.count(self._row_line(r))
+            if out and est + c > self.token_budget * 0.9:
                 break
-            rows = rows[len(rows) // 10 or 1:]
-        return rows
+            out.append(r)
+            est += c
+        return out
 
     def _context(self, session_key: str, cycle: str, rows: list,
-                 compact: bool = False) -> str:
-        r_seen, cut = self.ledger.get_recorder_state(session_key)
+                 cut: Optional[int] = None) -> str:
+        r_seen, live_cut = self.ledger.get_recorder_state(session_key)
+        cut0 = live_cut if cut is None else int(cut)     # 压缩同跑传快照（钉住不回读）
         now = time.strftime(_TIME_FMT)
         records = [r for r in rows
                    if r.type == TYPE_ASSISTANT and r.seq_id > r_seen
@@ -214,12 +242,9 @@ class Recorder:
         head = [
             f"# 记忆整理 · {'快' if cycle == 'fast' else '慢'}周期 · {now}",
             self._usage_line(session_key),
-            f"# 切点 seq#{cut} · 已整理到 seq#{r_seen} · 未处理委托 {len(records)} 条"
+            f"# 切点 seq#{cut0}（压缩流程推进）· 已整理到 seq#{r_seen} · 未处理委托 {len(records)} 条"
             + (f"（{', '.join(f'seq#{r.seq_id}' for r in records)}）" if records else ""),
         ]
-        advice_line = self._advice_line(session_key, compact)
-        if advice_line:
-            head.append(advice_line)
         if rows:
             head.append(f"# 流水 seq#{rows[0].seq_id}～seq#{rows[-1].seq_id}"
                         "（工具结果已略；图片不附本体）")
@@ -237,37 +262,25 @@ class Recorder:
         return "\n\n".join(parts)
 
     def _usage(self, session_key: str):
-        """(tokens, predicted, budget, advice)：tokens 优先读 agent_loop 落的渲染用量，
-        缺数据（如刚重启没渲染过）按活行成本现算兜底；预算统一用与 M 共用的配置值
-        （pct 与建议点同分母，不拿 stats 里的重复预算当运算输入）。"""
-        advice = suggest_cut(self.ledger, session_key,
-                             budget=self.token_budget, counter=self.token_counter)
+        """(tokens, predicted)：tokens 优先读 agent_loop 落的渲染用量，缺数据
+        （如刚重启没渲染过）按活行成本现算兜底。"""
         stats = self.stats_provider(session_key) if self.stats_provider else None
         if stats is not None and stats.tokens:
-            return stats.tokens, stats.predicted, self.token_budget, advice
-        return advice.total, 0, self.token_budget, advice
+            return stats.tokens, stats.predicted
+        _, cut = self.ledger.get_recorder_state(session_key)
+        rows = self.ledger.since(session_key, max(cut - 1, 0),
+                                 limit=LIVE_ROWS_LIMIT)
+        return rows_cost(rows, self.token_counter), 0
 
     def _usage_line(self, session_key: str) -> str:
         """常驻数字行：当前上下文 token 数 / 预算 / 占比（估算，锚定预测另标）。"""
-        tokens, predicted, budget, _ = self._usage(session_key)
+        tokens, predicted = self._usage(session_key)
+        budget = self.token_budget
         pct = tokens / budget if budget else 0.0
         line = f"# 上下文用量：{tokens:,}/{budget:,} token（{pct:.0%}"
         if predicted:
             line += f"；锚定预测 {predicted:,}"
         return line + "）"
-
-    def _advice_line(self, session_key: str, compact: bool) -> str:
-        """条件提示：占比严格超 90% 或强制压缩才提清理（平时只给数字，不没事找事）。"""
-        tokens, _, budget, advice = self._usage(session_key)
-        pct = tokens / budget if budget else 0.0
-        if not compact and pct <= PRESSURE_PCT:
-            return ""
-        if not advice.needed:
-            return "# 强制压缩：当前占比不高，无可清（拿不准就不动）" if compact else ""
-        ts_str = time.strftime(_TIME_FMT, time.localtime(advice.ts))
-        what = "强制压缩" if compact else "上下文快满了"
-        return (f"# {what}（{pct:.0%}）：尽量丢弃 {ts_str} 以前的上下文"
-                f"（建议保留最新约 {advice.keep_pct:.0%} 预算；{advice.reason}）")
 
     def _memory_files(self) -> List[tuple]:
         """记忆文件全量（old/ 除外），(相对路径, 内容)。只收文本（记忆库是文本世界）。"""
@@ -287,26 +300,7 @@ class Recorder:
                 continue
         return out
 
-    def _row_line(self, r) -> str:
-        """一行 → 流水视图的一条（主表定稿原样，和 M 看到的完全一致）。"""
-        if r.type == TYPE_TOOL_RESULT:
-            return ""
-        lines = []
-        if r.text:
-            lines.append(r.text)          # <message>/<recall> 等标签都已固化在文里
-        if r.type == TYPE_ASSISTANT:      # record_memory 委托随轮内联（工具行不进流水）
-            ts = time.strftime(_TIME_FMT, time.localtime(r.timestamp))
-            for c in r.calls:
-                if getattr(c, "name", "") == RECORD_NAME:
-                    payload = record_payload({"arguments": getattr(c, "arguments", "")})
-                    lines.append(f'<record time="{ts}">{_esc(payload)}</record>')
-        return "\n".join(lines)
-
-
-def _esc(s: str) -> str:
-    """属性/正文转义（与 M 侧协议一致：引号与标签边界）。"""
-    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            .replace('"', "&quot;"))
+    _row_line = staticmethod(row_line)
 
 
 class RecorderScheduler:
@@ -338,7 +332,7 @@ class RecorderScheduler:
                 for key in self.ledger.session_keys():
                     if key.startswith("group:"):
                         continue   # 群桶是 chatagent 的（自己静默压缩），R 不插手：
-                        # 别把群聊内容写进主记忆、别跟它的压缩抢切点
+                        # 别把群聊内容写进主记忆
                     if self._settled(key, now) and self.recorder.pending(key):
                         await self.recorder.run(key, "fast")
                     if slow_due:
@@ -362,3 +356,9 @@ class RecorderScheduler:
                 return done_at <= now - self.debounce
         recent = self.ledger.tail(session_key, limit=1)
         return bool(recent) and recent[0].timestamp < now - self.debounce
+
+
+def _esc(s: str) -> str:
+    """属性/正文转义（与 M 侧协议一致：引号与标签边界）。"""
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))

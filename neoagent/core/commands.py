@@ -38,7 +38,7 @@ class CommandContext:
     wakes_info: Optional[Callable[[], Sequence[str]]] = None
     # skill 名清单（/skills；只给名字）
     skills_info: Optional[Callable[[], Sequence[str]]] = None
-    # 强制压缩（/compact）：跑 R 清理上下文；notify = 跑完的异步播报口
+    # 强制压缩（/compact）：压缩上下文（总结备忘+退役+R 最后扫描）；notify = 跑完的异步播报口
     compact: Optional[Callable[[], Awaitable[str]]] = None
     notify: Optional[Callable[[str], Awaitable[None]]] = None
     # 控制台视图钩子（view 指令用；agent/聊天上下文里没有 → 降级说明）
@@ -204,9 +204,9 @@ def _skills(args: List[str], ctx: CommandContext) -> str:
 
 
 def _compact(args: List[str], ctx: CommandContext) -> str:
-    """强制压缩上下文：后台跑 R（先落记忆再退役），完成后播报切点简报。"""
+    """强制压缩上下文：后台跑压缩（总结备忘+退役+R 最后扫描），完成后播报简报。"""
     if ctx.compact is None:
-        return "无法压缩（没有接记忆整理器）"
+        return "无法压缩（没有接上下文压缩）"
 
     async def _run() -> None:
         try:
@@ -253,7 +253,7 @@ def _install_defaults() -> None:
     register("channels", "列出频道与状态", _channels)
     register("wakes", "唤醒清单（闹钟/自查）", _wakes)
     register("skills", "列出 skill 名", _skills)
-    register("compact", "强制压缩上下文（跑 R 清理到建议保留点）", _compact,
+    register("compact", "强制压缩上下文（总结备忘 + 保留最近 10 条）", _compact,
              agent_ok=False)
     # 控制台视图/管理指令（输出不落转录；agent 拿不到视图钩子会得到一句说明）
     register("logs", "logs [行数]  看最近的技术日志", _logs, surfaces=("console",), view=True)

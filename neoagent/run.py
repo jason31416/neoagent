@@ -522,8 +522,7 @@ async def _run(mode: str, verbose: bool) -> None:
             wakes_info=lambda: [wake_line(w) for w in agent.ledger.list_wakes(
                 agent.timeline_bucket or "main")],
             skills_info=lambda: list_names(agent.skills_dir),
-            compact=(lambda: agent.recorder.compact(agent.timeline_bucket or "main"))
-            if getattr(agent, "recorder", None) else None,
+            compact=lambda: agent.compact_now(agent.timeline_bucket or "main"),
             notify=notify_cli,
             tail_logs=tail_logs,
             reply_rows=lambda rows: server.reply_rows(conn, list(rows)),

@@ -33,13 +33,15 @@ from ..providers.tokens import HeuristicTokenCounter, TokenAnchor, TokenCounter,
 from ..providers.vision import normalize_image
 from ..tools.file_tools import _resolve_in_roots
 from ..tools.registry import ToolOutput, ToolRegistry, clip_tool_result
-from . import commands, modellog
+from . import commands, compaction, modellog
 from .events import Attachment, MessageEvent
 from .frames import (Bubble, attachment_notes, finalize_assistant, finalize_user,
                      recall_tag)
 from .ledger import (MessageLedger, TYPE_ASSISTANT, TYPE_INTERNAL, TYPE_TOOL_RESULT,
                      TYPE_USER, TYPE_WAKE)
 from .llm import LLMClient
+from .compaction import CompactResult
+from .recorder import row_line
 from .render import ContextStats, render_messages
 
 logger = logging.getLogger(__name__)
@@ -132,6 +134,7 @@ class AgentLoop:
         # 每会话渲染用量（R 整理时读：上下文 token 数/预算/占比）
         self.context_stats: Dict[str, ContextStats] = {}
         self._tools_est: Optional[int] = None        # 工具 schema 估算（常量，算一次）
+        self._bg_tasks: set = set()                  # 后台任务（R 退役前扫描等）防 GC
 
     # ------------------------------------------------------------------
     # 对外入口
@@ -255,7 +258,6 @@ class AgentLoop:
             logger.info("[command] 非主人指令静默忽略：%s（%s）", cmd_name,
                         event.sender.id)
             return
-        recorder = self.recorder
 
         async def _notify(text: str) -> None:
             """异步完成播报（如 /compact 压缩完）：普通系统消息，不落账。"""
@@ -274,8 +276,7 @@ class AgentLoop:
             set_home=lambda ch: self.ledger.set_setting("home", ch),
             thinking=self.effort_provider() if callable(self.effort_provider) else "",
             set_thinking=self.effort_setter,
-            compact=(lambda: recorder.compact(session_key))
-            if recorder is not None else None,
+            compact=lambda: self.compact_now(session_key),
             notify=_notify))
         logger.info("[command] %s → %s", text, receipt)
         ts = time.time()
@@ -339,6 +340,72 @@ class AgentLoop:
             return False, None
         return st.busy, st.done_at
 
+    # ------------------------------------------------------------------
+    # 上下文压缩（撞限/强制两个时刻；机械推切点，核在 core/compaction.py）
+    # ------------------------------------------------------------------
+    async def compact(self, session_key: str) -> Optional[CompactResult]:
+        """一次机械压缩：总结备忘 + 切点推进 + 图回收。撞限/强制共用。"""
+        return await compaction.compact(
+            self.ledger, self.llm, session_key,
+            prompt=compaction.COMPACT_PROMPT, counter=self.token_counter,
+            row_view=row_line, vision=self.vision, session=session_key)
+
+    async def compact_now(self, session_key: str) -> str:
+        """用户强制压缩（/compact）：压缩 + R 退役前扫描并发跑、都等完，
+        合并简报（给人看）。"""
+        cut0 = self.ledger.get_recorder_state(session_key)[1]   # 触发时刻切点快照
+        r_task = (asyncio.get_event_loop().create_task(
+                      self.recorder.run_retiring(session_key, cut0))
+                  if self.recorder is not None else None)
+        result = await self.compact(session_key)
+        r_report = ""
+        if r_task is not None:
+            try:
+                r_report = (await r_task) or ""
+            except Exception:
+                logger.exception("R 退役前扫描失败 session=%s", session_key)
+        if result is None:
+            return "无需压缩（活行不多，没什么可退役的）"
+        line = (f"压缩完成：保留最近 {result.kept} 条 + 备忘，"
+                f"释放约 {result.freed:,} token（回收图 {result.blobs_gone} 张）")
+        if r_report:
+            line += f"；记忆整理：{r_report}"
+        return line
+
+    async def _compact_midturn(self, session_key: str, st: SessionState) -> bool:
+        """turn 中撞限的压缩：压缩 + R 退役前扫描并发；只等压缩（重渲染要用），
+        R 后台跑完自动落记忆。返回有没有真的压（False = 活行不足，走渲染端兜底）。"""
+        cut0 = self.ledger.get_recorder_state(session_key)[1]   # 触发时刻切点快照
+        if st.responder is not None:
+            await st.responder("压缩上下文中")
+        if self.recorder is not None:
+            self._spawn(self.recorder.run_retiring(session_key, cut0),
+                        "R 退役前扫描")
+        try:
+            result = await self.compact(session_key)
+        except Exception:
+            logger.exception("压缩失败 session=%s", session_key)
+            result = None
+        if st.responder is not None:
+            await st.responder("压缩完成")
+        return result is not None
+
+    def _spawn(self, coro, what: str) -> None:
+        """后台任务挂账：防 GC，完事记日志（异常不静默）。"""
+        task = asyncio.get_event_loop().create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(lambda t: self._bg_done(t, what))
+
+    def _bg_done(self, t: asyncio.Task, what: str) -> None:
+        self._bg_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.error("%s 失败：%r", what, exc)
+        else:
+            logger.info("%s 完成：%s", what, t.result())
+
     async def _run_turn(self, session_key: str, st: SessionState) -> int:
         """一轮：渲染 → 模型调用/工具循环，返回最终渲染时的输入代数。
 
@@ -352,7 +419,7 @@ class AgentLoop:
         bubbles_sent = 0
 
         gen_at_render = st.input_gen
-        compressed = False          # 紧急压缩一次 turn 最多试一次（R 没进展就走兜底）
+        compressed = False          # 一次 turn 最多压一次（压完重渲染再看）
         while rounds < self.max_tool_rounds:
             # 攒批屏障：新材料已落账但 kick 未到（用户可能还有下文）→ 原地待命。
             # 打断（取消在飞模型）在 ingest 就做了；这里等的是"带着新消息继续"的时机。
@@ -365,25 +432,19 @@ class AgentLoop:
             gen_at_render = st.input_gen
             overhead, extra_est = self._request_overhead(session_key, tools)
             messages, timeline_cost, trimmed = self._render(session_key, overhead=overhead)
-
-            # 紧急压缩（harness 式，罕见）：装配被迫砍最老 → 挂起 turn、同步跑 R 整理。
-            # "压缩上下文中/压缩完成"是系统播报，直发不过 M 的模型。
-            if trimmed and self.recorder is not None \
-                    and not compressed:
-                compressed = True
-                _, cut_before = self.ledger.get_recorder_state(session_key)
-                if st.responder is not None:
-                    await st.responder("压缩上下文中")
-                logger.info("[turn] 预算吃紧，同步整理 session=%s", session_key)
-                await self.recorder.run(session_key, "fast")
-                _, cut_after = self.ledger.get_recorder_state(session_key)
-                if st.responder is not None:
-                    await st.responder("压缩完成")
-                if cut_after > cut_before:
-                    continue        # 切点推进 → 重渲染继续，不扣轮数
-                logger.warning("[turn] 整理未推进切点，走渲染端兜底截断（欠一次整理）")
-
             est_total = timeline_cost + extra_est
+
+            # 压缩（机械，罕见）：撞限 = 装配被迫砍最老 / 超 90% 预算 → 挂起 turn。
+            # 压缩总结推切点 + R 退役前最后扫描并发跑（R 后台跑完自动落记忆）；
+            # "压缩上下文中/压缩完成"是系统播报，直发不过 M 的模型。
+            if not compressed and (trimmed or est_total
+                                   > self.token_budget * compaction.PRESSURE_PCT):
+                compressed = True
+                logger.info("[turn] 上下文撞限，压缩 session=%s", session_key)
+                if await self._compact_midturn(session_key, st):
+                    continue        # 切点推进 → 重渲染继续，不扣轮数
+                logger.warning("[turn] 没什么可压缩，走渲染端兜底截断")
+
             predicted = self._anchors[session_key].predict(est_total)
 
             # 请求发出前先落 modellog（400 翻车现场也留证据；未开启时空转）
@@ -751,7 +812,7 @@ class AgentLoop:
         identity = self._identity_text()
         if self.workspace is not None:
             identity += f"\n\n（你的工作目录：{self.workspace}，产出物放这里；文件工具的相对路径以它为基准）"
-        _, cut_seq = self.ledger.get_recorder_state(session_key)   # R 的上下文切点
+        _, cut_seq = self.ledger.get_recorder_state(session_key)   # 上下文切点（压缩机械推进）
         return render_messages(
             self.ledger, session_key,
             identity=identity,
