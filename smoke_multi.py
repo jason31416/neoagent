@@ -862,6 +862,38 @@ async def main() -> None:
     modellog.setup(None)
     check(not modellog.enabled(), "setup(None) 关闭落盘")
 
+    # ---- 24. /status 状态卡片（ASCII 小卡片，聊天渲染无 markdown） ----
+    print("=== 24. /status 状态卡片 ===")
+    from neoagent.core import commands as cmds
+    from neoagent.core.commands import _disp_width
+
+    agent_s = AgentLoop(llm=StubLLM([]), registry=registry, ledger=ledger,
+                        memory_file=mem, token_counter=COUNTER,
+                        token_budget=250_000, known_channels=["feishu", "qq"])
+    mem.write_text("# 记忆", encoding="utf-8")        # 记忆行要有真文件才报
+    agent_s.context_stats["cli:st"] = SimpleNamespace(tokens=12_300, predicted=15_000)
+    ctx = cmds.CommandContext(
+        surface="chat", known_channels=["feishu", "qq"],
+        model="deepseek-flash", thinking="medium",
+        context_info=lambda: agent_s.context_line("cli:st"),
+        status_rows=lambda: agent_s.status_rows(["feishu 已连接", "qq 连接中"]))
+    out = cmds.execute("/status", ctx)
+    print(out)
+    check("deepseek-flash" in out and "12.3k/250.0k" in out
+          and "feishu 已连接" in out and "qq 连接中" in out,
+          "卡片带模型/上下文/频道状态（多行值续行）")
+    check("MEMORY.md" in out, "记忆行：memory 文件大小")
+    check(not any(c in out for c in ("*", "`", "#", "_")),
+          "聊天渲染安全：无 markdown 痕迹")
+    widths = {_disp_width(ln) for ln in out.splitlines()}
+    check(len(widths) == 1, f"CJK 对齐：所有行等宽（实际 {sorted(widths)}）")
+    check(out.splitlines()[1].startswith("| neoagent"),
+          f"卡片标题行（实际 {out.splitlines()[1]!r}）")
+    check("还没有渲染过" in agent_s.context_line("cli:none"),
+          "上下文没数据时给句人话")
+    check("锚定预测 15.0k" in agent_s.context_line("cli:st"),
+          f"上下文带锚定预测（实际 {agent_s.context_line('cli:st')}）")
+
     ledger.close()
     print("=== 全部通过 ===")
 

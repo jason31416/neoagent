@@ -130,15 +130,17 @@ def register_group_tools(registry: ToolRegistry, *, ledger: Any,
             return error("not_found",
                          f"这个群没有活跃的 chatagent：{chat_id}"
                          "（没 /activate 过或已休眠）")
-        reply = await manager.main_says(chat_id, message)
+        manager.main_says(chat_id, message)   # 落账 + 触发它一轮；发完即回不等回话
         return ToolOutput(
-            text=reply or "已记下",
+            text="已发给 chatagent（发完即回、不等它回话；它有回话会以 chatagent@ 的"
+                 "消息另行出现在对话里）",
             stat=green("已转达"), fields=[("delta", "+1")])
 
     registry.register(
         "tell_chatagent",
-        "发消息给某个群的子 agent，立即触发它一轮。用于传达或布置；"
-        "它一般把消息记进记忆，除非你要求它在群里说话。它的回话会带回来。",
+        "发消息给某个群的子 agent，立即触发它一轮，发完即回、不等回话。用于传达或布置；"
+        "它一般把消息记进记忆，除非你要求它在群里说话。它的回话不从工具结果回来——"
+        "会以 chatagent@ 的消息另行出现在对话里。",
         {"type": "object",
          "properties": {
              "group": {"type": "string", "description": "群 id（用 list_groups 拿）"},

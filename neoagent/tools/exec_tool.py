@@ -24,7 +24,7 @@ from .registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-MAX_TIMEOUT_SECONDS = 600   # 模型自己申请也顶不过这个硬上限
+MAX_TIMEOUT_SECONDS = 30   # 模型自己申请也顶不过这个硬上限
 
 
 class ExecPolicy:
@@ -143,7 +143,7 @@ EXEC_SCHEMA = {
             "command": {"type": "string", "description": "要执行的 bash 命令"},
             "cwd": {"type": "string", "description": "工作目录（可选，默认工作台；必须在允许范围内）"},
             "timeout": {"type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_SECONDS,
-                        "description": f"本次允许的最长执行秒数（不传取配置默认，硬上限 {MAX_TIMEOUT_SECONDS}）"},
+                        "description": f"本次允许的最长执行秒数（不传取配置默认，硬上限 {MAX_TIMEOUT_SECONDS}，需要执行更长的任务挂后台并定期查看）"},
         },
         "required": ["command"],
     },

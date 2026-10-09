@@ -374,6 +374,8 @@ async def _run(mode: str, verbose: bool) -> None:
         return result
 
     agent.chatagents.set_sender(group_sender)
+    # tell_neoagent 投递进主桶后主 agent 要说话——把回话出口绑上（重启后没对话也发得出）
+    agent.chatagents.set_main_responder(make_responder(agent.home_channel))
 
     # ---- 群记录保留期清扫（每日一次，超期行删掉；文字之外本就没存）
     async def group_log_gc() -> None:
@@ -479,20 +481,21 @@ async def _run(mode: str, verbose: bool) -> None:
         asyncio.get_event_loop().create_task(_down())
         return f"{name} 停用中（登录态保留，再 /connect 不用扫码）"
 
+    def _channel_state(ch) -> str:
+        if ch.name in by_name:
+            return "已连接"
+        if _connecting(ch.name):
+            return "连接中"
+        return "已启用（还没连上）" if ch.enabled else "已停用"
+
     def op_channels() -> list:
         _reload_channels()
-        out = []
-        for ch in cfg.channels:
-            if ch.name in by_name:
-                state = "已连接"
-            elif _connecting(ch.name):
-                state = "连接中"
-            elif ch.enabled:
-                state = "已启用（还没连上）"
-            else:
-                state = "已停用"
-            out.append(f"{ch.name}（{ch.kind}）{state}")
-        return out
+        return [f"{ch.name}（{ch.kind}）{_channel_state(ch)}" for ch in cfg.channels]
+
+    def op_channel_lines() -> list:
+        """/status 卡片用的短行："名 状态"（kind 在 /channels 看，这里不重复）。"""
+        _reload_channels()
+        return [f"{ch.name} {_channel_state(ch)}" for ch in cfg.channels]
 
     # ---- 控制台输入：/ 指令（回执两形态）或裸输入（channel=cli 聊天）
     def console_ctx(conn: ClientConn) -> commands.CommandContext:
@@ -515,7 +518,9 @@ async def _run(mode: str, verbose: bool) -> None:
             set_home=lambda c: agent.ledger.set_setting("home", c),
             thinking=agent.effort_provider(),
             set_thinking=lambda v: save_config_value("model.thinking", v, home=cfg.home),
-            status_extra=op_channels,
+            model=getattr(agent.llm, "model", ""),
+            context_info=lambda: agent.context_line(agent.timeline_bucket or "main"),
+            status_rows=lambda: agent.status_rows(op_channel_lines()),
             connect_channel=op_connect,
             disconnect_channel=op_disconnect,
             channels_info=op_channels,

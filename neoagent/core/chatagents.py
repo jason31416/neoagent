@@ -3,8 +3,9 @@
 角色：看全部群消息、被 @ 才说话、聊天专用（工具只有 memory + tell_neoagent）。
 - **消息路由**：所有群消息落群记录（group_messages）；活跃群的 chatagent
   噪音安静入账（不打断在飞模型），被 @ / 上级来话才触发 turn；
-- **双向配对**：tell_neoagent（chatagent→主 agent）与 tell_chatagent（主 agent→chatagent）
-  用 pending future 配对应答，A→B→A 不产生新轮（防回环）；
+- **两 agent 互发即回**：tell_neoagent（chatagent→主 agent）与 tell_chatagent
+  （主 agent→chatagent）都是落账 + 触发一轮 + 立即返回，**不等对方回话**——
+  回话由对方自己决定怎么给（群里开口 / 再 tell 回来），各是独立的一轮；
 - **压缩**：上下文压力超阈值 → 静默总结调用 → `<compact>` 行落为最新消息、
   最近 10 条原样保留、切点推进、切点以下的图回收（压缩即销毁）；
 - **状态**：激活与否进 kv（重启不丢）；休眠 = 实例销毁、零 API、消息只落记录。
@@ -34,11 +35,10 @@ logger = logging.getLogger(__name__)
 # 数值旋钮（代码常数，不过度配置）
 CHATAGENT_TOKEN_BUDGET = 60_000      # 群消息量大，独立小预算（与主 agent 的分开）
 CHATAGENT_MAX_TOOL_ROUNDS = 8        # 聊天工具，链短
-TELL_TIMEOUT = 90.0                  # tell_* 同步等待上限（秒）
 
 
 class ChatAgentManager:
-    """所有群的 chatagent 生命周期 + 消息路由 + 两 agent 间的消息配对。"""
+    """所有群的 chatagent 生命周期 + 消息路由 + 两 agent 互发消息。"""
 
     def __init__(self, *, main: Any, ledger: MessageLedger, llm: LLMClient,
                  home: Path, vision=None, transcriber=None, token_counter=None,
@@ -52,9 +52,8 @@ class ChatAgentManager:
         self.token_counter = token_counter
         self.known_channels = tuple(known_channels)
         self._loops: Dict[str, Any] = {}      # chat_id → AgentLoop
-        self._up: Dict[str, asyncio.Future] = {}    # chatagent 等主 agent 的答复
-        self._down: Dict[str, asyncio.Future] = {}  # 主 agent 等 chatagent 的回话
         self._sender: Optional[Callable] = None     # 发群消息出口（run.py 注入）
+        self._main_responder: Optional[Callable] = None  # 主 agent 回话出口（run.py 注入）
         self._quote_fetcher: Optional[Callable] = None
 
     def set_sender(self, sender: Callable) -> None:
@@ -63,6 +62,10 @@ class ChatAgentManager:
 
     def set_quote_fetcher(self, fn: Optional[Callable]) -> None:
         self._quote_fetcher = fn
+
+    def set_main_responder(self, responder: Callable) -> None:
+        """主 agent 的回话出口：tell_neoagent 注入后，它的轮要说话说得出去。"""
+        self._main_responder = responder
 
     # ------------------------------------------------------------------
     # 状态（kv 持久，重启不丢）
@@ -164,60 +167,31 @@ class ChatAgentManager:
         await self._say_group(chat_id, receipt, sender="neoagent")
 
     # ------------------------------------------------------------------
-    # 两 agent 之间的消息配对
+    # 两 agent 互发消息（落账 + 触发一轮 + 立即返回，不等回话）
     # ------------------------------------------------------------------
-    async def chatagent_says(self, chat_id: str, message: str,
-                             context: str = "") -> str:
-        """tell_neoagent 的实现：回话给等在下面的 tell_chatagent，或上报主 agent。"""
-        down = self._down.pop(chat_id, None)
-        if down is not None and not down.done():
-            down.set_result((message, context))
-            return "已回话给 neoagent"
+    def chatagent_says(self, chat_id: str, message: str,
+                       context: str = "") -> None:
+        """tell_neoagent 的实现：转述进主桶并触发主 agent 一轮，发完即回。
 
-        up = asyncio.get_event_loop().create_future()
-        self._up[chat_id] = up
+        不等主 agent 回话——它有话要说自己会说（回主人 / 再 tell_chatagent），
+        什么时候说、说不说都由它定。"""
         body = message
         if context.strip():
             body += f"\n<context>\n{context.strip()}\n</context>"
         self._inject_main(chat_id, body)
         self.main.kick(self.main.timeline_bucket or "main")
-        try:
-            reply = await asyncio.wait_for(up, timeout=TELL_TIMEOUT)
-            return reply
-        except asyncio.TimeoutError:
-            return "已转达，回头群里说"
-        finally:
-            if self._up.get(chat_id) is up:
-                self._up.pop(chat_id, None)
 
-    async def main_says(self, chat_id: str, message: str) -> str:
-        """tell_chatagent 的实现：答正在等的 chatagent，或触发它一轮。"""
+    def main_says(self, chat_id: str, message: str) -> None:
+        """tell_chatagent 的实现：上级来话进它的上下文并触发它一轮，发完即回。
+
+        不等它回话——它要开口就在群里 <message>，要答你就 tell_neoagent。"""
         if not self.is_active(chat_id):
-            return ""                      # 调用方按 not_found 口径处理
-        up = self._up.pop(chat_id, None)
-        if up is not None and not up.done():
-            up.set_result(message)
-            return "已回复 chatagent"
-
+            return                      # 调用方按 not_found 口径拦过，这里只兜底
         loop = self._ensure_loop(chat_id)
         key = loop.session_key
-        down = asyncio.get_event_loop().create_future()
-        self._down[chat_id] = down
-        try:
-            self._inject_chatagent(loop, chat_id, message)
-            loop.kick(key)
-            idle = asyncio.get_event_loop().create_task(loop.wait_idle(key))
-            done, _pending = await asyncio.wait(
-                {down, idle}, return_when=asyncio.FIRST_COMPLETED,
-                timeout=TELL_TIMEOUT)
-            idle.cancel()
-            if down in done and not down.cancelled():
-                text, _ctx = down.result()
-                return text
-            return "已记下"
-        finally:
-            if self._down.get(chat_id) is down:
-                self._down.pop(chat_id, None)
+        self._inject_chatagent(loop, chat_id, message)
+        loop.kick(key)
+        asyncio.get_event_loop().create_task(self._post_turn(chat_id))
 
     # ------------------------------------------------------------------
     # 注入
@@ -236,11 +210,16 @@ class ChatAgentManager:
             session_key=key, bubble_id=bid, seq_id=seq, direction="in",
             platform="", chat_id=chat_id, kind="text", content=body,
             sender=sender, timestamp=ts)
-        self.main.states_of(key).input_gen += 1
+        st = self.main.states_of(key)
+        if st.responder is None and self._main_responder is not None:
+            st.responder = self._main_responder   # 重启后还没对话也发得出回话
+        st.input_gen += 1
 
     def _inject_chatagent(self, loop, chat_id: str, body: str) -> None:
-        """上级来话进 chatagent 的上下文（sender=neoagent）。"""
+        """上级来话进 chatagent 的上下文（sender=neoagent），顺手绑好发声出口。"""
         key = loop.session_key
+        st = loop.states_of(key)
+        st.responder = self._responder(chat_id)   # 它 <message> 说的照常发回群里
         ts = time.time()
         bid = self.ledger.alloc_bubbles(key, 1)[0]
         final = finalize_user(body, sender="neoagent", bubble_id=bid, ts=ts)
@@ -250,7 +229,7 @@ class ChatAgentManager:
             session_key=key, bubble_id=bid, seq_id=seq, direction="in",
             platform="", chat_id=chat_id, kind="text", content=body,
             sender="neoagent", timestamp=ts)
-        loop.states_of(key).input_gen += 1
+        st.input_gen += 1
 
     # ------------------------------------------------------------------
     # 发群消息

@@ -10,6 +10,8 @@ agent 跑指令走同一注册表、同一权限档（agent_ok），是工具调
 from __future__ import annotations
 
 import asyncio
+import time
+import unicodedata
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -28,7 +30,10 @@ class CommandContext:
     set_home: Optional[Callable[[str], None]] = None
     thinking: str = ""                                      # 当前思考档位
     set_thinking: Optional[Callable[[str], bool]] = None     # 落盘改档（保注释写 config.yml）
-    status_extra: Optional[Callable[[], Sequence[str]]] = None   # /status 追加行（后端接状态）
+    # /status 卡片：模型名 / 上下文用量 / 后端动态行（label, value；缺的就少一行）
+    model: str = ""
+    context_info: Optional[Callable[[], str]] = None
+    status_rows: Optional[Callable[[], Sequence[Tuple[str, str]]]] = None
     agent_run: bool = False                                 # run_command 工具跑的：走权限档
     # 频道管理钩子（/connect //disconnect //channels；没有就降级说明）
     connect_channel: Optional[Callable[[str], str]] = None
@@ -132,15 +137,61 @@ def _home(args: List[str], ctx: CommandContext) -> str:
     return f"成功将 home 设置为 {target}"
 
 
+# ----------------------------------------------------------------------
+# /status 的 ASCII 小卡片（渲染进聊天：纯文本，无 markdown；CJK 宽字符算 2 列）
+# ----------------------------------------------------------------------
+_BOOT_TS = time.time()      # 进程起跑（模块导入）时刻，/status 的"运行"用
+
+
+def _disp_width(s: str) -> int:
+    """显示宽度（CJK 宽字符算 2 列）——卡片对齐用。"""
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+               for c in s)
+
+
+def _pad(s: str, width: int) -> str:
+    return s + " " * max(0, width - _disp_width(s))
+
+
+def _card(title: str, rows: Sequence[Tuple[str, str]]) -> str:
+    """纯文本小卡片：+--+ 边框、label/value 两栏；value 可多行（续行不带 label）。"""
+    flat: List[Tuple[str, str]] = []
+    for label, value in rows:
+        lines = str(value).splitlines() or [""]
+        for i, ln in enumerate(lines):
+            flat.append((str(label) if i == 0 else "", ln))
+    label_w = max([_disp_width(l) for l, _ in flat] + [4])
+    value_w = max([_disp_width(v) for _, v in flat] + [4])
+    inner = label_w + value_w + 4          # 1 空 + label + 2 空隙 + value + 1 空
+    bar = "+" + "-" * inner + "+"
+    out = [bar, "|" + _pad(" " + title, inner) + "|", bar]
+    for label, value in flat:
+        out.append("| " + _pad(label, label_w) + "  " + _pad(value, value_w) + " |")
+    out.append(bar)
+    return "\n".join(out)
+
+
+def _uptime() -> str:
+    secs = int(time.time() - _BOOT_TS)
+    h, m = secs // 3600, (secs % 3600) // 60
+    return f"{h} 小时 {m} 分" if h else f"{m} 分钟"
+
+
 def _status(args: List[str], ctx: CommandContext) -> str:
-    lines = [
-        f"思考档位：{ctx.thinking or '（服务端默认）'}",
-        f"home：{ctx.home or '（未设置）'}（主动消息默认发这里）",
-        f"频道：{'、'.join(ctx.known_channels) or '（无）'}",
+    """状态卡片：模型 / 思考 / 上下文 / home / 频道 / …（各后端有什么报什么）。"""
+    rows: List[Tuple[str, str]] = [
+        ("模型", ctx.model or "（未知）"),
+        ("思考", ctx.thinking or "（服务端默认）"),
     ]
-    if ctx.status_extra is not None:
-        lines.extend(ctx.status_extra())
-    return "\n".join(lines)
+    if ctx.context_info is not None:
+        rows.append(("上下文", ctx.context_info()))
+    rows.append(("home", ctx.home or "（未设置）"))
+    if ctx.status_rows is not None:
+        rows.extend(ctx.status_rows())
+    else:
+        rows.append(("频道", "、".join(ctx.known_channels) or "（无）"))
+    rows.append(("运行", _uptime()))
+    return _card("neoagent", rows)
 
 
 def _effort(args: List[str], ctx: CommandContext) -> str:
@@ -246,7 +297,7 @@ def _install_defaults() -> None:
     register("help", "列出可用指令", _help)
     register("id", "回你的账号 id（配对/配置用）", _id)
     register("home", "home [channel]  设置 home 频道（主动消息默认发这里；无参 = 设为当前频道）", _home)
-    register("status", "看看状态（思考档位 / home / 频道）", _status)
+    register("status", "看看状态（模型 / 上下文 / 频道 …）", _status)
     register("effort", "effort [档位]  看/调思考档位（none/low/medium/high/…）", _effort)
     register("connect", "connect [频道]  连上频道（扫码/写自启；无参 = 列出频道）", _connect)
     register("disconnect", "disconnect <频道>  停用频道（登录态保留，再连免扫码）", _disconnect)

@@ -1,6 +1,6 @@
-"""chatagent 的工具：memory（便签）+ tell_neoagent（电话线）。
+"""chatagent 的工具：memory（便签）+ tell_neoagent（传话筒）。
 
-就这两个——它不是缩水版 neoagent，是带便签和电话的群友：
+就这两个——它不是缩水版 neoagent，是带便签和传话筒的群友：
 没有文件、命令、搜索、技能。工具面小是特征不是欠账。
 """
 
@@ -66,15 +66,16 @@ def register_chatagent_tools(registry: ToolRegistry, *, memory_file: Path,
         if not message:
             return error("bad_param", "message 必填（要跟 neoagent 说什么）")
         context = str(args.get("context") or "")
-        reply = await manager.chatagent_says(chat_id, message, context)
+        manager.chatagent_says(chat_id, message, context)  # 落账 + 触发主 agent；发完即回
         return ToolOutput(
-            text=f"neoagent：{reply}",
+            text="已转达（发完即回、不等回话；neoagent 有回话会作为它的消息稍后出现）",
             stat=green("已上报"), fields=[("delta", "+1")])
 
     registry.register(
         "tell_neoagent",
         "发送消息给在私聊中的主 agent，用于在私聊中告知主人或在主人明确允许时"
-        "请求主 agent 进行信息的查询或一些其他操作。",
+        "请求主 agent 进行信息的查询或一些其他操作。发完即回、不等回话；"
+        "它的回话（如果有）会以 neoagent 的消息另行出现，别干等。",
         {"type": "object",
          "properties": {
              "message": {"type": "string",

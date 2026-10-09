@@ -26,7 +26,7 @@ import logging
 import mimetypes
 import time
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
 from ..providers.tokens import HeuristicTokenCounter, TokenAnchor, TokenCounter, count_chat_payload
@@ -43,6 +43,7 @@ from .llm import LLMClient
 from .compaction import CompactResult
 from .recorder import row_line
 from .render import ContextStats, render_messages
+from .skills import list_names
 
 logger = logging.getLogger(__name__)
 
@@ -276,6 +277,9 @@ class AgentLoop:
             set_home=lambda ch: self.ledger.set_setting("home", ch),
             thinking=self.effort_provider() if callable(self.effort_provider) else "",
             set_thinking=self.effort_setter,
+            model=getattr(self.llm, "model", ""),
+            context_info=lambda: self.context_line(session_key),
+            status_rows=lambda: self.status_rows(),
             compact=lambda: self.compact_now(session_key),
             notify=_notify))
         logger.info("[command] %s → %s", text, receipt)
@@ -339,6 +343,48 @@ class AgentLoop:
         if st is None:
             return False, None
         return st.busy, st.done_at
+
+    # ------------------------------------------------------------------
+    # 状态（/status 卡片的数据源）
+    # ------------------------------------------------------------------
+    def context_line(self, session_key: str) -> str:
+        """当前上下文用量一句话："12.3k/250.0k token（5%）…"。"""
+        st = self.context_stats.get(session_key)
+        budget = self.token_budget
+        if st is None or not st.tokens:
+            return "还没有渲染过（发条消息就有数了）"
+        pct = st.tokens / budget if budget else 0.0
+        line = f"{st.tokens / 1000:.1f}k/{budget / 1000:.1f}k token（{pct:.0%}）"
+        if st.predicted:
+            line += f"，锚定预测 {st.predicted / 1000:.1f}k"
+        return line
+
+    def status_rows(self, channel_lines: Optional[Sequence[str]] = None
+                    ) -> List[Tuple[str, str]]:
+        """/status 的动态行（label, value）；后端有什么报什么，缺的不硬凑。
+
+        channel_lines：入口层给的每频道一行"名 状态"（没有就只报频道名）。"""
+        rows: List[Tuple[str, str]] = []
+        ch = [str(x) for x in (channel_lines or self.known_channels)]
+        rows.append(("频道", "\n".join(ch) if ch else "（无）"))
+        if self.memory_file is not None:
+            try:
+                n = self.memory_file.stat().st_size
+                rows.append(("记忆", f"{self.memory_file.name} {n / 1000:.1f}kB"))
+            except OSError:
+                pass
+        wakes = self.ledger.list_wakes(self.timeline_bucket or "main",
+                                       status="pending")
+        rows.append(("唤醒", f"{len(wakes)} 个待触发" if wakes else "无"))
+        skills_dir = getattr(self, "skills_dir", None)
+        if skills_dir is not None:
+            n = len(list_names(skills_dir))
+            rows.append(("skills", f"{n} 个" if n else "无"))
+        mgr = getattr(self, "chatagents", None)
+        if mgr is not None:
+            n = sum(1 for g in self.ledger.group_log_chats() if mgr.is_active(g))
+            rows.append(("群聊", f"{n} 个群已激活" if n else "没激活的群"))
+        return rows
 
     # ------------------------------------------------------------------
     # 上下文压缩（撞限/强制两个时刻；机械推切点，核在 core/compaction.py）
