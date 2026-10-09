@@ -22,10 +22,11 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from ..config import PACKAGE_DIR
-from ..providers.vision import sniff_image_mime
+from . import compaction
+from .compaction import PRESSURE_PCT
 from .events import MessageEvent, SendResult
 from .frames import finalize_user
-from .ledger import TYPE_INTERNAL, TYPE_USER, MessageLedger
+from .ledger import TYPE_USER, MessageLedger
 from .llm import LLMClient
 
 logger = logging.getLogger(__name__)
@@ -34,15 +35,6 @@ logger = logging.getLogger(__name__)
 CHATAGENT_TOKEN_BUDGET = 60_000      # 群消息量大，独立小预算（与主 agent 的分开）
 CHATAGENT_MAX_TOOL_ROUNDS = 8        # 聊天工具，链短
 TELL_TIMEOUT = 90.0                  # tell_* 同步等待上限（秒）
-COMPACT_KEEP = 10                    # 压缩后原样保留的最近消息条数
-PRESSURE_PCT = 0.9                   # 上下文占比超过它触发静默压缩
-COMPACT_MAX_IMAGES = 6               # 总结调用最多带几张图
-
-COMPACT_PROMPT = (
-    "把这份群聊记录总结成一份简短的接续备忘，写给刚失忆的自己看、供接话用。"
-    "包括这些部分（有就写没有就略过）：最近聊到的内容 / 正在讨论的内容 / "
-    "主人的嘱咐与待办 / 人物印象。只写要点，不要客套，不要复述整段对话。"
-)
 
 
 class ChatAgentManager:
@@ -303,48 +295,22 @@ class ChatAgentManager:
             logger.exception("[chatagent] 压缩检查出错 %s", chat_id)
 
     async def compact(self, chat_id: str) -> None:
+        """静默压缩：走公共压缩件（总结 + <compact> 备忘行 + 切点推进 + 图回收）。"""
         loop = self._loops.get(chat_id)
         if loop is None:
             return
         key = loop.session_key
-        _, cut = self.ledger.get_recorder_state(key)
-        rows = self.ledger.since(key, cut)
-        if not rows:
-            return
-        kept = rows[-COMPACT_KEEP:]
         try:
-            summary = await self._summarize(rows, key)
+            result = await compaction.compact(
+                self.ledger, self.llm, key, prompt=compaction.COMPACT_PROMPT,
+                counter=self.token_counter, vision=self.vision, session=key)
         except Exception as exc:
             logger.warning("[chatagent] 总结调用失败，跳过压缩 %s：%s", chat_id, exc)
             return
-        ts = time.time()
-        self.ledger.add_turn(
-            session_key=key, type=TYPE_INTERNAL,
-            text=f'<compact time="{time.strftime("%Y-%m-%d %H:%M")}">'
-                 f'{summary}</compact>',
-            timestamp=ts)
-        self.ledger.set_recorder_state(key, cut_seq=kept[0].seq_id)
-        gone = self.ledger.reclaim_blobs(key)
+        if result is None:
+            return
         logger.info("[chatagent] 压缩 %s：留 %d 条 + 备忘，回收图 %d",
-                    chat_id, len(kept), gone)
-
-    async def _summarize(self, rows, session: str = "") -> str:
-        """打包行（文字 + 图）跑一次总结调用（思考关）。"""
-        content: list = [{"type": "text",
-                          "text": "\n".join(r.text for r in rows if r.text)}]
-        n = 0
-        for r in rows:
-            for a in r.attachments:
-                if a.kind == "image" and a.data and n < COMPACT_MAX_IMAGES:
-                    mime = sniff_image_mime(a.data)
-                    if mime and self.vision is not None:
-                        content.append(self.vision.content_part(a.data, mime))
-                        n += 1
-        msgs = [{"role": "system", "content": COMPACT_PROMPT},
-                {"role": "user", "content": content}]
-        result = await self.llm.chat(msgs, reasoning_effort="none",
-                                     session=session)
-        return (result.content or "").strip()
+                    chat_id, result.kept, result.blobs_gone)
 
 
 def _strip_mentions(text: str) -> str:
