@@ -10,6 +10,7 @@ dependencies = [
     "qrcode>=8.0",         # 微信扫码登录时终端渲染二维码
     "ruamel-yaml>=0.18",
     "prompt-toolkit>=3.0",
+    "pilk>=0.2.4",         # QQ 语音 SILK 解码（ASR 前置；ffmpeg 不认识 SILK）
 ]
 
 [project.optional-dependencies]

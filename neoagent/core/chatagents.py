@@ -33,7 +33,7 @@ from .llm import LLMClient
 logger = logging.getLogger(__name__)
 
 # 数值旋钮（代码常数，不过度配置）
-CHATAGENT_TOKEN_BUDGET = 60_000      # 群消息量大，独立小预算（与主 agent 的分开）
+CHATAGENT_TOKEN_BUDGET = 200_000     # 群消息量大，独立预算（与主 agent 的分开；2026-10-09 由 60k 提到 200k）
 CHATAGENT_MAX_TOOL_ROUNDS = 8        # 聊天工具，链短
 
 
