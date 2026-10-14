@@ -157,7 +157,8 @@ def build_agent(cfg: Config) -> AgentLoop:
                                   home=cfg.home, vision=vision,
                                   transcriber=transcriber,
                                   token_counter=token_counter,
-                                  known_channels=cfg.channel_names())
+                                  known_channels=cfg.channel_names(),
+                                  llm_cfg=cfg.llm)
     agent.chatagents = chatagents             # run.py 的消息分流用
     register_group_tools(registry, ledger=ledger, manager=chatagents)
 

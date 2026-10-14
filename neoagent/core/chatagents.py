@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,6 +57,11 @@ class GroupConfig:
     skills: List[str] = field(default_factory=list)    # skill 白名单（空 = 一个不给）
     token_budget: int = CHATAGENT_TOKEN_BUDGET
     max_tool_rounds: int = CHATAGENT_MAX_TOOL_ROUNDS
+    # 模型覆盖（空 = 跟随全局 config.yml 的 model 段）
+    model_name: str = ""
+    thinking: str = ""
+    base_url: str = ""
+    api_key: str = ""
     problems: List[str] = field(default_factory=list)
 
 
@@ -76,7 +82,7 @@ def load_group_config(group_dir: Path) -> GroupConfig:
         cfg.problems.append("config.yml 顶层必须是键值对（整份用默认）")
         return cfg
 
-    unknown = set(data) - {"persona", "skills", "token_budget", "max_tool_rounds"}
+    unknown = set(data) - {"persona", "skills", "token_budget", "max_tool_rounds", "model"}
     if unknown:
         cfg.problems.append(f"未知配置项：{sorted(unknown)}（已忽略）")
 
@@ -101,6 +107,19 @@ def load_group_config(group_dir: Path) -> GroupConfig:
                     cfg.problems.append(f"skill 引用不合法：{s!r}（已忽略）")
             cfg.skills = out
 
+    model_raw = data.get("model")
+    if model_raw is not None:
+        if not isinstance(model_raw, dict):
+            cfg.problems.append("model 必须是键值对（用默认：跟随全局 model 段）")
+        else:
+            mu = set(model_raw) - {"name", "thinking", "base_url", "api_key"}
+            if mu:
+                cfg.problems.append(f"model 有未知键：{sorted(mu)}（已忽略）")
+            cfg.model_name = str(model_raw.get("name", "") or "").strip()
+            cfg.thinking = str(model_raw.get("thinking", "") or "").strip()
+            cfg.base_url = str(model_raw.get("base_url", "") or "").strip()
+            cfg.api_key = str(model_raw.get("api_key", "") or "").strip()
+
     for key, (lo, hi) in (("token_budget", TOKEN_BUDGET_RANGE),
                           ("max_tool_rounds", TOOL_ROUNDS_RANGE)):
         raw = data.get(key)
@@ -123,10 +142,11 @@ class ChatAgentManager:
 
     def __init__(self, *, main: Any, ledger: MessageLedger, llm: LLMClient,
                  home: Path, vision=None, transcriber=None, token_counter=None,
-                 known_channels=()) -> None:
+                 known_channels=(), llm_cfg=None) -> None:
         self.main = main                      # 主 AgentLoop（tell_neoagent 注入它）
         self.ledger = ledger
         self.llm = llm
+        self.llm_cfg = llm_cfg                # 全局 model 段原料（群级模型覆盖时克隆用）
         self.home = Path(home)
         self.vision = vision
         self.transcriber = transcriber
@@ -157,7 +177,20 @@ class ChatAgentManager:
 
     def activate(self, chat_id: str) -> None:
         self.ledger.set_setting(f"group_active:{chat_id}", "1")
+        self._seed_group_config(chat_id)     # 没有 config.yml 就放一份全注释模板
         self._ensure_loop(chat_id)
+
+    def _seed_group_config(self, chat_id: str) -> None:
+        """/activate 时给本群拷一份配置模板（已存在绝不覆盖——用户可能改过）。"""
+        dst = self.home / "groups" / chat_id / "config.yml"
+        if dst.exists():
+            return
+        src = PACKAGE_DIR / "assets" / "group-config.example.yml"
+        if not src.is_file():
+            return
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+        logger.info("[chatagent] %s 已放配置模板：%s", chat_id, dst)
 
     def deactivate(self, chat_id: str) -> None:
         self.ledger.set_setting(f"group_active:{chat_id}", "")
@@ -241,9 +274,10 @@ class ChatAgentManager:
             chat_id=chat_id, sender=event.sender.id, is_owner=event.is_owner,
             kind=kind, text=text, message_id=event.id, timestamp=event.timestamp)
 
-        # ② 指令（主人 @ 并发送才认；/id 谁都能问）
+        # ② 指令：必须 @ 到它才认（主人 @ 才执行，/id 谁 @ 谁问）。
+        # 没 @ 的 /xxx 一律当普通群消息——群里可能有别的机器人在用斜杠命令，别抢戏
         stripped = _strip_mentions(event.text or "")
-        if stripped.startswith("/"):
+        if stripped.startswith("/") and event.metadata.get("at_bot"):
             await self._handle_command(event, stripped)
             return
 
@@ -433,12 +467,23 @@ def AgentLoopFactory(manager: ChatAgentManager, registry, chat_id: str,
     cfg = cfg or GroupConfig()
     gdir = manager.home / "groups" / chat_id
     persona = gdir / cfg.persona
+    # 模型覆盖：改了 name/base_url/api_key 任一个就克隆一个专属 LLMClient；
+    # thinking 走 effort_provider（每轮现取）。没配 = 跟随全局。
+    llm = manager.llm
+    if any((cfg.model_name, cfg.base_url, cfg.api_key)):
+        base = manager.llm_cfg
+        llm = LLMClient(cfg.base_url or getattr(base, "base_url", ""),
+                        cfg.api_key or getattr(base, "api_key", ""),
+                        cfg.model_name or manager.llm.model,
+                        reasoning_effort=cfg.thinking
+                        or getattr(base, "reasoning_effort", "") or "medium")
     loop = AgentLoop(
-        manager.llm, registry, manager.ledger, None,
+        llm, registry, manager.ledger, None,
         identity_file=PACKAGE_DIR / "prompts" / "chatagent.md",
         personality_file=persona if persona.is_file() else None,
         vision=manager.vision, transcriber=manager.transcriber,
         token_counter=manager.token_counter,
+        effort_provider=(lambda: cfg.thinking) if cfg.thinking else None,
         max_tool_rounds=cfg.max_tool_rounds,
         token_budget=cfg.token_budget,
         progress_ping_seconds=0,            # 群侧不催报（催报是主 agent 的体验）

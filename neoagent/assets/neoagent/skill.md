@@ -83,8 +83,10 @@ neoagent 是住在聊天软件里的个人 AI 助手：一个产品、一个名�
 - `personality.md` —— 人格（同目录）
 - `groups/<群id>/config.yml` + `persona.md` —— 每群 chatagent 的独立配置（全键可选）：
   persona（人格文件名，默认 persona.md）/ skills（skill 白名单，写"skill名"或
-  "skill名.工具名"，空 = 一个不给）/ token_budget（本群上下文预算）/ max_tool_rounds；
-  改完在群里说句话即生效（mtime 自动重载）；坏键回退默认并在 /activate 回执提示
+  "skill名.工具名"，空 = 一个不给）/ token_budget（本群上下文预算）/ max_tool_rounds /
+  model（name / thinking / base_url / api_key，可覆盖全局模型，给闲聊群换便宜模型）；
+  /activate 时没配置会自动放一份全注释模板；改完在群里说句话即生效（mtime 自动重载）；
+  坏键回退默认并在 /activate 回执提示
 - `channels/<名>.yml` —— 一个频道一个文件（kind / enabled / …；QQ 要 ws_url + token；
   owner_id 由 /connect 配对自动写入）
 - 密钥可走环境变量：NEOAGENT_LLM_API_KEY / NEOAGENT_JEV_API_KEY /
@@ -95,7 +97,8 @@ neoagent 是住在聊天软件里的个人 AI 助手：一个产品、一个名�
 - 聊天/控制台通用：/help /id /home /status /effort /connect /disconnect /channels
   /wakes /skills /compact
 - 控制台专有：/logs /quiet /stop
-- 群里（主人 @ 才认，/id 谁都能问）：/activate /deactivate /id
+- 群里（必须 @ 到它才认指令；主人 @ 才执行 /activate、/deactivate，/id 谁 @ 谁问）：
+  /activate /deactivate /id
 - /status 是 ASCII 状态卡片：模型 / 思考 / 上下文用量 / home / 频道状态 / 记忆 /
   唤醒 / skills / 群聊 / 运行时长
 

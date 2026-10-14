@@ -1,0 +1,28 @@
+# 本群 chatagent 的独立配置模板（/activate 时自动生成到这里）
+# 全部键可选：去掉行首 # 才生效；什么都不改 = 跟随全局默认。
+# 改完在群里说句话即生效（自动重载，不用重启）。
+# ---------------------------------------------------------------
+
+# 人格文件（放本目录；配了就拼在内置群人格之后）
+# persona: persona.md
+
+# 允许它用的 skill（默认一个不给）：
+#   写 "skill名"       = 整个 skill 的工具都放行
+#   写 "skill名.工具名" = 只放行这一个工具（推荐——放行前想清楚：这个工具
+#                        群里任何人 @ 一下都能调，别放会写/会删/会花钱的）
+# skills:
+#   - mcsm.list_instances
+
+# 本群上下文预算（token；默认 200000，范围 2 万~30 万）
+# token_budget: 80000
+
+# 一轮最多连续调用多少次工具（默认 8，范围 1~50）
+# max_tool_rounds: 8
+
+# 模型覆盖（不配 = 跟随全局 config.yml 的 model 段；改了 name/base_url/api_key
+# 任一个才会用专属模型，只改 thinking 不换模型）
+# model:
+#   name: deepseek-flash        # 换模型（比如给闲聊群配个便宜的）
+#   thinking: none              # 思考档位：none/minimal/low/medium/high/xhigh/ultra/max
+#   base_url: ""                # 换 OpenAI 兼容接口地址
+#   api_key: ""                 # 换密钥（不填就用全局的）
