@@ -79,6 +79,10 @@ limits:
   # 干活静默催报（秒）：用户在等、距上次发消息超这么久 → 本次请求里催一句汇报进度
   # （提示只存在于请求不落账本）；0 = 关
   progress_ping_seconds: 30
+  # 图片滞回窗口：请求里图超过 trigger 张就一轮替换、只保留最新 keep 张
+  # （老图降级"（图略）"，原图留在账本）；缩图后单张 ≤300KB，20 张 ≈ 8MB 请求体
+  images_live_trigger: 20
+  images_live_keep: 10
 
 advanced:
   # 工作台：neoagent 的工作目录（工具的默认目录、产出物落脚点）

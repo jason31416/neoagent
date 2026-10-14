@@ -3,7 +3,7 @@
 默认实现是零依赖的**保守估算**（宁高勿低，别把上下文撑爆）：
 - CJK 字符 ≈ 1 token/字；
 - 其余（ASCII/符号/空白）≈ 4 字符/token（向上取整）；
-- 图片按常数估算（DeepSeek vision 未公布精确公式，用可配置常数）。
+- 图片按字节估算（bytes/150，贴近视觉接口按像素计费的量级；拿不到字节回退可配置常数）。
 
 要精确可换实现（tiktoken / 供应商官方 tokenizer），核心与渲染层只认接口。
 """
@@ -23,7 +23,7 @@ class TokenCounter(Protocol):
 
     def count(self, text: str) -> int: ...
 
-    def count_image(self) -> int: ...
+    def count_image(self, nbytes: int = 0) -> int: ...
 
 
 class HeuristicTokenCounter:
@@ -39,7 +39,11 @@ class HeuristicTokenCounter:
         rest = len(text) - cjk
         return cjk + (rest + 3) // 4
 
-    def count_image(self) -> int:
+    def count_image(self, nbytes: int = 0) -> int:
+        """图片估算：按字节贴近视觉接口的真实计费（bytes/150，封顶 8k）；
+        没有字节信息（老数据/外链）回退配置常数。"""
+        if nbytes > 0:
+            return max(256, min(int(nbytes) // 150, 8000))
         return self._image_tokens
 
 
@@ -92,7 +96,11 @@ def count_chat_payload(counter: TokenCounter,
                     if p.get("type") == "text":
                         total += counter.count(str(p.get("text") or ""))
                     else:
-                        total += counter.count_image()
+                        url = str((p.get("image_url") or {}).get("url") or "")
+                        nb = 0
+                        if url.startswith("data:") and "," in url:
+                            nb = (len(url) - url.index(",") - 1) * 3 // 4
+                        total += counter.count_image(nb)
         elif isinstance(c, dict):
             total += counter.count(json.dumps(c, ensure_ascii=False))
         for tc in m.get("tool_calls") or []:

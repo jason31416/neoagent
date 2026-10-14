@@ -63,6 +63,9 @@ class AgentConfig:
     # 干活静默催报（秒）：用户在等、距上次发消息超这么久 → 本次请求里催一句汇报进度；
     # 只存在于请求不落账本。0 = 关
     progress_ping_seconds: int = 30
+    # 图片滞回窗口：这次请求里的图超过 trigger 张 → 砍到最新 keep 张（老图降级"（图略）"）
+    images_live_trigger: int = 20
+    images_live_keep: int = 10
 
 
 @dataclass
@@ -365,6 +368,10 @@ def load_config(home: Optional[Path] = None) -> Config:
                                               cfg.agent.history_token_budget))
     cfg.agent.progress_ping_seconds = int(_get(raw, "limits.progress_ping_seconds",
                                                cfg.agent.progress_ping_seconds))
+    cfg.agent.images_live_trigger = int(_get(raw, "limits.images_live_trigger",
+                                             cfg.agent.images_live_trigger))
+    cfg.agent.images_live_keep = int(_get(raw, "limits.images_live_keep",
+                                          cfg.agent.images_live_keep))
 
     cfg.recorder.memory_dir = str(_get(raw, "memory.dir", cfg.recorder.memory_dir))
     cfg.recorder.pause_debounce_seconds = int(_get(raw, "memory.tidy_delay",

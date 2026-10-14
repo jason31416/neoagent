@@ -112,6 +112,8 @@ def build_agent(cfg: Config) -> AgentLoop:
                       bubble_gap_min=cfg.agent.bubble_gap_min,
                       bubble_gap_max=cfg.agent.bubble_gap_max,
                       progress_ping_seconds=cfg.agent.progress_ping_seconds,
+                      images_live_trigger=cfg.agent.images_live_trigger,
+                      images_live_keep=cfg.agent.images_live_keep,
                       # 模型 channel 属性的白名单（= 频道名 + 内置频道）
                       known_channels=cfg.channel_names(),
                       timeline_bucket=TIMELINE_BUCKET,   # 一条连续记录

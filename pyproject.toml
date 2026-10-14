@@ -11,6 +11,7 @@ dependencies = [
     "ruamel-yaml>=0.18",
     "prompt-toolkit>=3.0",
     "pilk>=0.2.4",         # QQ 语音 SILK 解码（ASR 前置；ffmpeg 不认识 SILK）
+    "pillow>=10.0",        # 入库缩图（大图压到 1600px/300KB，请求体才可控）
 ]
 
 [project.optional-dependencies]

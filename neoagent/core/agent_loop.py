@@ -104,6 +104,7 @@ class AgentLoop:
                  media_max_bytes: int = 20 * 1024 * 1024,
                  bubble_gap_min: float = 0.0, bubble_gap_max: float = 0.0,
                  progress_ping_seconds: float = 30,
+                 images_live_trigger: int = 20, images_live_keep: int = 10,
                  workspace: Optional[Path] = None,
                  effort_provider: Optional[Callable[[], str]] = None,
                  effort_setter: Optional[Callable[[str], bool]] = None,
@@ -129,6 +130,9 @@ class AgentLoop:
         self.bubble_gap_max = float(bubble_gap_max)
         # 干活静默催报（秒）：用户在等、距上次发消息超这么久 → 请求尾巴催一句；0=关
         self.progress_ping_seconds = float(progress_ping_seconds)
+        # 图片滞回窗口：请求里图超 trigger 张砍到最新 keep 张（见 core/render.py）
+        self.images_live_trigger = int(images_live_trigger)
+        self.images_live_keep = int(images_live_keep)
         self.workspace = Path(workspace) if workspace else None   # 工作台（相对路径基准）
         # 思考档位（reasoning_effort）：每轮请求前现取 → 改配置即生效，可随时切换
         # 思考/非思考混用；默认 "medium"（none=不思考）
@@ -870,6 +874,7 @@ class AgentLoop:
                                    a.filename, a.mime or "未知")
                     continue
                 a.data, a.mime = norm
+                a.size = len(a.data)      # 缩图后的字节数（估价按这个算）
 
         return text, attachments
 
@@ -915,6 +920,7 @@ class AgentLoop:
             vision=self.vision,
             overhead=overhead,
             cut_seq=cut_seq,
+            images_live=(self.images_live_trigger, self.images_live_keep),
         )
 
     def _request_overhead(self, session_key: str, tools) -> tuple:

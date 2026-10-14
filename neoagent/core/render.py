@@ -29,11 +29,43 @@ _REASONING_PAD = " "
 # 结果缺失占位（罕见：入库中途崩过）
 _MISSING_RESULT = '<error kind="exec_failed">工具结果缺失（当时异常中断）</error>'
 
+# 图片滞回窗口：这次请求里的图超过 trigger 张 → 一轮替换只保留最新 keep 张，
+# 老图降级"（图略）"。降级水位记在会话上（只进不退）——两次替换之间渲染纯追加，
+# 缓存前缀不破；每次替换付一次前缀重填，频率 ≈ 每 (trigger-keep) 张超额图一次。
+IMAGES_LIVE_TRIGGER = 20
+IMAGES_LIVE_KEEP = 10
+_IMG_CUT: dict = {}          # session_key → 图片降级水位 seq（内存态；重启重算一次）
+
+
+def _image_window(session_key: str, rows: List, trigger: int, keep: int) -> int:
+    """算本次渲染的图片水位：seq 低于水位的行不带图 parts（原图仍在账本）。
+
+    rows 旧→新；水位只进不退。活图 ≤ trigger 不动；超了就砍到最新 keep 张
+    （水位停在"第 keep 张所在的行"，行级整组降级不劈消息）。"""
+    cut = _IMG_CUT.get(session_key, 0)
+    live = sum(1 for r in rows if r.seq_id >= cut
+               for a in r.attachments if a.kind == "image" and a.data)
+    if live <= trigger:
+        return cut
+    acc = 0
+    for r in reversed(rows):
+        if r.seq_id < cut:
+            break
+        acc += sum(1 for a in r.attachments if a.kind == "image" and a.data)
+        if acc >= keep:
+            cut = r.seq_id
+            break
+    _IMG_CUT[session_key] = cut
+    return cut
+
 
 def render_messages(ledger, session_key: str, *, identity: str, memory_text: str,
                     budget: int, counter, vision=None,
                     overhead: int = 0, include_reasoning: bool = True,
-                    cut_seq: int = 0) -> Tuple[List[dict], int, bool]:
+                    cut_seq: int = 0,
+                    images_live: Tuple[int, int] = (IMAGES_LIVE_TRIGGER,
+                                                    IMAGES_LIVE_KEEP)
+                    ) -> Tuple[List[dict], int, bool]:
     """装配一次请求的 messages。
 
     返回 (messages, 时间线估算 token, 是否被迫裁剪)。
@@ -54,11 +86,13 @@ def render_messages(ledger, session_key: str, *, identity: str, memory_text: str
         # 最新组保底：单组超预算就截最大那行的正文（保头 60% + 尾 40%）
         victim = max(groups[0], key=lambda r: counter.count(r.text or ""))
         victim.text = _truncate_text(victim.text, usable, counter)
+    img_cut = _image_window(session_key, [r for g in groups for r in g],
+                            *images_live)      # 图片滞回窗口（老图降级占位）
     msgs: List[dict] = [{"role": "system", "content": system}]
     cost = counter.count(system)
     for g in groups:
         for r in _fill_missing(g):
-            msg, c = _assemble(r, counter, vision, include_reasoning)
+            msg, c = _assemble(r, counter, vision, include_reasoning, img_cut)
             msgs.append(msg)
             cost += c
     return msgs, cost, trimmed
@@ -73,8 +107,8 @@ def _row_cost(r, counter) -> int:
         c += 24 + counter.count(call.name) + counter.count(call.arguments)
     if r.type == TYPE_ASSISTANT:            # 思考草稿要回传，成本得算上
         c += counter.count(r.reasoning or "")
-    c += counter.count_image() * sum(
-        1 for a in r.attachments if a.kind == "image" and a.data)
+    c += sum(counter.count_image(a.size or len(a.data)) for a in r.attachments
+             if a.kind == "image" and a.data)   # 图按字节估（贴近真实体积）
     return c
 
 
@@ -155,7 +189,6 @@ def _truncate_text(text: str, max_tokens: int, counter) -> str:
 # ----------------------------------------------------------------------
 LIVE_ROWS_LIMIT = 1_000_000   # 活行扫描不设行数帽（整理/压缩的窗口自管封顶）
 
-
 @dataclass
 class ContextStats:
     """一次渲染的上下文用量（agent_loop 落，Recorder 整理时读）。"""
@@ -173,25 +206,30 @@ def rows_cost(rows, counter) -> int:
 # ----------------------------------------------------------------------
 # 组装：行 → 协议消息（文本零加工）
 # ----------------------------------------------------------------------
-def _parts(r, vision) -> Optional[list]:
-    """图片附件 → content parts（blob 字节现编码；格式不支持的保险丝拦下）。"""
+def _parts(r, vision, img_cut: int = 0) -> Optional[list]:
+    """图片附件 → content parts（blob 字节现编码；格式不支持的保险丝拦下）。
+    img_cut：图片滞回水位——seq 低于它的行不带图（占位见 _assemble）。"""
     if vision is None:
         return None
     parts = []
     for a in r.attachments:
-        if a.kind == "image" and a.data:
+        if a.kind == "image" and a.data and r.seq_id >= img_cut:
             mime = sniff_image_mime(a.data)      # 坏图绝不进上下文（会 400）
             if mime:
                 parts.append(vision.content_part(a.data, mime))
     return parts or None
 
 
-def _assemble(r, counter, vision, include_reasoning: bool) -> Tuple[dict, int]:
-    parts = _parts(r, vision)
+def _assemble(r, counter, vision, include_reasoning: bool,
+              img_cut: int = 0) -> Tuple[dict, int]:
+    parts = _parts(r, vision, img_cut)
     cost = _row_cost(r, counter)
+    hidden = bool(img_cut) and r.seq_id < img_cut and any(
+        a.kind == "image" and a.data for a in r.attachments)
+    text = r.text + ("\n（图略）" if hidden else "")
 
     if r.type == TYPE_TOOL_RESULT:
-        content: object = ([{"type": "text", "text": r.text}] + parts) if parts else r.text
+        content: object = ([{"type": "text", "text": text}] + parts) if parts else text
         return {"role": "tool", "tool_call_id": r.call_id, "content": content}, cost
 
     if r.type == TYPE_ASSISTANT:
@@ -214,5 +252,5 @@ def _assemble(r, counter, vision, include_reasoning: bool) -> Tuple[dict, int]:
     role = "system" if r.type == TYPE_INTERNAL else "user"
     if parts:
         return {"role": role,
-                "content": [{"type": "text", "text": r.text}] + parts}, cost
-    return {"role": role, "content": r.text}, cost
+                "content": [{"type": "text", "text": text}] + parts}, cost
+    return {"role": role, "content": text}, cost
