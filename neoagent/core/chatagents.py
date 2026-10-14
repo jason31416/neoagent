@@ -441,6 +441,7 @@ def AgentLoopFactory(manager: ChatAgentManager, registry, chat_id: str,
         token_counter=manager.token_counter,
         max_tool_rounds=cfg.max_tool_rounds,
         token_budget=cfg.token_budget,
+        progress_ping_seconds=0,            # 群侧不催报（催报是主 agent 的体验）
         media_roots=[],                     # 聊天工具：不发媒体
         known_channels=manager.known_channels,
         timeline_bucket=f"group:{chat_id}")

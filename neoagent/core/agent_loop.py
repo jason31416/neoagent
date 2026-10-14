@@ -54,6 +54,10 @@ logger = logging.getLogger(__name__)
 # 兜底：语音转写失败/不可用时正文的占位
 _VOICE_FALLBACK = "（语音消息，转写暂不可用）"
 
+# 干活静默催报：只挂在本次请求尾巴上（不落账本），催模型用 <message> 报进度
+_PROGRESS_PING = ("（系统提示：距上次回复用户已经有一会了，"
+                  "请尽量及时跟用户汇报进度）")
+
 MAX_IMAGES_PER_MESSAGE = 4
 MAX_BUBBLES_PER_TURN = 8      # 单 turn 气泡上限（防话痨刷屏）
 
@@ -82,6 +86,9 @@ class SessionState:
         self.kick_event: asyncio.Event = asyncio.Event()  # kick 信号（每次 kick 换新事件）
         self.responder: Optional[Callable] = None       # 回复出口（绑定通道适配器）：
         #   调用 responder(text, quote_to=平台消息id|None) → SendResult（message_id 回填账）
+        self.user_waiting: bool = False                 # 用户说了话、还没答完（催报的门槛）
+        self.waiting_since: Optional[float] = None      # 用户开始等的时刻（还没说过话时的基准）
+        self.last_spoke_at: Optional[float] = None      # 上次真给用户发消息的时刻
 
 
 class AgentLoop:
@@ -96,6 +103,7 @@ class AgentLoop:
                  media_roots: Optional[List[str]] = None,
                  media_max_bytes: int = 20 * 1024 * 1024,
                  bubble_gap_min: float = 0.0, bubble_gap_max: float = 0.0,
+                 progress_ping_seconds: float = 30,
                  workspace: Optional[Path] = None,
                  effort_provider: Optional[Callable[[], str]] = None,
                  effort_setter: Optional[Callable[[str], bool]] = None,
@@ -119,6 +127,8 @@ class AgentLoop:
         # 气泡连发间隔（秒）：0=不间隔（smoke 用默认）；产品默认 1.5–2.5 走 config 注入
         self.bubble_gap_min = float(bubble_gap_min)
         self.bubble_gap_max = float(bubble_gap_max)
+        # 干活静默催报（秒）：用户在等、距上次发消息超这么久 → 请求尾巴催一句；0=关
+        self.progress_ping_seconds = float(progress_ping_seconds)
         self.workspace = Path(workspace) if workspace else None   # 工作台（相对路径基准）
         # 思考档位（reasoning_effort）：每轮请求前现取 → 改配置即生效，可随时切换
         # 思考/非思考混用；默认 "medium"（none=不思考）
@@ -175,6 +185,9 @@ class AgentLoop:
         if not is_command:
             # 置忙：从入库到 turn 收工的整段都算"任务执行中"（R 快整理不插队）
             st.busy = True
+            if not st.user_waiting:      # 用户开始等（催报门槛；唤醒注入不算）
+                st.user_waiting = True
+                st.waiting_since = time.time()
 
         # 1) 预处理：语音转写 → 普通文本；图片上传 vision
         text, attachments = await self._preprocess(event)
@@ -324,10 +337,13 @@ class AgentLoop:
                     await st.responder(f"我这边出了点状况，这轮没答上来（{type(exc).__name__}）。稍等会儿再问我一次。")
                 except Exception:
                     pass
+                self._spoke(st)
         finally:
             st.model_task = None
             st.tool_running = False
             st.busy = False
+            st.user_waiting = False      # 这轮答完了，催报门槛落下
+            st.waiting_since = None
             st.done_at = time.time()      # 任务收工：R 快整理从这一刻起算静默
 
     def states_of(self, session_key: str) -> SessionState:
@@ -424,6 +440,7 @@ class AgentLoop:
         cut0 = self.ledger.get_recorder_state(session_key)[1]   # 触发时刻切点快照
         if st.responder is not None:
             await st.responder("压缩上下文中")
+            self._spoke(st)
         if self.recorder is not None:
             self._spawn(self.recorder.run_retiring(session_key, cut0),
                         "R 退役前扫描")
@@ -434,6 +451,7 @@ class AgentLoop:
             result = None
         if st.responder is not None:
             await st.responder("压缩完成")
+            self._spoke(st)
         return result is not None
 
     def _spawn(self, coro, what: str) -> None:
@@ -451,6 +469,25 @@ class AgentLoop:
             logger.error("%s 失败：%r", what, exc)
         else:
             logger.info("%s 完成：%s", what, t.result())
+
+    # ------------------------------------------------------------------
+    # 干活静默催报（用户在等时催它报进度；提示只存在于本次请求）
+    # ------------------------------------------------------------------
+    def _spoke(self, st: SessionState) -> None:
+        """记一笔"真给用户发了消息"（催报计时基准）。"""
+        st.last_spoke_at = time.time()
+
+    def _progress_ping(self, st: SessionState) -> Optional[dict]:
+        """催报消息（挂请求尾巴，不落账本）；不触发返回 None。
+
+        触发 = 用户在等（user_waiting；闹钟/哨兵的自主干活不算）且距上次真发消息
+        超过 progress_ping_seconds（还没说过话就从用户开始等起算）。"""
+        if self.progress_ping_seconds <= 0 or not st.user_waiting:
+            return None
+        base = st.last_spoke_at or st.waiting_since
+        if base is None or time.time() - base <= self.progress_ping_seconds:
+            return None
+        return {"role": "user", "content": _PROGRESS_PING}
 
     async def _run_turn(self, session_key: str, st: SessionState) -> int:
         """一轮：渲染 → 模型调用/工具循环，返回最终渲染时的输入代数。
@@ -491,6 +528,13 @@ class AgentLoop:
                     continue        # 切点推进 → 重渲染继续，不扣轮数
                 logger.warning("[turn] 没什么可压缩，走渲染端兜底截断")
 
+            # 干活静默催报（仅本次请求，不落账本）：用户在等且久没吭声 →
+            # 请求尾巴挂一条 user 提示，催它用 <message> 报一句进度。
+            ping = self._progress_ping(st)
+            if ping is not None:
+                messages = messages + [ping]
+                est_total += count_chat_payload(self.token_counter, [ping])
+                logger.info("[turn] 静默超时，催报进度 session=%s", session_key)
             predicted = self._anchors[session_key].predict(est_total)
 
             # 请求发出前先落 modellog（400 翻车现场也留证据；未开启时空转）
@@ -685,6 +729,7 @@ class AgentLoop:
                                                     channel=b.channel)
                     except Exception:
                         logger.exception("回复发送失败")
+                    self._spoke(st)          # 说上话了：催报计时重置
                 self._backfill_bubble(session_key, b.bubble_id, result)
             else:
                 await self._deliver_media(session_key, st, b, quote_to)
@@ -740,6 +785,7 @@ class AgentLoop:
                                             channel=b.channel)
             except Exception:
                 logger.exception("媒体发送失败")
+            self._spoke(st)
         self._backfill_bubble(session_key, b.bubble_id, result)
         if not (result is not None and getattr(result, "ok", False)):
             err = getattr(result, "error", None) or "通道不支持"
@@ -766,6 +812,7 @@ class AgentLoop:
                 result = await st.responder(text, channel=channel)
             except Exception:
                 logger.exception("回复发送失败")
+            self._spoke(st)
         self._backfill_bubble(session_key, bid, result)
         return bid
 

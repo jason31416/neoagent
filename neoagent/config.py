@@ -60,6 +60,9 @@ class AgentConfig:
     # 气泡连发间隔（秒）：多条消息之间的随机停顿（真实感 + 给阅读时间），0 = 不间隔
     bubble_gap_min: float = 0.5
     bubble_gap_max: float = 1.5
+    # 干活静默催报（秒）：用户在等、距上次发消息超这么久 → 本次请求里催一句汇报进度；
+    # 只存在于请求不落账本。0 = 关
+    progress_ping_seconds: int = 30
 
 
 @dataclass
@@ -360,6 +363,8 @@ def load_config(home: Optional[Path] = None) -> Config:
     cfg.agent.max_tool_rounds = int(_get(raw, "limits.max_tool_rounds", cfg.agent.max_tool_rounds))
     cfg.agent.history_token_budget = int(_get(raw, "limits.history_token_budget",
                                               cfg.agent.history_token_budget))
+    cfg.agent.progress_ping_seconds = int(_get(raw, "limits.progress_ping_seconds",
+                                               cfg.agent.progress_ping_seconds))
 
     cfg.recorder.memory_dir = str(_get(raw, "memory.dir", cfg.recorder.memory_dir))
     cfg.recorder.pause_debounce_seconds = int(_get(raw, "memory.tidy_delay",
