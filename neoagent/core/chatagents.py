@@ -18,9 +18,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
+
+from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError
 
 from ..config import PACKAGE_DIR
 from . import compaction
@@ -33,8 +38,84 @@ from .llm import LLMClient
 logger = logging.getLogger(__name__)
 
 # 数值旋钮（代码常数，不过度配置）
-CHATAGENT_TOKEN_BUDGET = 200_000     # 群消息量大，独立预算（与主 agent 的分开；2026-10-09 由 60k 提到 200k）
+CHATAGENT_TOKEN_BUDGET = 200_000     # 群消息量大，独立预算（与主 agent 的分开；群级可配）
 CHATAGENT_MAX_TOOL_ROUNDS = 8        # 聊天工具，链短
+TOKEN_BUDGET_RANGE = (20_000, 300_000)   # 群配置里 token_budget 的合法范围
+TOOL_ROUNDS_RANGE = (1, 50)              # 同上：max_tool_rounds
+
+# skill 白名单引用：skill 名 或 skill 名.工具名
+_SKILL_REF_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*(\.[a-z0-9_]+)?$")
+
+
+@dataclass
+class GroupConfig:
+    """每群 chatagent 的独立配置（groups/<chat_id>/config.yml，全键可选）。
+
+    缺文件/缺键 = 现状默认；解析问题进 problems（回退默认照跑，/activate 回执里提）。"""
+    persona: str = "persona.md"                        # 人格文件（相对群目录）
+    skills: List[str] = field(default_factory=list)    # skill 白名单（空 = 一个不给）
+    token_budget: int = CHATAGENT_TOKEN_BUDGET
+    max_tool_rounds: int = CHATAGENT_MAX_TOOL_ROUNDS
+    problems: List[str] = field(default_factory=list)
+
+
+def load_group_config(group_dir: Path) -> GroupConfig:
+    """读 groups/<chat_id>/config.yml → GroupConfig；坏键回退默认，不带坏配置跑。"""
+    cfg = GroupConfig()
+    path = group_dir / "config.yml"
+    if not path.is_file():
+        return cfg
+    try:
+        data = YAML(typ="safe").load(path.read_text(encoding="utf-8"))
+    except (YAMLError, OSError) as e:
+        cfg.problems.append(f"config.yml 读不了：{e}（整份用默认）")
+        return cfg
+    if data is None:
+        return cfg
+    if not isinstance(data, dict):
+        cfg.problems.append("config.yml 顶层必须是键值对（整份用默认）")
+        return cfg
+
+    unknown = set(data) - {"persona", "skills", "token_budget", "max_tool_rounds"}
+    if unknown:
+        cfg.problems.append(f"未知配置项：{sorted(unknown)}（已忽略）")
+
+    persona = str(data.get("persona", "") or "").strip()
+    if persona:
+        if "/" in persona or persona.startswith("."):
+            cfg.problems.append(f"persona 只认群目录里的文件名：{persona!r}（用默认）")
+        else:
+            cfg.persona = persona
+
+    skills = data.get("skills")
+    if skills is not None:
+        if not isinstance(skills, list):
+            cfg.problems.append("skills 必须是列表（用默认：一个不放行）")
+        else:
+            out = []
+            for s in skills:
+                ref = str(s).strip()
+                if _SKILL_REF_RE.fullmatch(ref):
+                    out.append(ref)
+                else:
+                    cfg.problems.append(f"skill 引用不合法：{s!r}（已忽略）")
+            cfg.skills = out
+
+    for key, (lo, hi) in (("token_budget", TOKEN_BUDGET_RANGE),
+                          ("max_tool_rounds", TOOL_ROUNDS_RANGE)):
+        raw = data.get(key)
+        if raw is None:
+            continue
+        try:
+            v = int(raw)
+        except (TypeError, ValueError):
+            cfg.problems.append(f"{key} 不是整数：{raw!r}（用默认）")
+            continue
+        if not lo <= v <= hi:
+            cfg.problems.append(f"{key}={v} 超出范围 {lo}~{hi}（已截到范围内）")
+            v = max(lo, min(hi, v))
+        setattr(cfg, key, v)
+    return cfg
 
 
 class ChatAgentManager:
@@ -52,6 +133,7 @@ class ChatAgentManager:
         self.token_counter = token_counter
         self.known_channels = tuple(known_channels)
         self._loops: Dict[str, Any] = {}      # chat_id → AgentLoop
+        self._cfg_cache: Dict[str, tuple] = {}   # chat_id → (mtime 签名, GroupConfig)
         self._sender: Optional[Callable] = None     # 发群消息出口（run.py 注入）
         self._main_responder: Optional[Callable] = None  # 主 agent 回话出口（run.py 注入）
         self._quote_fetcher: Optional[Callable] = None
@@ -85,18 +167,55 @@ class ChatAgentManager:
             if st is not None and st.task is not None and not st.task.done():
                 st.task.cancel()          # 休眠 = 当作不存在：在飞的轮直接掐
 
+    # ------------------------------------------------------------------
+    # 每群配置（groups/<chat_id>/config.yml；mtime 缓存，改了自动重载）
+    # ------------------------------------------------------------------
+    def group_config(self, chat_id: str) -> GroupConfig:
+        """本群配置；config.yml / persona.md 的 mtime 变了就重读。"""
+        sig = self._cfg_sig(chat_id)
+        hit = self._cfg_cache.get(chat_id)
+        if hit is not None and hit[0] == sig:
+            return hit[1]
+        cfg = load_group_config(self.home / "groups" / chat_id)
+        self._cfg_cache[chat_id] = (sig, cfg)
+        return cfg
+
+    def _cfg_sig(self, chat_id: str) -> tuple:
+        gdir = self.home / "groups" / chat_id
+        hit = self._cfg_cache.get(chat_id)
+        names = ("config.yml", hit[1].persona if hit else "persona.md")
+        out = []
+        for n in names:
+            try:
+                out.append((gdir / n).stat().st_mtime_ns)
+            except OSError:
+                out.append(0)              # 没这个文件 = 全默认
+        return tuple(out)
+
     def _ensure_loop(self, chat_id: str):
+        cfg = self.group_config(chat_id)   # 同一配置 = 同一对象（热更比对锚）
         loop = self._loops.get(chat_id)
         if loop is not None:
-            return loop
+            if getattr(loop, "_group_cfg", None) is cfg:
+                return loop
+            busy, _ = loop.turn_state(loop.session_key)
+            if busy:
+                return loop    # 正忙先用旧配置跑完这轮，下条消息再换
+            self._loops.pop(chat_id, None)
+            logger.info("[chatagent] %s 配置有变，重建实例（上下文在账本里，不丢）",
+                        chat_id)
         from ..tools.chatagent_tools import register_chatagent_tools
         from ..tools.registry import ToolRegistry
+        from ..tools.skill_tools import register_skill_tools
 
         registry = ToolRegistry(part="chatagent")
         notes = self.home / "groups" / chat_id / "memory.md"
         register_chatagent_tools(registry, memory_file=notes,
                                  manager=self, chat_id=chat_id)
-        loop = AgentLoopFactory(self, registry, chat_id)
+        if cfg.skills:                     # 白名单空 = 不给 skill 工具（现状默认）
+            register_skill_tools(registry, self.home / "skills",
+                                 allow=cfg.skills, with_check=False)
+        loop = AgentLoopFactory(self, registry, chat_id, cfg)
         self._loops[chat_id] = loop
         logger.info("[chatagent] %s 上岗（便签 %s）", chat_id, notes)
         return loop
@@ -157,7 +276,11 @@ class ChatAgentManager:
                 return                      # 静默忽略，不教人试
             if name == "activate":
                 self.activate(chat_id)
-                receipt = "已激活，@我聊天"
+                cfg = self.group_config(chat_id)
+                receipt = ("已激活，@我聊天"
+                           f"（本群配置：{self.home / 'groups' / chat_id / 'config.yml'}）")
+                if cfg.problems:
+                    receipt += "\n配置有问题：" + "；".join(cfg.problems)
             else:
                 self.deactivate(chat_id)
                 receipt = "已休眠（记忆和记录都留着，/activate 再来）"
@@ -301,19 +424,26 @@ def _strip_mentions(text: str) -> str:
     return out
 
 
-def AgentLoopFactory(manager: ChatAgentManager, registry, chat_id: str):
-    """按群造一个 chatagent 的 AgentLoop（懒实例化；休眠即销毁）。"""
+def AgentLoopFactory(manager: ChatAgentManager, registry, chat_id: str,
+                     cfg: Optional[GroupConfig] = None):
+    """按群造一个 chatagent 的 AgentLoop（懒实例化；休眠即销毁）。
+    cfg：本群配置（人格/预算/工具轮数）；缺省用默认。"""
     from .agent_loop import AgentLoop
 
+    cfg = cfg or GroupConfig()
+    gdir = manager.home / "groups" / chat_id
+    persona = gdir / cfg.persona
     loop = AgentLoop(
         manager.llm, registry, manager.ledger, None,
         identity_file=PACKAGE_DIR / "prompts" / "chatagent.md",
+        personality_file=persona if persona.is_file() else None,
         vision=manager.vision, transcriber=manager.transcriber,
         token_counter=manager.token_counter,
-        max_tool_rounds=CHATAGENT_MAX_TOOL_ROUNDS,
-        token_budget=CHATAGENT_TOKEN_BUDGET,
+        max_tool_rounds=cfg.max_tool_rounds,
+        token_budget=cfg.token_budget,
         media_roots=[],                     # 聊天工具：不发媒体
         known_channels=manager.known_channels,
         timeline_bucket=f"group:{chat_id}")
     loop.session_key = f"group:{chat_id}"   # 本模块内的便捷名（会话 = 群桶）
+    loop._group_cfg = cfg                   # 配置热更的比对锚（对象同一性）
     return loop

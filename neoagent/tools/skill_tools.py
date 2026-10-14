@@ -9,7 +9,7 @@ skill 本体是 ~/.neoagent/skills/ 下的文件（契约见 docs/设计-skill�
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Sequence
 
 from ..core import skills as core
 from .format import ToolOutput, error, root
@@ -91,23 +91,47 @@ def render_check(skill: core.Skill, rows) -> str:
 # ----------------------------------------------------------------------
 
 class SkillKit:
-    """一套 skill 工具；skills_dir 是 skill 根目录（~/.neoagent/skills/）。"""
+    """一套 skill 工具；skills_dir 是 skill 根目录（~/.neoagent/skills/）。
 
-    def __init__(self, skills_dir: Path) -> None:
+    allow：skill 白名单（None = 不设限；项 = "skill名" 或 "skill名.工具名"）。
+    群 agent 用它做能力收口：白名单外的连名字都看不到（防探路）。"""
+
+    def __init__(self, skills_dir: Path,
+                 allow: Optional[Sequence[str]] = None) -> None:
         self.skills_dir = skills_dir
+        self.allow = None if allow is None else [str(a).strip() for a in allow]
+
+    def _skill_ok(self, name: str) -> bool:
+        return self.allow is None or any(
+            a == name or a.startswith(name + ".") for a in self.allow)
+
+    def _tool_ok(self, name: str, tool: str) -> bool:
+        return self.allow is None or any(
+            a == name or a == f"{name}.{tool}" for a in self.allow)
+
+    def _visible(self, skill: core.Skill) -> core.Skill:
+        """白名单过滤后的视图（工具表也收口）；discover/find 每次新建对象，直接改安全。"""
+        skill.tools = [t for t in skill.tools if self._tool_ok(skill.name, t.name)]
+        return skill
+
+    def _names(self) -> List[str]:
+        """这个 kit 眼里可用的 skill 名（not_found 提示用，不泄白名单外的名字）。"""
+        return [n for n in core.list_names(self.skills_dir) if self._skill_ok(n)]
 
     # -- skill_list -----------------------------------------------------
     async def skill_list(self, args: Dict[str, Any]) -> ToolOutput:
-        items = core.discover(self.skills_dir)
+        items = [self._visible(s) for s in core.discover(self.skills_dir)
+                 if self._skill_ok(s.name)]
         return ToolOutput(text=render_list(items), stat=f"{len(items)} 个 skill")
 
     # -- skill_show -----------------------------------------------------
     async def skill_show(self, args: Dict[str, Any]) -> ToolOutput:
         name = str(args.get("name", "")).strip()
         skill = core.find_skill(self.skills_dir, name) if name else None
-        if skill is None:
+        if skill is None or not self._skill_ok(skill.name):
             return error("not_found", f"没有这个 skill：{name or '（缺 name 参数）'}，"
-                                      f"可用：{', '.join(core.list_names(self.skills_dir)) or '（无）'}")
+                                      f"可用：{', '.join(self._names()) or '（无）'}")
+        skill = self._visible(skill)
         return ToolOutput(text=render_show(skill),
                           stat=f"{len(skill.tools)} 个工具")
 
@@ -119,13 +143,13 @@ class SkillKit:
                                       f"收到：{sid or '（缺 id 参数）'}")
         sname, tname = sid.rsplit(".", 1)
         skill = core.find_skill(self.skills_dir, sname)
-        if skill is None:
+        if skill is None or not self._skill_ok(skill.name):
             return error("not_found", f"没有这个 skill：{sname}，"
-                                      f"可用：{', '.join(core.list_names(self.skills_dir)) or '（无）'}")
+                                      f"可用：{', '.join(self._names()) or '（无）'}")
         tool = skill.tool(tname)
-        if tool is None:
+        if tool is None or not self._tool_ok(sname, tname):
             return error("not_found", f"{sname} 没有工具 {tname}，"
-                                      f"可用：{', '.join(t.name for t in skill.tools) or '（无）'}")
+                                      f"可用：{', '.join(t.name for t in skill.tools if self._tool_ok(sname, t.name)) or '（无）'}")
         params = args.get("params") or {}
         if not isinstance(params, dict):
             return error("bad_param", "params 必须是对象（键 = skill_show 里的 param 名）")
@@ -150,7 +174,7 @@ class SkillKit:
         skill = core.find_skill(self.skills_dir, name) if name else None
         if skill is None:
             return error("not_found", f"没有这个 skill：{name or '（缺 name 参数）'}，"
-                                      f"可用：{', '.join(core.list_names(self.skills_dir)) or '（无）'}")
+                                      f"可用：{', '.join(self._names()) or '（无）'}")
         return render_check(skill, core.check_skill(skill))
 
 
@@ -158,9 +182,12 @@ class SkillKit:
 # 注册
 # ----------------------------------------------------------------------
 
-def register_skill_tools(registry: ToolRegistry, skills_dir: Path) -> None:
-    """固定四个 skill 工具；不随服务涨（服务是 skill 文件，不是新工具）。"""
-    kit = SkillKit(skills_dir)
+def register_skill_tools(registry: ToolRegistry, skills_dir: Path, *,
+                         allow: Optional[Sequence[str]] = None,
+                         with_check: bool = True) -> None:
+    """注册 skill 工具。allow 给 SkillKit 做白名单（群 agent 的能力收口）；
+    with_check=False 不注册 skill_check（自修入口，只给主 agent）。"""
+    kit = SkillKit(skills_dir, allow=allow)
     registry.register(
         "skill_list",
         "列出全部 skill——neoagent 对外部服务的能力包（住 ~/.neoagent/skills/，"
@@ -187,10 +214,11 @@ def register_skill_tools(registry: ToolRegistry, skills_dir: Path) -> None:
                                    "description": "参数（键 = param 名）；无参数的工具传空对象或不传",
                                    "additionalProperties": True}},
          "required": ["id"]}, kit.skill_call)
-    registry.register(
-        "skill_check",
-        "校验一个 skill（声明结构、参数表、密钥键名、脚本引用）。改完 skill.yml / 脚本后"
-        "跑一遍，✘ 项按提示修——skill 是 neoagent 自己维护的长期能力。",
-        {"type": "object",
-         "properties": {"name": {"type": "string", "description": "skill 名（skill_list 里有）"}},
-         "required": ["name"]}, kit.skill_check)
+    if with_check:
+        registry.register(
+            "skill_check",
+            "校验一个 skill（声明结构、参数表、密钥键名、脚本引用）。改完 skill.yml / 脚本后"
+            "跑一遍，✘ 项按提示修——skill 是 neoagent 自己维护的长期能力。",
+            {"type": "object",
+             "properties": {"name": {"type": "string", "description": "skill 名（skill_list 里有）"}},
+             "required": ["name"]}, kit.skill_check)

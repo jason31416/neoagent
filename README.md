@@ -18,9 +18,10 @@
 - **联网搜索**：`web_search` 一个工具接常见搜索服务（Exa / Tavily，`config.yml` 的
   `search` 段配密钥，auto 取有钥的），返回标题 + 链接 + 摘要
 - **飞书群里的群友（chatagent）**：`/activate` 后群里有个只聊天的子 agent——
-  看全部消息、被 @ 才说话、不碰文件命令（工具只有自己的便签 + 跟主 agent 通话）；
-  主人可 `read_group_chat` 查群记录、`tell_chatagent` 给它发话，它也会主动上报
-  群里值得主人知道的事（`tell_neoagent`）；`/deactivate` 休眠（记忆和记录都留着）
+  看全部消息、被 @ 才说话、不碰文件命令（工具只有自己的便签 + 跟主 agent 通话，
+  skill 白名单可按群放开）；主人可 `read_group_chat` 查群记录、`tell_chatagent` 给它发话，
+  它也会主动上报群里值得主人知道的事（`tell_neoagent`）；`/deactivate` 休眠（记忆和记录都留着）；
+  每群可配独立人格/skill 白名单/上下文预算（`groups/<群id>/config.yml`）
 - **对外部服务有"手"（skill）**：服务封装成 `~/.neoagent/skills/` 下的 skill 包
   （声明式工具 + 脚本 + 密钥 `.env`），固定四个工具 `skill_list` / `skill_show` /
   `skill_call` / `skill_check`，不随服务涨；skill 由 agent 自己创建维护（`/skills` 看清单），
