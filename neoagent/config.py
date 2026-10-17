@@ -21,6 +21,7 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from ruamel.yaml import YAML
 
@@ -98,8 +99,15 @@ class AsrConfig:
 
 @dataclass
 class SearchConfig:
-    """联网搜索（web_search 工具）：Exa / Tavily，auto = 取第一个配了密钥的。"""
-    provider: str = "auto"       # auto | exa | tavily
+    """联网搜索（web_search）+ 读网页正文（web_read）：DeepSeek / Exa / Tavily。
+
+    DeepSeek 官方 Search/Fetch 共用同一把 key；search.deepseek_api_key 没配时，
+    model.base_url 指向 DeepSeek 官方会自动复用 model.api_key。
+    auto = 按 deepseek → exa → tavily 取第一个配了密钥的。
+    """
+    provider: str = "auto"       # auto | deepseek | exa | tavily
+    deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com"
     exa_api_key: str = ""
     tavily_api_key: str = ""
     max_results: int = 8         # 默认条数（调用时可传 count 覆盖，上限 20）
@@ -351,6 +359,18 @@ def resolve_path(home: Path, value: str) -> Path:
     return p if p.is_absolute() else home / p
 
 
+def _is_deepseek_official(base_url: str) -> bool:
+    """model.base_url 是否指向 DeepSeek 官方（决定能否复用模型密钥做搜索）。
+
+    只认 api.deepseek.com；指向 opencode 之类的网关时不回退，避免把网关密钥
+    发给 DeepSeek 官方接口。"""
+    try:
+        host = (urlparse(str(base_url or "")).hostname or "").lower()
+    except ValueError:
+        return False
+    return host == "api.deepseek.com"
+
+
 def load_config(home: Optional[Path] = None) -> Config:
     """读取 ~/.neoagent/config.yml 与 channels/*.yml，叠加环境变量覆盖。"""
     home = home or home_dir()
@@ -437,6 +457,10 @@ def load_config(home: Optional[Path] = None) -> Config:
                                          cfg.asr.max_audio_seconds))
 
     cfg.search.provider = str(_get(raw, "search.provider", cfg.search.provider))
+    cfg.search.deepseek_api_key = str(_get(raw, "search.deepseek_api_key",
+                                            cfg.search.deepseek_api_key) or "")
+    cfg.search.deepseek_base_url = str(_get(raw, "search.deepseek_base_url",
+                                             cfg.search.deepseek_base_url) or "")
     cfg.search.exa_api_key = str(_get(raw, "search.exa_api_key", cfg.search.exa_api_key) or "")
     cfg.search.tavily_api_key = str(_get(raw, "search.tavily_api_key",
                                          cfg.search.tavily_api_key) or "")
@@ -466,9 +490,17 @@ def load_config(home: Optional[Path] = None) -> Config:
     cfg.asr.api_key = os.environ.get("NEOAGENT_ASR_API_KEY", cfg.asr.api_key)
     cfg.jev.api_key = os.environ.get("NEOAGENT_JEV_API_KEY", cfg.jev.api_key)
     cfg.search.provider = os.environ.get("NEOAGENT_SEARCH_PROVIDER", cfg.search.provider)
+    cfg.search.deepseek_api_key = os.environ.get("NEOAGENT_SEARCH_DEEPSEEK_API_KEY",
+                                                 cfg.search.deepseek_api_key)
+    cfg.search.deepseek_base_url = os.environ.get("NEOAGENT_SEARCH_DEEPSEEK_BASE_URL",
+                                                  cfg.search.deepseek_base_url)
     cfg.search.exa_api_key = os.environ.get("NEOAGENT_SEARCH_EXA_API_KEY", cfg.search.exa_api_key)
     cfg.search.tavily_api_key = os.environ.get("NEOAGENT_SEARCH_TAVILY_API_KEY",
                                                cfg.search.tavily_api_key)
+    # DeepSeek 官方 Search/Fetch 与模型共用账号：没单独配搜索密钥时复用模型密钥。
+    # 只在 model.base_url 确实是 DeepSeek 官方时生效（换网关不会误用）。
+    if not cfg.search.deepseek_api_key and _is_deepseek_official(cfg.llm.base_url):
+        cfg.search.deepseek_api_key = cfg.llm.api_key
     cfg.recorder.reasoning_effort = os.environ.get("NEOAGENT_MEMORY_TIDY_THINKING",
                                                    cfg.recorder.reasoning_effort)
     # 飞书凭据按 kind 覆盖到每个飞书频道（多开也吃得下）

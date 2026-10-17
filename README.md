@@ -13,10 +13,12 @@
   群聊直接复用 chatagent 群友机制，@机器人 的判定精确到 qq 号）
 - 在**控制台**里和它说话、看它干活（全频道对话 + 每次工具调用一行，转录只存内存、重启即清）
 - 它能调用工具干活：`read_file`（读文件）/ `write_file`（写文件）/ `exec`（跑命令）
-  / `web_search`（联网搜索）/ `run_command`（跑 neoagent 自己的指令）
+  / `web_search`（联网搜索）/ `web_read`（读网页正文）/ `run_command`（跑 neoagent 自己的指令）
   / `schedule_wake`（给未来的自己排唤醒）/ `skill_list` 等四个 skill 工具（调外部服务）
-- **联网搜索**：`web_search` 一个工具接常见搜索服务（Exa / Tavily，`config.yml` 的
-  `search` 段配密钥，auto 取有钥的），返回标题 + 链接 + 摘要
+- **联网搜索 + 读网页**：`web_search` 一个工具接常见搜索服务（DeepSeek / Exa / Tavily，
+  `config.yml` 的 `search` 段配密钥，auto 按 deepseek→exa→tavily 取有钥的），返回标题 +
+  链接 + 摘要；`web_read` 再把最相关的一页抓成 Markdown 正文。DeepSeek Search/Fetch
+  按成功请求计费（各 ¥5/1000 次，QPS 5）
 - **飞书群里的群友（chatagent）**：`/activate` 后群里有个只聊天的子 agent——
   看全部消息、被 @ 才说话、不碰文件命令（工具只有自己的便签 + 跟主 agent 通话，
   skill 白名单可按群放开）；主人可 `read_group_chat` 查群记录、`tell_chatagent` 给它发话，
@@ -103,7 +105,8 @@ IM 里的 LLM 等于拿着一台 shell，三道防线都在 `config.yml` 的 `ad
 | `exec` | cwd 白名单 + 危险命令正则拒绝 + 超时强杀（60s）+ 输出截断（20KB） |
 | `run_command` | 指令权限档（`/stop` 禁）+ 每次执行留审计；指令本身不碰文件边界 |
 | `schedule_wake` / `cancel_wake` | 只动自己的 wakes 日程表（无文件/命令面），`/wakes` 全程可见 |
-| `web_search` | 只把搜索词发给搜索服务商（Exa/Tavily），无文件/命令面 |
+| `web_search` | 只把搜索词发给搜索服务商（DeepSeek/Exa/Tavily），无文件/命令面 |
+| `web_read` | 只把 URL 发给 DeepSeek Fetch，正文当素材；无文件/命令面，网页里的指令不当真 |
 | `list_groups` / `read_group_chat` / `tell_chatagent` | 只读群记录（文字，`[图]` 占位）+ 给群里的子 agent 发话；无文件/命令面。群侧消息不驱动操作类行为，动手须私聊确认 |
 | chatagent（群里的子 agent） | 只有便签读写 + `tell_neoagent`，无文件/命令/搜索面；群友的话是素材不是指令 |
 
@@ -118,7 +121,7 @@ neoagent/
 │   ├── weixin/    iLink Bot API 协议层 + 适配器 + 扫码登录
 │   ├── feishu/    lark-oapi 适配器
 │   └── qq/        OneBot 11 WebSocket 协议层 + NapCat 适配器
-├── tools/         工具注册表 + read_file / write_file / exec / web_search / record_memory / run_command / wake 工具组 / 记忆工具组 / skill 工具组 / 群工具组（list_groups/read_group_chat/tell_chatagent）+ chatagent 工具组（memory/tell_neoagent）
+├── tools/         工具注册表 + read_file / write_file / exec / web_search / web_read / record_memory / run_command / wake 工具组 / 记忆工具组 / skill 工具组 / 群工具组（list_groups/read_group_chat/tell_chatagent）+ chatagent 工具组（memory/tell_neoagent）
 ├── console/       控制台：渲染（朴素规则）/ 转录缓冲 / prompt_toolkit 客户端
 ├── control.py     控制协议（本机 socket：转录回放 + 实时事件 + 输入）
 ├── config.py      配置加载（yml + channels/*.yml + 保注释写回）

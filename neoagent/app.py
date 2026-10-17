@@ -29,6 +29,7 @@ from .tools.registry import ToolRegistry
 from .tools.search_tool import register_search_tool
 from .tools.skill_tools import register_skill_tools
 from .tools.wake_tools import register_wake_tools
+from .tools.web_read_tool import register_web_read_tool
 
 logger = logging.getLogger("neoagent.app")
 
@@ -149,8 +150,10 @@ def build_agent(cfg: Config) -> AgentLoop:
     # 不随服务涨——服务是 skill 文件，不是新工具）
     register_skill_tools(registry, skills_dir)
 
-    # 联网搜索：一个 web_search 工具吃所有搜索服务（Exa/Tavily 由 config 的 search 段决定）
+    # 联网搜索：一个 web_search 工具吃所有搜索服务（DeepSeek/Exa/Tavily 由 config 的
+    # search 段决定）；web_read 再把最相关的一页抓成 Markdown 正文（DeepSeek Fetch）
     register_search_tool(registry, cfg.search)
+    register_web_read_tool(registry, cfg.search)
 
     # 群里的子 agent（chatagent）+ 主 agent 的群工具：list_groups / read_group_chat /
     # tell_chatagent（M-only，R 不动）。manager 管各群 chatagent 的生命周期与消息路由，

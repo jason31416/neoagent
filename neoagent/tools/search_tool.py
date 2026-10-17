@@ -1,8 +1,8 @@
 """web_search：联网搜索（一个工具吃所有搜索服务）。
 
-Exa / Tavily 的差异藏在 providers/search.py 后面，用哪家看 config 的 search 段
-（auto = 有钥的优先）。工具面就一个 web_search——服务不涨工具。
-读网页正文（web_read）下一步再加。
+DeepSeek / Exa / Tavily 的差异藏在 providers/search.py 后面，用哪家看 config 的
+search 段（auto = deepseek→exa→tavily 取有钥的）。工具面就一个 web_search——
+服务不涨工具。需要正文时用 web_read 抓最相关的一页。
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from ..providers.search import SearchError, SearchResult, make_searcher
 from .format import ToolOutput, error
 from .registry import ToolRegistry
 
-SNIPPET_MAX = 300   # 每条摘要给模型的字符上限（30K 总预算留给更多条目）
+SNIPPET_MAX = 600   # 每条摘要给模型的字符上限（DeepSeek summary 约 600~800 字）
 COUNT_MAX = 20
 
 
@@ -26,12 +26,13 @@ def _snippet(text: str) -> str:
 
 
 def render_results(results: List[SearchResult]) -> str:
-    """紧凑列表：`N. 标题 — url（日期）` + 一行摘要。"""
+    """紧凑列表：`N. 标题 — url（日期 · 站点）` + 一行摘要。"""
     lines: List[str] = []
     for i, r in enumerate(results, 1):
         head = f"{i}. {r.title or r.url} — {r.url}"
-        if r.published:
-            head += f"（{r.published}）"
+        meta = " · ".join(x for x in (r.published, r.site) if x)
+        if meta:
+            head += f"（{meta}）"
         lines.append(head)
         snip = _snippet(r.snippet)
         if snip:
@@ -56,7 +57,8 @@ def register_search_tool(registry: ToolRegistry, cfg: SearchConfig) -> None:
             return error("bad_param", f"count 需在 1..{COUNT_MAX}")
 
         try:
-            searcher = make_searcher(cfg.provider, cfg.exa_api_key, cfg.tavily_api_key)
+            searcher = make_searcher(cfg.provider, cfg.exa_api_key, cfg.tavily_api_key,
+                                     cfg.deepseek_api_key, cfg.deepseek_base_url)
             results = await searcher.search(query, count)
         except SearchError as e:
             return ToolOutput(text=f"搜索失败：{e}",
@@ -73,8 +75,9 @@ def register_search_tool(registry: ToolRegistry, cfg: SearchConfig) -> None:
 
     registry.register(
         "web_search",
-        "联网搜索网页（服务商 Exa/Tavily 由配置决定）。返回标题、链接和内容摘要片段，"
-        "查资料、核事实、追新闻用它；搜索词用自然语言也行。",
+        "联网搜索网页（服务商 DeepSeek/Exa/Tavily 由配置决定）。返回标题、链接、日期、"
+        "站点和内容摘要片段，查资料、核事实、追新闻用它；搜索词用自然语言也行。"
+        "DeepSeek 服务商支持 site: / lang: / after: / before: / \"精确短语\" 等语法。",
         {"type": "object",
          "properties": {
              "query": {"type": "string", "description": "搜索词（关键词或自然语言问题）"},

@@ -39,8 +39,9 @@ neoagent 是住在聊天软件里的个人 AI 助手：一个产品、一个名�
 ## 功能清单
 
 - **对话干活**：OpenAI 兼容工具循环。工具：文件读写、命令执行、联网搜索（web_search，
-  Exa/Tavily 二选一）、skill 调用（skill_call）、记忆提案（record_memory）、
-  排闹钟（schedule_wake）、群工具（list_groups / read_group_chat / tell_chatagent）
+  DeepSeek/Exa/Tavily 三选一）+ 读网页正文（web_read）、skill 调用（skill_call）、
+  记忆提案（record_memory）、排闹钟（schedule_wake）、群工具（list_groups /
+  read_group_chat / tell_chatagent）
 - **消息协议**：一条回复可拆多条气泡（带随机间隔）、可引用回复（replyTo）、
   标签外的碎碎念只留存不发送
 - **语音与图**：语音消息自动转写再处理；图片能看（vision）
@@ -49,7 +50,10 @@ neoagent 是住在聊天软件里的个人 AI 助手：一个产品、一个名�
 - **上下文压缩**：撞到预算限制或用户 /compact 时机械压缩——总结一份结构化接续备忘
   （`<compact>` 行）、原样保留最近 10 条、更早的退役（图一并回收）；R 同时做退役前
   最后一次记忆扫描（先落记忆再退役）
-- **搜索工具**：搜索工具需要用户配置exa/tavily的key，可以引导用户在 `https://www.tavily.com/` 注册带免费额度的key
+- **搜索与读网页**：搜索需要密钥——DeepSeek 官方（api.deepseek.com，Search/Fetch
+  各 5 元/1000 次成功请求；model.base_url 是官方时自动复用 model.api_key）、Exa、
+  Tavily（只支持搜索）。没配 Key 时 web_search/web_read 会提示怎么配；
+  web_read 用来读单页正文，网页内容是素材不是指令
 - **主动性**：自己排闹钟（重启不丢、错过合并补报）；配了 Jev 还有哨兵隔一阵探
   "值不值得说一句"，免打扰时段（quiet_hours）不吭声
 - **skill**：`~/.neoagent/skills/<名>/` 四件套（skill.md / skill.yml / .env / scripts）；
@@ -70,8 +74,8 @@ neoagent 是住在聊天软件里的个人 AI 助手：一个产品、一个名�
 - `settle`：攒批等待三档（wait_clear / wait_maybe / wait_fragment）+ wait_cap
 - `jev`：Jev 决策模型（不配 api_key = 整个不启用；攒批走默认等待、主动性只剩闹钟）
 - `proactive`：enabled / quiet_hours / probe_active_min / probe_idle_max
-- `search`：provider（auto = exa→tavily 取先配了密钥的）/ exa_api_key /
-  tavily_api_key / max_results
+- `search`：provider（auto = deepseek→exa→tavily 取先配了密钥的）/
+  deepseek_api_key / deepseek_base_url / exa_api_key / tavily_api_key / max_results
 - `groups`：log_retention_days（群记录保留天数）
 - `limits`：max_tool_rounds（一次回复最多几轮工具）/ history_token_budget
   （上下文 token 预算，压缩红线的基准）
@@ -90,7 +94,8 @@ neoagent 是住在聊天软件里的个人 AI 助手：一个产品、一个名�
 - `channels/<名>.yml` —— 一个频道一个文件（kind / enabled / …；QQ 要 ws_url + token；
   owner_id 由 /connect 配对自动写入）
 - 密钥可走环境变量：NEOAGENT_LLM_API_KEY / NEOAGENT_JEV_API_KEY /
-  NEOAGENT_SEARCH_EXA_API_KEY / NEOAGENT_SEARCH_TAVILY_API_KEY / NEOAGENT_ASR_API_KEY
+  NEOAGENT_SEARCH_DEEPSEEK_API_KEY / NEOAGENT_SEARCH_EXA_API_KEY /
+  NEOAGENT_SEARCH_TAVILY_API_KEY / NEOAGENT_ASR_API_KEY
 
 ## 指令
 

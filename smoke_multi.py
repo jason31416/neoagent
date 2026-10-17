@@ -9,6 +9,7 @@
 6. 静默：无 <message> 块 → 什么都不发
 7. replyTo 显式引用：quote_to 透传通道 / 落账 reply_to / 发出 id 回填 / 编造 seq 降级
 8. token 预算：从最老端成组抛弃 / tool 组原子 / 最新块保底截断 / 增量渲染==全量渲染
+9. DeepSeek 搜索/Fetch 适配：结果映射 / 错误归一 / provider 选择 / 工具输出（离线 mock）
 """
 import asyncio
 import json
@@ -916,6 +917,144 @@ async def main() -> None:
     check(not ensure_seed_skill(sdir, assets / "neoagent")
           and (sdir / "neoagent" / "skill.md").read_text(encoding="utf-8") == "改过了",
           "已存在不覆盖（用户改动保留）")
+
+    # ---- 26. DeepSeek 搜索/Fetch 适配（离线，mock HTTP） ----
+    print("=== 26. DeepSeek 搜索/Fetch 适配 ===")
+    from neoagent.config import SearchConfig, _is_deepseek_official
+    from neoagent.providers import deepseek as ds
+    from neoagent.providers.fetch import (DeepSeekFetch, FetchError, FetchResult,
+                                          make_fetcher)
+    from neoagent.providers.search import (DeepSeekSearch, SearchError, SearchResult,
+                                           make_searcher)
+    from neoagent.tools.search_tool import register_search_tool
+    from neoagent.tools.web_read_tool import register_web_read_tool
+
+    class FakeCall:
+        """替换 DeepSeekToolsClient：记请求、回放固定响应或抛错。"""
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        async def call(self, tool, payload):
+            self.calls.append((tool, payload))
+            if isinstance(self.result, Exception):
+                raise self.result
+            return self.result
+
+    check(ds.tool_url("https://api.deepseek.com", "search")
+          == "https://api.deepseek.com/v1/tools/search"
+          and ds.tool_url("https://api.deepseek.com/v1/", "fetch")
+          == "https://api.deepseek.com/v1/tools/fetch",
+          "DeepSeek 端点拼接（base 带不带 /v1 都吃）")
+    check("API Key" in ds.friendly_error(401, '{"error":{"message":"Authentication Fails"}}'),
+          "DeepSeek 401 归一成可操作的提示")
+    check(_is_deepseek_official("https://api.deepseek.com/v1")
+          and not _is_deepseek_official("https://opencode.ai/zen/go/v1"),
+          "模型密钥回退只认 DeepSeek 官方")
+
+    dsrch = DeepSeekSearch("k")
+    dsrch._client = FakeCall({"results": [{
+        "title": "标题", "url": "https://e.com/a", "summary": "长摘要" * 10,
+        "snippet": "短摘要", "date": "2026-06-01T00:00:00+00:00",
+        "site_name": "Example", "rerank_score": 2.4, "authority": 3,
+    }]})
+    rows = await dsrch.search("q", 3)
+    check(len(rows) == 1 and rows[0].title == "标题"
+          and rows[0].snippet.startswith("长摘要") and rows[0].published == "2026-06-01"
+          and rows[0].site == "Example", "DeepSeek 结果映射（summary/date/site）")
+    check(dsrch._client.calls == [("search", {"query": "q", "count": 3})],
+          "DeepSeek Search 请求体")
+
+    dsrch._client = FakeCall(ds.DeepSeekToolError(401, "密钥无效", "search"))
+    try:
+        await dsrch.search("q", 1)
+        err_ok = False
+    except SearchError as e:
+        err_ok = "密钥无效" in str(e)
+    check(err_ok, "DeepSeek 错误归一成 SearchError")
+
+    check(make_searcher("auto", "", "", "dk", "").name == "deepseek"
+          and make_searcher("auto", "ek", "", "", "").name == "exa"
+          and make_searcher("auto", "", "tk", "", "").name == "tavily",
+          "auto 顺序：deepseek → exa → tavily")
+    try:
+        make_searcher("deepseek", "", "", "", "")
+        key_ok = False
+    except SearchError as e:
+        key_ok = "deepseek_api_key" in str(e)
+    check(key_ok, "provider=deepseek 缺钥时给出配置指引")
+
+    fetcher = DeepSeekFetch("k")
+    fetcher._client = FakeCall({"title": "页面", "content": "# 正文"})
+    page = await fetcher.fetch("https://e.com/a")
+    check(page.title == "页面" and page.content == "# 正文", "DeepSeek Fetch 映射")
+    fetcher._client = FakeCall({"title": "空", "content": "   "})
+    try:
+        await fetcher.fetch("https://e.com/empty")
+        empty_ok = False
+    except FetchError as e:
+        empty_ok = "正文" in str(e)
+    check(empty_ok, "Fetch 空正文归一成 FetchError")
+    try:
+        make_fetcher("", "")
+        miss_ok = False
+    except FetchError as e:
+        miss_ok = "deepseek_api_key" in str(e)
+    check(miss_ok, "web_read 缺钥时给出配置指引")
+
+    # web_search 工具：provider 选择 + 日期/站点渲染
+    import neoagent.tools.search_tool as st
+
+    class FakeSearcher:
+        name = "deepseek"
+
+        async def search(self, query, count):
+            return [SearchResult("标题A", "https://e.com/a", "摘要A",
+                                 "2026-06-01", "Example")]
+
+    orig_searcher = st.make_searcher
+    st.make_searcher = lambda *a, **k: FakeSearcher()
+    try:
+        reg_search = ToolRegistry()
+        register_search_tool(reg_search, SearchConfig(provider="deepseek",
+                                                      deepseek_api_key="k"))
+        out = txt(await reg_search.call("web_search", {"query": "x"}))
+        check("标题A" in out and "2026-06-01 · Example" in out,
+              "web_search 渲染日期/站点")
+        desc = {s["function"]["name"]: s["function"]["description"]
+                for s in reg_search.schemas()}["web_search"]
+        check("DeepSeek" in desc and "site:" in desc, "web_search 描述带上 DeepSeek 语法")
+    finally:
+        st.make_searcher = orig_searcher
+
+    # web_read 工具：正文骨架 + URL 校验 + 截断
+    import neoagent.tools.web_read_tool as wr
+
+    class FakeFetcher:
+        name = "deepseek"
+
+        def __init__(self, content="正文" * 10):
+            self.content = content
+
+        async def fetch(self, url):
+            return FetchResult("页面标题", self.content)
+
+    orig_fetcher = wr.make_fetcher
+    try:
+        reg_read = ToolRegistry()
+        register_web_read_tool(reg_read, SearchConfig(deepseek_api_key="k"))
+        wr.make_fetcher = lambda *a, **k: FakeFetcher()
+        out = txt(await reg_read.call("web_read", {"url": "https://e.com/a"}))
+        check("<page" in out and "页面标题" in out and "正文" in out,
+              "web_read 返回 page 正文")
+        bad = txt(await reg_read.call("web_read", {"url": "file:///etc/passwd"}))
+        check("http" in bad, "web_read 拒绝非 http(s) URL")
+
+        wr.make_fetcher = lambda *a, **k: FakeFetcher("A" * (wr.PAGE_MAX + 100))
+        big = txt(await reg_read.call("web_read", {"url": "https://e.com/big"}))
+        check("已截断" in big and 'truncated="true"' in big, "web_read 超长正文截断")
+    finally:
+        wr.make_fetcher = orig_fetcher
 
     ledger.close()
     print("=== 全部通过 ===")

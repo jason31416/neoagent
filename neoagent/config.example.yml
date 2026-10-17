@@ -59,8 +59,17 @@ proactive:
   probe_idle_max: 5400
 
 search:
-  # 联网搜索（web_search 工具）：auto = 按 exa→tavily 取第一个配了密钥的
+  # 联网搜索（web_search）+ 读网页正文（web_read）：
+  # auto = 按 deepseek → exa → tavily 取第一个配了密钥的
   provider: auto
+  # DeepSeek 官方 Search / Fetch（https://api.deepseek.com）：
+  # 各自 5 元 / 1000 次成功请求、5 QPS；Search 返回摘要，Fetch 返回 Markdown 正文
+  # 密钥也可以不落盘：环境变量 NEOAGENT_SEARCH_DEEPSEEK_API_KEY
+  # 不填且 model.base_url 是 DeepSeek 官方时，自动复用 model.api_key
+  deepseek_api_key: ""
+  # DeepSeek API 地址（一般不用改；走代理时才改）
+  deepseek_base_url: https://api.deepseek.com
+  # Exa / Tavily：只支持搜索，不支持 web_read
   # 密钥也可以不落盘：环境变量 NEOAGENT_SEARCH_EXA_API_KEY / NEOAGENT_SEARCH_TAVILY_API_KEY
   exa_api_key: ""
   tavily_api_key: ""
