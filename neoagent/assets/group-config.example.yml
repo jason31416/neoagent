@@ -13,10 +13,10 @@
 # skills:
 #   - mcsm.list_instances
 
-# 本群上下文预算（token；默认 200000，范围 2 万~30 万）
-# token_budget: 80000
+# 本群上下文预算（token；默认 200000，建议范围 2 万~30 万）
+# token_budget: 200000
 
-# 一轮最多连续调用多少次工具（默认 8，范围 1~50）
+# 一轮最多连续调用多少次工具（默认 8，建议范围 1~50）
 # max_tool_rounds: 8
 
 # 模型覆盖（不配 = 跟随全局 config.yml 的 model 段；改了 name/base_url/api_key
