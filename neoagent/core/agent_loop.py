@@ -226,8 +226,14 @@ class AgentLoop:
         空闲 → 起新 turn；忙 → 不用额外动作——打断已在 ingest 做过，
         turn 循环的攒批屏障会在 kick 后放行，带着批内全部消息重渲染重跑
         （连补几句只打断模型一次、只重跑一次）。
-        """
+
+        **没有待答输入就不开工**：/ 指令在 ingest 里执行完就 return（不 bump
+        input_gen），submit 仍会 kick——放行前必须挡住，否则照着"指令 + 回执"
+        两行白跑一轮模型（用户会看到回执后面又冒一句闲聊）。"""
         st = self._states.setdefault(session_key, SessionState())
+        if st.input_gen <= st.kicked_input_gen:
+            logger.info("[turn] 没有待答输入，kick 不开工（如 / 指令回执）")
+            return
         st.kicked_input_gen = st.input_gen
         st.kick_event.set()
         st.kick_event = asyncio.Event()   # 换新：下一轮等待者听新事件
